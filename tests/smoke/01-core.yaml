@@ -1,0 +1,216 @@
+name: Core API compatibility
+suites:
+
+  - name: API Discovery
+    tests:
+      - name: "version endpoint"
+        kubectl: version
+        contains: "v1.36"
+      - name: "version has +q8s suffix"
+        kubectl: version -o json
+        contains: "+q8s"
+      - name: "api-versions"
+        kubectl: api-versions
+        contains: "v1"
+      - name: "api-resources lists pods"
+        kubectl: api-resources
+        contains: pods
+      - name: "api-resources lists nodes"
+        kubectl: api-resources
+        contains: nodes
+      - name: "api-resources lists deployments"
+        kubectl: api-resources
+        contains: deployments
+      - name: "healthz"
+        curl: { path: /healthz, status: 200 }
+
+  - name: Node
+    tests:
+      - name: "get nodes"
+        kubectl: get nodes
+        contains: Ready
+      - name: "node has real hostname"
+        kubectl: get nodes -o wide
+        contains: asrock
+      - name: "node has version"
+        kubectl: get nodes
+        contains: "v1.36.2+q8s"
+      - name: "node has OS image"
+        kubectl: get nodes -o wide
+        contains: openSUSE
+      - name: "node has container runtime"
+        kubectl: get nodes -o wide
+        contains: "podman://"
+      - name: "node has real IP (not 127.0.0.1)"
+        kubectl: get nodes -o wide
+        not_contains: "127.0.0.1"
+      - name: "describe node works"
+        kubectl: describe node asrock
+        contains: "Kubelet Version"
+      - name: "describe node has capacity"
+        kubectl: describe node asrock
+        contains: "cpu:"
+      - name: "describe node has conditions"
+        kubectl: describe node asrock
+        contains: "KubeletReady"
+      - name: "describe node has lease"
+        kubectl: describe node asrock
+        contains: "HolderIdentity"
+      - name: "describe node has ephemeral-storage"
+        kubectl: describe node asrock
+        contains: "ephemeral-storage"
+      - name: "describe node has machine-id"
+        kubectl: describe node asrock
+        contains: "Machine ID"
+      - name: "describe node has boot-id"
+        kubectl: describe node asrock
+        contains: "Boot ID"
+
+  - name: Metrics
+    tests:
+      - name: "top nodes works"
+        kubectl: top nodes
+        contains: asrock
+      - name: "top nodes shows CPU"
+        kubectl: top nodes
+        contains: "CPU"
+      - name: "metrics API discovery"
+        curl: { path: /apis/metrics.k8s.io/v1beta1, status: 200 }
+
+  - name: Namespace CRUD
+    tests:
+      - name: "create namespace"
+        kubectl: create namespace smoke-test
+      - name: "namespace in list"
+        kubectl: get namespaces
+        contains: smoke-test
+      - name: "default namespace exists"
+        kubectl: get namespace default
+        contains: default
+
+  - name: ConfigMap CRUD
+    tests:
+      - name: "create configmap"
+        kubectl: create configmap test-cm -n smoke-test --from-literal=key1=val1 --from-literal=key2=val2
+      - name: "get configmap"
+        kubectl: get configmap test-cm -n smoke-test -o yaml
+        contains: key1
+      - name: "patch configmap"
+        kubectl: "patch configmap test-cm -n smoke-test -p '{\"data\":{\"key3\":\"val3\"}}'"
+      - name: "patch applied"
+        kubectl: get configmap test-cm -n smoke-test -o yaml
+        contains: key3
+      - name: "delete configmap"
+        kubectl: delete configmap test-cm -n smoke-test
+
+  - name: Secret CRUD
+    tests:
+      - name: "create secret"
+        kubectl: create secret generic test-secret -n smoke-test --from-literal=password=hunter2
+      - name: "get secret"
+        kubectl: get secret test-secret -n smoke-test -o yaml
+        contains: password
+      - name: "delete secret"
+        kubectl: delete secret test-secret -n smoke-test
+
+  - name: Deployment Lifecycle
+    tests:
+      - name: "create deployment"
+        kubectl: create deployment smoke-app -n smoke-test --image=busybox:latest -- sleep 3600
+      - name: "deployment in list"
+        kubectl: get deployments -n smoke-test
+        contains: smoke-app
+      - name: "wait for pod running"
+        wait: get pods -n smoke-test
+        contains: Running
+        timeout: 60
+      - name: "pod shows ready 1/1"
+        kubectl: get pods -n smoke-test
+        contains: "1/1"
+      - name: "pod in cross-namespace list"
+        kubectl: get pods -A
+        contains: smoke-app
+      - name: "scale to 2"
+        kubectl: scale deployment smoke-app -n smoke-test --replicas=2
+      - name: "wait for second pod"
+        wait: get deployment smoke-app -n smoke-test
+        contains: "2/2"
+        timeout: 60
+      - name: "scale to 1"
+        kubectl: scale deployment smoke-app -n smoke-test --replicas=1
+      - name: "scaled down to 1"
+        wait: get deployment smoke-app -n smoke-test
+        contains: "1/1"
+        timeout: 15
+
+  - name: Pod Lifecycle
+    tests:
+      - name: "pod logs"
+        kubectl: logs -n smoke-test smoke-app-0
+        expect: success
+      - name: "label pod"
+        kubectl: label pod smoke-app-0 -n smoke-test env=test
+      - name: "get by label"
+        kubectl: get pods -n smoke-test -l env=test
+        contains: smoke-app
+
+  - name: Deployment Delete Cascade
+    tests:
+      - name: "delete deployment"
+        kubectl: delete deployment smoke-app -n smoke-test
+      - name: "pods gone after deployment delete"
+        wait: get pods -n smoke-test
+        not_contains: smoke-app
+        timeout: 45
+
+  - name: CrashLoop Detection
+    tests:
+      - name: "create failing deployment"
+        kubectl: create deployment crash-test -n smoke-test --image=busybox:latest -- /nonexistent
+      - name: "wait for crash loop"
+        wait: get pods -n smoke-test
+        contains: CrashLoopBackOff
+        timeout: 60
+      - name: "ready shows 0/1"
+        kubectl: get pods -n smoke-test
+        contains: "0/1"
+      - name: "delete crashing deployment"
+        kubectl: delete deployment crash-test -n smoke-test
+      - sleep: 2
+      - name: "crash pods cleaned up"
+        kubectl: get pods -n smoke-test
+        not_contains: crash-test
+
+  - name: Cross-namespace listing
+    tests:
+      - name: "get all -A"
+        kubectl: get all -A
+        expect: success
+      - name: "get pods -A"
+        kubectl: get pods -A
+        expect: success
+      - name: "get deployments -A"
+        kubectl: get deployments -A
+        expect: success
+
+  - name: Table format
+    tests:
+      - name: "pods table has columns"
+        kubectl: get pods -A
+        contains: READY
+      - name: "nodes wide has OS-IMAGE"
+        kubectl: get nodes -o wide
+        contains: OS-IMAGE
+      - name: "deployments table"
+        kubectl: get deployments -A
+        contains: READY
+
+  - name: Coordination
+    tests:
+      - name: "lease API exists"
+        curl: { path: /apis/coordination.k8s.io/v1, status: 200 }
+
+  - name: Cleanup
+    tests:
+      - type: cleanup
+        kubectl: delete namespace smoke-test --ignore-not-found
