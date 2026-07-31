@@ -23,6 +23,12 @@ type InstallConfig struct {
 	Home    string
 	// Port is the TCP port the API server listens on. Defaults to 6443.
 	Port int
+	// ExtraSANIPs are additional IP addresses to include in the server certificate SAN.
+	ExtraSANIPs []net.IP
+	// ExtraSANDNS are additional DNS names to include in the server certificate SAN.
+	ExtraSANDNS []string
+	// RegenerateCerts forces certificate regeneration even if they already exist.
+	RegenerateCerts bool
 }
 
 // DefaultPort is the standard q8s API port (matches kube-apiserver's default).
@@ -120,13 +126,23 @@ func Install(cfg InstallConfig) error {
 	}
 	fmt.Printf("Binary installed to %s\n", binPath)
 
-	// Generate TLS certs only if they don't already exist
-	if _, err := os.Stat(filepath.Join(dataDir, "certs", "ca.crt")); os.IsNotExist(err) {
-		certs := generateCerts()
+	// Generate TLS certs if they don't exist or regeneration is requested
+	certsExist := false
+	if _, err := os.Stat(filepath.Join(dataDir, "certs", "ca.crt")); err == nil {
+		certsExist = true
+	}
+	certsRegenerated := false
+	if !certsExist || cfg.RegenerateCerts || len(cfg.ExtraSANIPs) > 0 || len(cfg.ExtraSANDNS) > 0 {
+		certs := generateCerts(cfg.ExtraSANIPs, cfg.ExtraSANDNS)
 		if err := writeCerts(dataDir, certs); err != nil {
 			return fmt.Errorf("failed to write certs: %w", err)
 		}
-		fmt.Println("Generated TLS certificates.")
+		if certsExist {
+			fmt.Println("Regenerated TLS certificates with updated SANs.")
+			certsRegenerated = true
+		} else {
+			fmt.Println("Generated TLS certificates.")
+		}
 	} else {
 		fmt.Println("TLS certificates already exist, skipping generation.")
 	}
@@ -134,6 +150,18 @@ func Install(cfg InstallConfig) error {
 	// Install systemd units
 	if err := installSystemdUnits(cfg); err != nil {
 		return fmt.Errorf("failed to install systemd units: %w", err)
+	}
+
+	// Restart service if certs were regenerated (so it picks up the new cert)
+	if certsRegenerated {
+		systemctlArgs := []string{"--user"}
+		if cfg.Rootful {
+			systemctlArgs = nil
+		}
+		restartArgs := append(systemctlArgs, "restart", "q8s-api.service")
+		if err := exec.Command("systemctl", restartArgs...).Run(); err == nil {
+			fmt.Println("Restarted q8s-api.service to load new certificates.")
+		}
 	}
 
 	// Print instructions
@@ -170,7 +198,7 @@ type certs struct {
 	clientKey  []byte
 }
 
-func generateCerts() certs {
+func generateCerts(extraIPs []net.IP, extraDNS []string) certs {
 	// Generate CA
 	caPriv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	caTemplate := x509.Certificate{
@@ -199,8 +227,8 @@ func generateCerts() certs {
 		NotAfter:    time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-		DNSNames:    []string{"localhost"},
+		IPAddresses: appendIPs(localIPs(), extraIPs),
+		DNSNames:    appendStrings(localDNSNames(), extraDNS),
 	}
 	serverCertDER, _ := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverPriv.PublicKey, caPriv)
 
@@ -345,4 +373,58 @@ WantedBy=multi-user.target
 
 	fmt.Printf("Installed systemd units to %s\n", systemdDir)
 	return nil
+}
+
+
+// localIPs returns the IPs for the server certificate SAN:
+// loopback (127.0.0.1, ::1) plus the default-route source IP.
+func localIPs() []net.IP {
+	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	// Get the default route source IP (equivalent to: ip route get 1 | awk '{print $7}')
+	conn, err := net.Dial("udp4", "1.1.1.1:80")
+	if err != nil {
+		return ips
+	}
+	defer conn.Close()
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		ips = append(ips, addr.IP)
+	}
+	return ips
+}
+
+// localDNSNames returns DNS names for the server certificate SAN.
+// Includes "localhost" plus the machine hostname.
+func localDNSNames() []string {
+	names := []string{"localhost"}
+	if hostname, err := os.Hostname(); err == nil && hostname != "localhost" {
+		names = append(names, hostname)
+	}
+	return names
+}
+
+
+func appendIPs(base, extra []net.IP) []net.IP {
+	seen := make(map[string]bool, len(base))
+	for _, ip := range base {
+		seen[ip.String()] = true
+	}
+	for _, ip := range extra {
+		if !seen[ip.String()] {
+			base = append(base, ip)
+		}
+	}
+	return base
+}
+
+func appendStrings(base, extra []string) []string {
+	seen := make(map[string]bool, len(base))
+	for _, s := range base {
+		seen[s] = true
+	}
+	for _, s := range extra {
+		if !seen[s] {
+			base = append(base, s)
+		}
+	}
+	return base
 }

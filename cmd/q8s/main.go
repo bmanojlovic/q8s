@@ -52,6 +52,10 @@ func main() {
 		cmdDisable()
 	case "kubeconfig":
 		cmdKubeconfig()
+	case "-h", "--help", "help":
+		printUsage()
+	case "-v", "--version", "version":
+		fmt.Println(version)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -152,7 +156,59 @@ func resolvePort(d dirs) int {
 func cmdInstall() {
 	rootful := os.Getuid() == 0
 	d := resolveDirs(rootful)
-	if err := install.Install(install.InstallConfig{Rootful: rootful, Home: os.Getenv("HOME"), Port: resolvePort(d)}); err != nil {
+
+	var extraIPs []net.IP
+	var extraDNS []string
+	regenCerts := false
+
+	args := os.Args[2:]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h", "--help":
+			fmt.Println("Usage: q8s install [flags]")
+			fmt.Println()
+			fmt.Println("Flags:")
+			fmt.Println("  --san-ip <ip>        Add extra IP to server certificate SAN")
+			fmt.Println("  --san-dns <name>     Add extra DNS name to server certificate SAN")
+			fmt.Println("  --regenerate-certs   Force certificate regeneration")
+			return
+		case "--san-ip":
+			i++
+			if i >= len(args) {
+				fmt.Fprintln(os.Stderr, "--san-ip requires a value")
+				os.Exit(1)
+			}
+			ip := net.ParseIP(args[i])
+			if ip == nil {
+				fmt.Fprintf(os.Stderr, "invalid IP: %s\n", args[i])
+				os.Exit(1)
+			}
+			extraIPs = append(extraIPs, ip)
+			regenCerts = true
+		case "--san-dns":
+			i++
+			if i >= len(args) {
+				fmt.Fprintln(os.Stderr, "--san-dns requires a value")
+				os.Exit(1)
+			}
+			extraDNS = append(extraDNS, args[i])
+			regenCerts = true
+		case "--regenerate-certs":
+			regenCerts = true
+		default:
+			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+			os.Exit(1)
+		}
+	}
+
+	if err := install.Install(install.InstallConfig{
+		Rootful:         rootful,
+		Home:            os.Getenv("HOME"),
+		Port:            resolvePort(d),
+		ExtraSANIPs:     extraIPs,
+		ExtraSANDNS:     extraDNS,
+		RegenerateCerts: regenCerts,
+	}); err != nil {
 		fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
 		os.Exit(1)
 	}
