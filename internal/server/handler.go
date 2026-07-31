@@ -1573,6 +1573,7 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
 			return
 		}
+		s.generateTraefikConfig(created)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
 		ing, err := s.config.Store.GetIngress(ns, name)
@@ -1604,15 +1605,111 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
 			return
 		}
+		s.generateTraefikConfig(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
 		if err := s.config.Store.DeleteIngress(ns, name); err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
+		s.removeTraefikConfig(ns, name)
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// --- Traefik dynamic config ---
+
+// generateTraefikConfig writes a Traefik dynamic config file for an Ingress.
+// The file is placed in TraefikDir and picked up by Traefik's file provider.
+func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
+	if s.config.TraefikDir == "" {
+		return
+	}
+
+	var routers, services strings.Builder
+	idx := 0
+
+	for _, rule := range ing.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			routerName := fmt.Sprintf("%s-%s-%d", ing.Namespace, ing.Name, idx)
+			idx++
+			svcName := path.Backend.Service.Name
+			svcPort := int32(80)
+			if path.Backend.Service.Port.Number != 0 {
+				svcPort = path.Backend.Service.Port.Number
+			}
+
+			// Resolve the actual host port from the Service object
+			hostPort := svcPort
+			if svc, err := s.config.Store.GetService(ing.Namespace, svcName); err == nil {
+				for _, p := range svc.Spec.Ports {
+					if p.Port == svcPort || p.Name == path.Backend.Service.Port.Name {
+						if p.NodePort != 0 {
+							hostPort = p.NodePort
+						} else {
+							hostPort = p.Port
+						}
+						break
+					}
+				}
+			}
+
+			// Build router rule
+			var ruleParts []string
+			if rule.Host != "" {
+				ruleParts = append(ruleParts, fmt.Sprintf("Host(`%s`)", rule.Host))
+			}
+			if path.Path != "" && path.Path != "/" {
+				ruleParts = append(ruleParts, fmt.Sprintf("PathPrefix(`%s`)", path.Path))
+			}
+			routerRule := "PathPrefix(`/`)"
+			if len(ruleParts) > 0 {
+				routerRule = strings.Join(ruleParts, " && ")
+			}
+
+			routers.WriteString(fmt.Sprintf("    %s:\n", routerName))
+			routers.WriteString(fmt.Sprintf("      rule: \"%s\"\n", routerRule))
+			routers.WriteString(fmt.Sprintf("      service: %s\n", routerName))
+			if len(ing.Spec.TLS) > 0 {
+				routers.WriteString("      tls: {}\n")
+			}
+
+			services.WriteString(fmt.Sprintf("    %s:\n", routerName))
+			services.WriteString("      loadBalancer:\n")
+			services.WriteString("        servers:\n")
+			services.WriteString(fmt.Sprintf("          - url: \"http://localhost:%d\"\n", hostPort))
+		}
+	}
+
+	content := fmt.Sprintf("http:\n  routers:\n%s  services:\n%s", routers.String(), services.String())
+
+	filename := fmt.Sprintf("%s-%s.yaml", ing.Namespace, ing.Name)
+	path := filepath.Join(s.config.TraefikDir, filename)
+	if err := os.MkdirAll(s.config.TraefikDir, 0755); err != nil {
+		fmt.Printf("traefik config: mkdir %s: %v\n", s.config.TraefikDir, err)
+		return
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		fmt.Printf("traefik config: write %s: %v\n", path, err)
+		return
+	}
+	fmt.Printf("traefik config: wrote %s\n", filename)
+}
+
+// removeTraefikConfig removes the Traefik dynamic config file for an Ingress.
+func (s *Server) removeTraefikConfig(ns, name string) {
+	if s.config.TraefikDir == "" {
+		return
+	}
+	filename := fmt.Sprintf("%s-%s.yaml", ns, name)
+	path := filepath.Join(s.config.TraefikDir, filename)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		fmt.Printf("traefik config: remove %s: %v\n", path, err)
 	}
 }
 
@@ -1752,6 +1849,11 @@ func (s *Server) ReconcileQuadlets() {
 		if err := mgr.StartUnit(unit); err != nil {
 			fmt.Printf("reconcile: start %s: %v\n", unit, err)
 		}
+	}
+
+	// Reconcile Traefik dynamic configs for existing ingresses
+	for _, ing := range s.config.Store.AllIngresses() {
+		s.generateTraefikConfig(ing)
 	}
 }
 
