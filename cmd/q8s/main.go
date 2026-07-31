@@ -471,6 +471,7 @@ func cmdServe() {
 		QuadletDir: d.quadletDir,
 		SystemdDir: d.systemdDir,
 		ConfigDir:  d.configDir,
+		TraefikDir: d.dataDir + "/traefik",
 		Mode:       mode,
 		Manager:    mgr,
 		Port:       resolvePort(d),

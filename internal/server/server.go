@@ -22,6 +22,7 @@ type Config struct {
 	QuadletDir string // Podman quadlet dir for .container/.volume/.network files
 	SystemdDir string // systemd user unit dir for .timer/.service files
 	ConfigDir  string // base dir for ConfigMap files: {ConfigDir}/{ns}/{cm-name}/
+	TraefikDir string // Traefik dynamic config dir for Ingress routing
 	Mode       systemd.Mode
 	Manager    *systemd.Manager
 	// Port is used only for the /api discovery hint (serverAddressByClientCIDRs);
