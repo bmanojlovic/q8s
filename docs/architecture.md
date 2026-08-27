@@ -14,7 +14,7 @@ When you `kubectl apply` a Pod, q8s writes a Podman Quadlet `.container` file an
 | Namespace | Podman network (`q8s-{ns}.network`) |
 | Pod | Quadlet `.container` unit |
 | Deployment | N indexed Quadlet `.container` units (`{name}-0` … `{name}-N`) with `Restart=on-failure` |
-| PersistentVolumeClaim | Quadlet `.volume` unit (named Podman volume) |
+| PersistentVolumeClaim | Quadlet `.volume` unit (named Podman volume) or host bind mount |
 | ConfigMap | Directory of files bind-mounted into containers |
 | Secret | Directory of files (mode 0600) bind-mounted into containers |
 | Job | Quadlet `.container` unit with `Restart=no` |
@@ -31,7 +31,7 @@ internal/
   server/
     server.go     HTTP server, TLS setup, route registration
     handler.go    All resource handlers (Pod, Service, PVC, ConfigMap, Secret, Deployment, Job, CronJob)
-    discovery.go  API discovery, /version, /api/v1/nodes
+    discovery.go  API discovery, /version, /api/v1/nodes, storage.k8s.io/v1/storageclasses
     metrics.go    metrics.k8s.io (kubectl top), coordination.k8s.io (lease)
     auth.go       mTLS client certificate middleware
     table.go      Table response rendering for kubectl get

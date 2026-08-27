@@ -64,8 +64,7 @@ Label=io.kubernetes.pod.namespace=default
 Label=io.kubernetes.pod.deployment=nginx
 Label=app=nginx
 Environment=KEY=value
-PublishPort=80:80/tcp
-Volume=default-my-pvc.volume:/data
+Volume=default-my-pvc.volume:/data:Z
 Volume=/run/q8s/configmaps/default/config:/etc/config:ro,z
 
 [Unit]
@@ -79,6 +78,46 @@ RestartSec=5
 
 [Install]
 WantedBy=default.target
+```
+
+## Storage classes
+
+PVCs can specify a `storageClassName` to control how volumes are mounted:
+
+| storageClassName | Quadlet Volume= | SELinux |
+|---|---|---|
+| `standard` (default) | `ns-name.volume:/mount:Z` | Exclusive relabel |
+| `standard-shared` | `ns-name.volume:/mount:z` | Shared relabel |
+| `hostpath` | `/host/path:/mount:Z` | Exclusive relabel |
+
+The `hostpath` class reads the host directory from the `q8s.io/host-path` annotation on the PVC. No `.volume` file is generated for hostpath PVCs.
+
+## Port semantics
+
+| Mechanism | Effect | Quadlet output |
+|---|---|---|
+| `containerPort` | Internal only — reachable within the `q8s-{ns}` podman network via NetworkAlias | None |
+| `hostPort` | Binds to the host | `PublishPort=hostPort:containerPort/proto` |
+| Service `.ports` | Binds to host via systemd socket unit | `{name}-{port}.socket` |
+
+`hostPort` and Service are **mutually exclusive** on the same port. q8s rejects creation if both would bind the same host port.
+
+## Resource limits and cgroup delegation
+
+q8s emits `Memory=` and `PodmanArgs=--cpus=N` in quadlet files when `resources.limits` are set. On cgroup v2, this requires the memory and cpu controllers to be delegated to the user session.
+
+q8s detects whether these controllers are available at startup. If not, resource limits are **silently skipped** — the pod starts without limits rather than crashing.
+
+To enable resource limits in rootless mode:
+
+```sh
+sudo mkdir -p /etc/systemd/system/user@.service.d
+sudo tee /etc/systemd/system/user@.service.d/delegate.conf <<CONF
+[Service]
+Delegate=memory cpu pids
+CONF
+sudo systemctl daemon-reload
+# re-login for the delegation to take effect
 ```
 
 ## CronJob timer translation

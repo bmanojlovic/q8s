@@ -7,8 +7,8 @@
 | `nodes` | get, list | Synthetic single node with real machine stats |
 | `namespaces` | get, list, create, delete | Creates a `q8s-{ns}.network` Podman network |
 | `pods` | get, list, create, patch, delete | Writes a `.container` Quadlet; patch rewrites and restarts |
-| `services` | get, list, create, patch, delete | Socket units per port |
-| `persistentvolumeclaims` | get, list, create, patch, delete | Named Podman volume |
+| `services` | get, list, create, patch, delete | Network aliases + socket units per port (mutually exclusive with hostPort) |
+| `persistentvolumeclaims` | get, list, create, patch, delete | Named Podman volume; storageClass selects mount mode |
 | `configmaps` | get, list, create, update, patch, delete | Files at `{configDir}/{ns}/{name}/` |
 | `secrets` | get, list, create, patch, delete | Files at `{secretDir}/{ns}/{name}/` (mode 0600) |
 | `events` | get, list, watch | In-memory, last 500, server-generated |
@@ -48,6 +48,37 @@
 |---|---|
 | `leases` | Synthetic node lease for kubectl describe node |
 
+## storage.k8s.io/v1
+
+| Resource | kubectl verbs | Notes |
+|---|---|---|
+| `storageclasses` | get, list | Fixed set: `standard`, `standard-shared`, `hostpath` |
+
+### Storage classes
+
+| Class | Volume type | SELinux | Use case |
+|---|---|---|---|
+| `standard` (default) | Podman named volume | `:Z` (exclusive) | Single-pod volumes |
+| `standard-shared` | Podman named volume | `:z` (shared) | Multiple pods sharing a volume |
+| `hostpath` | Bind mount from host | `:Z` (exclusive) | Pre-existing host directories |
+
+The `hostpath` class requires a `q8s.io/host-path` annotation on the PVC specifying the absolute host directory:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: my-data
+  annotations:
+    q8s.io/host-path: "/srv/data/myapp"
+spec:
+  storageClassName: hostpath
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+```
+
 ## Pod subresources
 
 | Subresource | kubectl command | Notes |
@@ -60,7 +91,8 @@
 - **Watch**: all list endpoints support `?watch=true` (kubectl get -w, Freelens, k9s)
 - **Label selectors**: `key=value`, `key==value`, `key!=value`, `key`, `!key` on all list endpoints
 - **Patch**: JSON merge patch and strategic merge patch (array-merge-by-name for containers/env/volumes)
-- **Resource limits**: `resources.limits.memory` → Quadlet `Memory=`, `resources.limits.cpu` → `--cpus=N`
+- **Resource limits**: `resources.limits.memory` → Quadlet `Memory=` + `--memory-swap=-1`, `resources.limits.cpu` → `--cpus=N` (skipped when cgroup controllers not delegated)
+- **Port semantics**: `containerPort` is internal-only (namespace network); `hostPort` publishes to host via `PublishPort=`; Service creates a systemd `.socket` unit. hostPort and Service are mutually exclusive on the same port.
 - **CrashLoopBackOff**: detected from restart count + non-zero exit, shown in pod status
 - **StartLimitBurst=5**: systemd gives up after 5 failures within 60s
 - **Delete cascade**: deployment delete removes owned pods, stops units, removes quadlets

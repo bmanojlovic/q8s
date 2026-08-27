@@ -355,8 +355,15 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		// server-side only) that its spec can't be safely turned into a
 		// unit file — e.g. an image reference or env value containing
 		// characters that would corrupt the generated quadlet.
-		if _, err := quadlet.Container(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels)); err != nil {
+		if _, err := quadlet.Container(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec)); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		// hostPort and Service socket units both bind the host — reject if
+		// a Service already owns a port this pod wants as hostPort.
+		if port, conflict := s.podHostPortConflict(&pod); conflict {
+			s.respondStatus(w, http.StatusConflict, "Conflict",
+				"hostPort %d conflicts with an existing Service port — use one or the other", port)
 			return
 		}
 		if pod.Labels == nil {
@@ -546,6 +553,12 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
 			return
 		}
+		if port, conflict := s.serviceHostPortConflict(created); conflict {
+			s.config.Store.DeleteService(ns, created.Name)
+			s.respondStatus(w, http.StatusConflict, "Conflict",
+				"service port %d conflicts with hostPort on a matching pod — use one or the other", port)
+			return
+		}
 		s.generateServiceSocket(created)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
@@ -572,6 +585,11 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		updated, err := s.config.Store.UpdateService(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			return
+		}
+		if port, conflict := s.serviceHostPortConflict(updated); conflict {
+			s.respondStatus(w, http.StatusConflict, "Conflict",
+				"service port %d conflicts with hostPort on a matching pod — use one or the other", port)
 			return
 		}
 		s.generateServiceSocket(updated)
@@ -1380,7 +1398,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		if s.config.QuadletDir != "" {
-			if content, err := quadlet.JobContainer(updated.Name, updated, s.config.ConfigDir); err == nil {
+			if content, err := quadlet.JobContainer(updated.Name, updated, s.config.ConfigDir, s.podPVCMap(updated.Namespace, updated.Spec.Template.Spec)); err == nil {
 				writeQuadletFile(s.config.QuadletDir,
 					fmt.Sprintf("%s-%s-job.container", updated.Namespace, updated.Name), content)
 			}
@@ -1753,7 +1771,7 @@ func (s *Server) ReconcileQuadlets() {
 				Spec:       dep.Spec.Template.Spec,
 			}
 			pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
-			content, err := quadlet.Container(instanceName, pod, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, pod.Labels))
+			content, err := quadlet.Container(instanceName, pod, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, pod.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec))
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
@@ -1768,7 +1786,7 @@ func (s *Server) ReconcileQuadlets() {
 		if !missing(f) {
 			continue
 		}
-		content, err := quadlet.Container(pod.Name, pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels))
+		content, err := quadlet.Container(pod.Name, pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec))
 		if err != nil {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
@@ -1782,9 +1800,13 @@ func (s *Server) ReconcileQuadlets() {
 		if !missing(f) {
 			continue
 		}
-		content, err := quadlet.Volume(pvc.Name, pvc.Name)
+		content, err := quadlet.Volume(pvc)
 		if err != nil {
 			fmt.Printf("reconcile pvc %s/%s: %v\n", pvc.Namespace, pvc.Name, err)
+			continue
+		}
+		if content == nil {
+			// hostpath PVCs don't need a .volume file.
 			continue
 		}
 		write(quadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name), content, "")
@@ -1795,7 +1817,7 @@ func (s *Server) ReconcileQuadlets() {
 		if !missing(f) {
 			continue
 		}
-		content, err := quadlet.JobContainer(job.Name, job, s.config.ConfigDir)
+		content, err := quadlet.JobContainer(job.Name, job, s.config.ConfigDir, s.podPVCMap(job.Namespace, job.Spec.Template.Spec))
 		if err != nil {
 			fmt.Printf("reconcile job %s/%s: %v\n", job.Namespace, job.Name, err)
 			continue
@@ -1813,7 +1835,7 @@ func (s *Server) ReconcileQuadlets() {
 		tf := fmt.Sprintf("%s/%s-%s-cron.timer", timerDir, cj.Namespace, cj.Name)
 		regen := false
 		if missing(cf) {
-			content, err := quadlet.CronContainer(cj.Name, cj, s.config.ConfigDir)
+			content, err := quadlet.CronContainer(cj.Name, cj, s.config.ConfigDir, s.podPVCMap(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec))
 			if err != nil {
 				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
 				continue
@@ -1859,12 +1881,33 @@ func (s *Server) ReconcileQuadlets() {
 
 // --- Quadlet integration ---
 
+// podPVCMap builds a map from PVC claim name to PVC object for all PVC
+// volumes referenced in the given pod spec. This lets the quadlet generator
+// inspect storageClassName and annotations when emitting volume directives.
+func (s *Server) podPVCMap(ns string, spec corev1.PodSpec) map[string]*corev1.PersistentVolumeClaim {
+	var m map[string]*corev1.PersistentVolumeClaim
+	for _, vol := range spec.Volumes {
+		if vol.PersistentVolumeClaim == nil {
+			continue
+		}
+		pvc, err := s.config.Store.GetPVC(ns, vol.PersistentVolumeClaim.ClaimName)
+		if err != nil {
+			continue
+		}
+		if m == nil {
+			m = make(map[string]*corev1.PersistentVolumeClaim)
+		}
+		m[pvc.Name] = pvc
+	}
+	return m
+}
+
 func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
 	if s.config.QuadletDir == "" {
 		return
 	}
 	resolved := s.resolveEnvFrom(pod)
-	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels))
+	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec))
 	if err != nil {
 		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
 		return
@@ -1880,7 +1923,7 @@ func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
 		return
 	}
 	resolved := s.resolveEnvFrom(pod)
-	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels))
+	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec))
 	if err != nil {
 		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
 		return
@@ -1929,9 +1972,13 @@ func (s *Server) generatePVCVolume(pvc *corev1.PersistentVolumeClaim) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	content, err := quadlet.Volume(pvc.Name, pvc.Name)
+	content, err := quadlet.Volume(pvc)
 	if err != nil {
 		fmt.Printf("pvc volume %s: %v\n", pvc.Name, err)
+		return
+	}
+	if content == nil {
+		// hostpath PVCs don't need a .volume file.
 		return
 	}
 	if err := writeQuadletFile(s.config.QuadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name), content); err != nil {
@@ -1954,7 +2001,7 @@ func (s *Server) generateJobQuadlet(job *batchv1.Job) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	content, err := quadlet.JobContainer(job.Name, job, s.config.ConfigDir)
+	content, err := quadlet.JobContainer(job.Name, job, s.config.ConfigDir, s.podPVCMap(job.Namespace, job.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("job quadlet %s: %v\n", job.Name, err)
 		return
@@ -1987,7 +2034,7 @@ func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
 	if timerDir == "" {
 		timerDir = quadletDir
 	}
-	containerContent, err := quadlet.CronContainer(cj.Name, cj, s.config.ConfigDir)
+	containerContent, err := quadlet.CronContainer(cj.Name, cj, s.config.ConfigDir, s.podPVCMap(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("cronjob container %s: %v\n", cj.Name, err)
 		return
@@ -2147,7 +2194,7 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 	}
 	pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
 	resolved := s.resolveEnvFrom(pod)
-	content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels))
+	content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return
@@ -2238,6 +2285,57 @@ func (s *Server) removeNamespaceNetwork(ns string) {
 		return
 	}
 	s.reloadAfterRemove(fmt.Sprintf("%s/q8s-%s.network", s.config.QuadletDir, ns))
+}
+
+// serviceHostPortConflict checks whether any pod matching the Service's
+// selector already has a hostPort that would conflict with one of the
+// Service's ports. In q8s the Service socket unit and hostPort both bind
+// the same host interface — they're mutually exclusive.
+func (s *Server) serviceHostPortConflict(svc *corev1.Service) (int32, bool) {
+	for _, pod := range s.config.Store.AllPods() {
+		if pod.Namespace != svc.Namespace {
+			continue
+		}
+		if !matchesEqualitySelector(pod.Labels, svc.Spec.Selector) {
+			continue
+		}
+		for _, c := range pod.Spec.Containers {
+			for _, cp := range c.Ports {
+				if cp.HostPort == 0 {
+					continue
+				}
+				for _, sp := range svc.Spec.Ports {
+					if sp.Port == cp.HostPort {
+						return cp.HostPort, true
+					}
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// podHostPortConflict checks whether any Service in the pod's namespace
+// already has a socket unit for a port this pod wants as hostPort.
+func (s *Server) podHostPortConflict(pod *corev1.Pod) (int32, bool) {
+	for _, svc := range s.config.Store.Services(pod.Namespace) {
+		if !matchesEqualitySelector(pod.Labels, svc.Spec.Selector) {
+			continue
+		}
+		for _, c := range pod.Spec.Containers {
+			for _, cp := range c.Ports {
+				if cp.HostPort == 0 {
+					continue
+				}
+				for _, sp := range svc.Spec.Ports {
+					if sp.Port == cp.HostPort {
+						return cp.HostPort, true
+					}
+				}
+			}
+		}
+	}
+	return 0, false
 }
 
 func (s *Server) generateServiceSocket(svc *corev1.Service) {

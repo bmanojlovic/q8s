@@ -223,6 +223,12 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/apis/coordination.k8s.io", s.handleCoordinationRoot)
 	s.mux.HandleFunc("/apis/coordination.k8s.io/v1", s.handleCoordinationV1)
 	s.mux.HandleFunc("/apis/coordination.k8s.io/v1/namespaces/", s.handleLease)
+
+	// storage.k8s.io API group (kubectl get storageclasses)
+	s.mux.HandleFunc("/apis/storage.k8s.io", s.handleStorageRoot)
+	s.mux.HandleFunc("/apis/storage.k8s.io/v1", s.handleStorageV1)
+	s.mux.HandleFunc("/apis/storage.k8s.io/v1/storageclasses", s.handleStorageClasses)
+	s.mux.HandleFunc("/apis/storage.k8s.io/v1/storageclasses/", s.handleStorageClasses)
 }
 
 // parseNamespaceResource parses a path like /api/v1/namespaces/{ns}/pods or /api/v1/namespaces/{ns}/pods/{name}

@@ -2,9 +2,11 @@ package quadlet
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -15,13 +17,102 @@ import (
 // documented escape hatch for podman run flags it doesn't model directly).
 // resource.Quantity fields are validated by k8s's own JSON decoding before
 // they ever reach here, so no extra input validation is needed.
+//
+// Memory limits are only emitted when the cgroup memory controller is
+// available. On rootless systems where the memory controller isn't
+// delegated to the user session, setting a memory limit causes runc to
+// fail at container create. The limit is silently skipped in that case.
 func writeResourceLimits(b *strings.Builder, limits corev1.ResourceList) {
-	if mem, ok := limits[corev1.ResourceMemory]; ok && !mem.IsZero() {
+	if mem, ok := limits[corev1.ResourceMemory]; ok && !mem.IsZero() && cgroupMemoryAvailable() {
 		b.WriteString(fmt.Sprintf("Memory=%d\n", mem.Value()))
+		// Disable the swap limit so runc doesn't try to write
+		// memory.swap.max — which doesn't exist on cgroup v2 hosts
+		// without the swap controller.
+		b.WriteString("PodmanArgs=--memory-swap=-1\n")
 	}
-	if cpu, ok := limits[corev1.ResourceCPU]; ok && !cpu.IsZero() {
+	if cpu, ok := limits[corev1.ResourceCPU]; ok && !cpu.IsZero() && cgroupCPUAvailable() {
 		cores := float64(cpu.MilliValue()) / 1000.0
 		b.WriteString(fmt.Sprintf("PodmanArgs=--cpus=%s\n", strconv.FormatFloat(cores, 'f', -1, 64)))
+	}
+}
+
+// cgroupMemoryAvailable reports whether the cgroup v2 memory controller is
+// delegated to the current process. On rootless systems this is often just
+// "pids" unless the sysadmin enables memory delegation.
+func cgroupMemoryAvailable() bool {
+	cgroupOnce.Do(detectCgroupControllers)
+	return cgroupHasMemory
+}
+
+// cgroupCPUAvailable reports whether the cgroup v2 cpu controller is delegated.
+func cgroupCPUAvailable() bool {
+	cgroupOnce.Do(detectCgroupControllers)
+	return cgroupHasCPU
+}
+
+// cgroupControllersDetected is the combined set of detected cgroup controllers,
+// exposed for testing. Tests can override cgroupHasMemory/cgroupHasCPU via
+// SetCgroupOverride.
+var (
+	cgroupOnce      sync.Once
+	cgroupHasMemory bool
+	cgroupHasCPU    bool
+)
+
+// SetCgroupOverride forces the memory/cpu controller flags for testing.
+// It returns a function that restores the original values.
+func SetCgroupOverride(memory, cpu bool) func() {
+	cgroupOnce.Do(func() {}) // ensure detectCgroupControllers won't run
+	origMem, origCPU := cgroupHasMemory, cgroupHasCPU
+	cgroupHasMemory = memory
+	cgroupHasCPU = cpu
+	return func() {
+		cgroupHasMemory = origMem
+		cgroupHasCPU = origCPU
+	}
+}
+
+func detectCgroupControllers() {
+	// Default to available — safe for root and cgroup v1 systems where the
+	// detection below doesn't apply.
+	cgroupHasMemory = true
+	cgroupHasCPU = true
+
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return
+	}
+	// cgroup v2 unified: line starts with "0::/"
+	var cgroupPath string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "0::/") {
+			cgroupPath = strings.TrimPrefix(line, "0::")
+			break
+		}
+	}
+	if cgroupPath == "" {
+		return // cgroup v1 or unparseable — assume available
+	}
+
+	// Walk up from the process cgroup to find the nearest controllers file
+	// that reflects what our user session can delegate. The process's own
+	// cgroup.controllers shows what it inherited; the parent's
+	// cgroup.subtree_control shows what new children can use.
+	controllers, err := os.ReadFile("/sys/fs/cgroup" + cgroupPath + "/cgroup.controllers")
+	if err != nil {
+		return
+	}
+
+	fields := strings.Fields(string(controllers))
+	cgroupHasMemory = false
+	cgroupHasCPU = false
+	for _, f := range fields {
+		switch f {
+		case "memory":
+			cgroupHasMemory = true
+		case "cpu":
+			cgroupHasCPU = true
+		}
 	}
 }
 
@@ -32,7 +123,10 @@ func writeResourceLimits(b *strings.Builder, limits corev1.ResourceList) {
 // looking across Store objects, which this package has no access to), and
 // each one becomes a Podman network alias so aardvark-dns resolves the
 // Service name straight to this container.
-func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string) ([]byte, error) {
+// pvcMap maps PVC claim names to their full objects so that volume mounts
+// can inspect storageClassName and annotations. A nil map is safe and falls
+// back to the default (named volume with :Z).
+func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim) ([]byte, error) {
 	var b strings.Builder
 
 	b.WriteString("[Container]\n")
@@ -82,16 +176,19 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 		b.WriteString(fmt.Sprintf("Environment=%s=%s\n", env.Name, env.Value))
 	}
 
+	// Ports — only publish when hostPort is explicitly set.
+	// containerPort alone is informational (matches k8s semantics):
+	// the container listens on that port inside the namespace network,
+	// reachable via NetworkAlias from other pods.
 	for _, port := range pod.Spec.Containers[0].Ports {
-		hostPort := port.ContainerPort
-		if port.HostPort != 0 {
-			hostPort = port.HostPort
+		if port.HostPort == 0 {
+			continue
 		}
 		proto := "tcp"
 		if port.Protocol == corev1.ProtocolUDP {
 			proto = "udp"
 		}
-		b.WriteString(fmt.Sprintf("PublishPort=%d:%d/%s\n", hostPort, port.ContainerPort, proto))
+		b.WriteString(fmt.Sprintf("PublishPort=%d:%d/%s\n", port.HostPort, port.ContainerPort, proto))
 	}
 
 	// Volumes — resolve ConfigMap references to their on-disk directory.
@@ -109,7 +206,16 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 					if err := validateRefName("persistentVolumeClaim.claimName", vol.PersistentVolumeClaim.ClaimName); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s\n", pod.Namespace, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
+					if pvc, ok := pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
+						line, err := pvcVolumeDirective(pod.Namespace, pvc, vm.MountPath)
+						if err != nil {
+							return nil, err
+						}
+						b.WriteString(line)
+					} else {
+						// PVC not found in map — fall back to named volume with :Z
+						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s:Z\n", pod.Namespace, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
+					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
 						return nil, err
@@ -203,7 +309,7 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 
 // JobContainer generates a .container quadlet for a Job's pod template.
 // The unit runs once (no Restart) and exits with the container's exit code.
-func JobContainer(name string, job *batchv1.Job, configDir string) ([]byte, error) {
+func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim) ([]byte, error) {
 	spec := job.Spec.Template.Spec
 	ns := job.Namespace
 
@@ -261,7 +367,15 @@ func JobContainer(name string, job *batchv1.Job, configDir string) ([]byte, erro
 					if err := validateRefName("persistentVolumeClaim.claimName", vol.PersistentVolumeClaim.ClaimName); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
+					if pvc, ok := pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
+						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath)
+						if err != nil {
+							return nil, err
+						}
+						b.WriteString(line)
+					} else {
+						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s:Z\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
+					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
 						return nil, err
@@ -312,7 +426,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string) ([]byte, erro
 
 // CronContainer generates the .container quadlet for a CronJob's pod template.
 // It is triggered by the paired .timer unit, not installed directly.
-func CronContainer(name string, cj *batchv1.CronJob, configDir string) ([]byte, error) {
+func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim) ([]byte, error) {
 	spec := cj.Spec.JobTemplate.Spec.Template.Spec
 	ns := cj.Namespace
 
@@ -370,7 +484,15 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string) ([]byte, 
 					if err := validateRefName("persistentVolumeClaim.claimName", vol.PersistentVolumeClaim.ClaimName); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
+					if pvc, ok := pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
+						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath)
+						if err != nil {
+							return nil, err
+						}
+						b.WriteString(line)
+					} else {
+						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s:Z\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
+					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
 						return nil, err
@@ -466,14 +588,76 @@ func cronToOnCalendar(cron string) string {
 		toSys(month), toSys(dom), toSys(hour), toSys(minute))
 }
 
+// Storage class constants recognised by q8s.
+const (
+	// StorageClassStandard creates a podman named volume with exclusive
+	// SELinux relabelling (:Z). This is the default when no storageClassName
+	// is set.
+	StorageClassStandard = "standard"
+
+	// StorageClassShared creates a podman named volume with shared
+	// SELinux relabelling (:z), allowing multiple containers to access it.
+	StorageClassShared = "standard-shared"
+
+	// StorageClassHostPath bind-mounts a host directory into the container.
+	// The host path is read from the annotation AnnotationHostPath on the PVC.
+	StorageClassHostPath = "hostpath"
+
+	// AnnotationHostPath is the PVC annotation key that supplies the host
+	// directory for the "hostpath" storage class.
+	AnnotationHostPath = "q8s.io/host-path"
+)
+
+// pvcStorageClass returns the effective storage class for a PVC, defaulting
+// to "standard" when the field is nil or empty.
+func pvcStorageClass(pvc *corev1.PersistentVolumeClaim) string {
+	if pvc.Spec.StorageClassName != nil && *pvc.Spec.StorageClassName != "" {
+		return *pvc.Spec.StorageClassName
+	}
+	return StorageClassStandard
+}
+
 // Volume generates a .volume quadlet file content.
-func Volume(name string, pvcName string) ([]byte, error) {
+// For hostpath PVCs no .volume file is needed — the caller should skip
+// writing when nil bytes are returned with no error.
+func Volume(pvc *corev1.PersistentVolumeClaim) ([]byte, error) {
+	if pvcStorageClass(pvc) == StorageClassHostPath {
+		return nil, nil
+	}
+
 	var b strings.Builder
 
 	b.WriteString("[Volume]\n")
-	b.WriteString(fmt.Sprintf("VolumeName=%s\n", pvcName))
+	b.WriteString(fmt.Sprintf("VolumeName=%s\n", pvc.Name))
 
 	return []byte(b.String()), nil
+}
+
+// pvcVolumeDirective returns the Volume= value for a PVC-backed volume mount.
+// It inspects the PVC's storageClassName and annotations to decide between a
+// named-volume reference (with :Z or :z) and a hostpath bind mount.
+func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath string) (string, error) {
+	class := pvcStorageClass(pvc)
+	switch class {
+	case StorageClassStandard:
+		return fmt.Sprintf("Volume=%s-%s.volume:%s:Z\n", ns, pvc.Name, mountPath), nil
+	case StorageClassShared:
+		return fmt.Sprintf("Volume=%s-%s.volume:%s:z\n", ns, pvc.Name, mountPath), nil
+	case StorageClassHostPath:
+		hostPath, ok := pvc.Annotations[AnnotationHostPath]
+		if !ok || hostPath == "" {
+			return "", fmt.Errorf("PVC %s/%s uses storageClass %q but is missing annotation %s",
+				ns, pvc.Name, StorageClassHostPath, AnnotationHostPath)
+		}
+		if err := validatePath("host-path annotation", hostPath); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Volume=%s:%s:Z\n", hostPath, mountPath), nil
+	default:
+		// Unknown class — fall back to named volume without SELinux option
+		// for forward compatibility.
+		return fmt.Sprintf("Volume=%s-%s.volume:%s\n", ns, pvc.Name, mountPath), nil
+	}
 }
 
 // Network generates a .network quadlet file content.
