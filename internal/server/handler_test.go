@@ -1270,3 +1270,52 @@ func TestUnknownResource(t *testing.T) {
 	assertStatus(t, resp, 404)
 	resp.Body.Close()
 }
+
+
+// --- StorageClasses ---
+
+func TestStorageClassList(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := get(t, ts.URL+"/apis/storage.k8s.io/v1/storageclasses")
+	assertStatus(t, resp, 200)
+	m := decodeBody(t, resp)
+	assertKind(t, m, "StorageClassList")
+
+	items := m["items"].([]interface{})
+	if len(items) != 3 {
+		t.Fatalf("expected 3 storage classes, got %d", len(items))
+	}
+
+	names := make(map[string]bool)
+	for _, item := range items {
+		sc := item.(map[string]interface{})
+		meta := sc["metadata"].(map[string]interface{})
+		names[meta["name"].(string)] = true
+	}
+	for _, want := range []string{"standard", "standard-shared", "hostpath"} {
+		if !names[want] {
+			t.Errorf("missing storage class %q", want)
+		}
+	}
+}
+
+func TestStorageClassGet(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := get(t, ts.URL+"/apis/storage.k8s.io/v1/storageclasses/standard")
+	assertStatus(t, resp, 200)
+	m := decodeBody(t, resp)
+	if m["kind"] != "StorageClass" {
+		t.Fatalf("expected kind=StorageClass, got %v", m["kind"])
+	}
+	meta := m["metadata"].(map[string]interface{})
+	if meta["name"] != "standard" {
+		t.Fatalf("expected name=standard, got %v", meta["name"])
+	}
+}
+
+func TestStorageClassGetNotFound(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := get(t, ts.URL+"/apis/storage.k8s.io/v1/storageclasses/nonexistent")
+	assertStatus(t, resp, 404)
+	resp.Body.Close()
+}

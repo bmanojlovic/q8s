@@ -19,6 +19,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/version"
+
+	"q8s/internal/quadlet"
 )
 
 // openapiV2Proto holds the lazily-computed protobuf encoding of openapiV2Schema.
@@ -133,6 +135,16 @@ func (s *Server) handleAPIsRoot(w http.ResponseWriter, r *http.Request) {
 				},
 				PreferredVersion: metav1.GroupVersionForDiscovery{
 					GroupVersion: "coordination.k8s.io/v1",
+					Version:      "v1",
+				},
+			},
+			{
+				Name: "storage.k8s.io",
+				Versions: []metav1.GroupVersionForDiscovery{
+					{GroupVersion: "storage.k8s.io/v1", Version: "v1"},
+				},
+				PreferredVersion: metav1.GroupVersionForDiscovery{
+					GroupVersion: "storage.k8s.io/v1",
 					Version:      "v1",
 				},
 			},
@@ -718,12 +730,115 @@ const openapiV2Schema = `{
     "io.k8s.api.batch.v1.CronJob":                     {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
     "io.k8s.api.batch.v1.CronJobList":                 {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
     "io.k8s.api.networking.v1.Ingress":                {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.networking.v1.IngressList":            {"type": "object", "x-kubernetes-preserve-unknown-fields": true}
+    "io.k8s.api.networking.v1.IngressList":            {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
+    "io.k8s.api.storage.v1.StorageClass":              {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
+    "io.k8s.api.storage.v1.StorageClassList":          {"type": "object", "x-kubernetes-preserve-unknown-fields": true}
   }
 }`
 
 func verbList() []string {
 	return []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"}
+}
+
+// --- storage.k8s.io ---
+
+// handleStorageRoot serves the storage.k8s.io API group discovery.
+func (s *Server) handleStorageRoot(w http.ResponseWriter, r *http.Request) {
+	data, _ := json.Marshal(metav1.APIGroup{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "APIGroup"},
+		Name:     "storage.k8s.io",
+		Versions: []metav1.GroupVersionForDiscovery{
+			{GroupVersion: "storage.k8s.io/v1", Version: "v1"},
+		},
+		PreferredVersion: metav1.GroupVersionForDiscovery{
+			GroupVersion: "storage.k8s.io/v1",
+			Version:      "v1",
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+// handleStorageV1 serves the storage.k8s.io/v1 resource list.
+func (s *Server) handleStorageV1(w http.ResponseWriter, r *http.Request) {
+	data, _ := json.Marshal(metav1.APIResourceList{
+		TypeMeta:     metav1.TypeMeta{APIVersion: "v1", Kind: "APIResourceList"},
+		GroupVersion: "storage.k8s.io/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "storageclasses", SingularName: "storageclass", Namespaced: false, Kind: "StorageClass", Verbs: []string{"get", "list"}, ShortNames: []string{"sc"}},
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+// handleStorageClasses returns the fixed set of storage classes supported by q8s.
+func (s *Server) handleStorageClasses(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract name from path: /apis/storage.k8s.io/v1/storageclasses/{name}
+	path := strings.TrimPrefix(r.URL.Path, "/apis/storage.k8s.io/v1/storageclasses")
+	name := strings.Trim(path, "/")
+
+	classes := []map[string]interface{}{
+		{
+			"apiVersion": "storage.k8s.io/v1",
+			"kind":       "StorageClass",
+			"metadata": map[string]interface{}{
+				"name": quadlet.StorageClassStandard,
+				"annotations": map[string]string{
+					"storageclass.kubernetes.io/is-default-class": "true",
+				},
+			},
+			"provisioner":       "q8s.io/podman-volume",
+			"reclaimPolicy":     "Retain",
+			"volumeBindingMode": "Immediate",
+		},
+		{
+			"apiVersion": "storage.k8s.io/v1",
+			"kind":       "StorageClass",
+			"metadata":   map[string]interface{}{"name": quadlet.StorageClassShared},
+			"provisioner":       "q8s.io/podman-volume",
+			"reclaimPolicy":     "Retain",
+			"volumeBindingMode": "Immediate",
+		},
+		{
+			"apiVersion": "storage.k8s.io/v1",
+			"kind":       "StorageClass",
+			"metadata":   map[string]interface{}{"name": quadlet.StorageClassHostPath},
+			"provisioner":       "q8s.io/host-path",
+			"reclaimPolicy":     "Retain",
+			"volumeBindingMode": "Immediate",
+		},
+	}
+
+	// Single storageclass GET
+	if name != "" {
+		for _, sc := range classes {
+			meta := sc["metadata"].(map[string]interface{})
+			if meta["name"] == name {
+				data, _ := json.Marshal(sc)
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(data)
+				return
+			}
+		}
+		s.respondStatus(w, http.StatusNotFound, "NotFound", "storageclasses %q not found", name)
+		return
+	}
+
+	// List
+	data, _ := json.Marshal(map[string]interface{}{
+		"apiVersion": "storage.k8s.io/v1",
+		"kind":       "StorageClassList",
+		"metadata":   map[string]interface{}{"resourceVersion": s.rv()},
+		"items":      classes,
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
 }
 
 // DiscoveryResources returns the API resources for kubectl discovery.

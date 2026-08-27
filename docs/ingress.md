@@ -72,7 +72,7 @@ File location: `~/.local/share/q8s/traefik/{namespace}-{name}.yaml`
 internet → traefik (host, :80/:443) → localhost:{published_port} → podman container
 ```
 
-1. Deployment publishes a port to the host via `PublishPort` in the quadlet
+1. Deployment publishes a port to the host via `hostPort` (→ `PublishPort` in quadlet) or a Service (→ systemd `.socket` unit)
 2. `kubectl create ingress` → q8s writes `{dataDir}/traefik/{ns}-{name}.yaml`
 3. Traefik's file provider detects the new file, applies the routing
 4. `kubectl delete ingress` → q8s removes the file, traefik drops the route
