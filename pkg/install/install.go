@@ -23,6 +23,8 @@ import (
 type InstallConfig struct {
 	Rootful bool
 	Home    string
+	// Name is the kubeconfig cluster/context name. Defaults to the hostname.
+	Name string
 	// Port is the TCP port the API server listens on. Defaults to 6443.
 	Port int
 	// ServerURL is the server address for kubeconfig. Defaults to https://localhost:{port}.
@@ -39,6 +41,7 @@ type InstallConfig struct {
 // It survives cert regeneration and is the source of truth for port, server URL,
 // and certificate SANs.
 type PersistentConfig struct {
+	Name        string   `json:"name"`
 	Port        int      `json:"port"`
 	ServerURL   string   `json:"serverURL"`
 	ExtraSANIPs []string `json:"extraSANIPs,omitempty"`
@@ -171,6 +174,19 @@ func Install(cfg InstallConfig) error {
 	// Merge: new flags override, existing values fill gaps.
 	pcfg := PersistentConfig{Port: cfg.Port}
 
+	if cfg.Name != "" {
+		pcfg.Name = cfg.Name
+	} else if existing.Name != "" {
+		pcfg.Name = existing.Name
+	} else {
+		hostname, _ := os.Hostname()
+		pcfg.Name = hostname
+		switch hostname {
+		case "localhost", "ubuntu", "fedora", "debian", "archlinux", "opensuse", "rhel", "centos", "rocky", "alma":
+			fmt.Printf("Warning: hostname %q is a distro default — consider q8s install --name <unique-name> to avoid kubeconfig collisions.\n", hostname)
+		}
+	}
+
 	if cfg.ServerURL != "" {
 		pcfg.ServerURL = normalizeServerURL(cfg.ServerURL, cfg.Port)
 	} else if existing.ServerURL != "" {
@@ -270,10 +286,10 @@ func Install(cfg InstallConfig) error {
 	fmt.Printf("Data directory: %s\n", dataDir)
 	fmt.Println()
 	fmt.Println("To configure kubectl, run:")
-	fmt.Printf("  kubectl config set-cluster q8s --server=%s --certificate-authority=%s/certs/ca.crt --client-certificate=%s/certs/client.crt --client-key=%s/certs/client.key --embed-certs=true\n", pcfg.ServerURL, dataDir, dataDir, dataDir)
-	fmt.Println("  kubectl config set-credentials q8s-user --embed-certs=true")
-	fmt.Println("  kubectl config set-context q8s --cluster=q8s --user=q8s-user")
-	fmt.Println("  kubectl config use-context q8s")
+	fmt.Printf("  kubectl config set-cluster %s --server=%s --certificate-authority=%s/certs/ca.crt --client-certificate=%s/certs/client.crt --client-key=%s/certs/client.key --embed-certs=true\n", pcfg.Name, pcfg.ServerURL, dataDir, dataDir, dataDir)
+	fmt.Printf("  kubectl config set-credentials %s-user --embed-certs=true\n", pcfg.Name)
+	fmt.Printf("  kubectl config set-context %s --cluster=%s --user=%s-user\n", pcfg.Name, pcfg.Name, pcfg.Name)
+	fmt.Printf("  kubectl config use-context %s\n", pcfg.Name)
 	fmt.Println()
 	fmt.Println("Or import directly:")
 	fmt.Printf("  %s kubeconfig | kubectl config merge --flatten -\n", binInstallPath(cfg.Rootful, cfg.Home))

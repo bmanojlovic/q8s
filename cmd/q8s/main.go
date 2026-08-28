@@ -164,6 +164,7 @@ func cmdInstall() {
 	var extraIPs []net.IP
 	var extraDNS []string
 	var serverURL string
+	var name string
 	regenCerts := false
 
 	args := os.Args[2:]
@@ -173,11 +174,19 @@ func cmdInstall() {
 			fmt.Println("Usage: q8s install [flags]")
 			fmt.Println()
 			fmt.Println("Flags:")
+			fmt.Println("  --name <name>        Cluster/context name for kubeconfig (default: hostname)")
 			fmt.Println("  --san-ip <ip>        Add extra IP to server certificate SAN")
 			fmt.Println("  --san-dns <name>     Add extra DNS name to server certificate SAN")
 			fmt.Println("  --server <url>       Server URL for kubeconfig (default: https://localhost:{port})")
 			fmt.Println("  --regenerate-certs   Force certificate regeneration")
 			return
+		case "--name":
+			i++
+			if i >= len(args) {
+				fmt.Fprintln(os.Stderr, "--name requires a value")
+				os.Exit(1)
+			}
+			name = args[i]
 		case "--san-ip":
 			i++
 			if i >= len(args) {
@@ -217,6 +226,7 @@ func cmdInstall() {
 	if err := install.Install(install.InstallConfig{
 		Rootful:         rootful,
 		Home:            os.Getenv("HOME"),
+		Name:            name,
 		Port:            resolvePort(d),
 		ServerURL:       serverURL,
 		ExtraSANIPs:     extraIPs,
@@ -399,9 +409,15 @@ func cmdKubeconfig() {
 	certDir := d.dataDir + "/certs"
 	port := resolvePort(d)
 
+	name := "q8s"
 	serverURL := fmt.Sprintf("https://localhost:%d", port)
-	if cfg, err := install.LoadConfig(d.dataDir); err == nil && cfg.ServerURL != "" {
-		serverURL = cfg.ServerURL
+	if cfg, err := install.LoadConfig(d.dataDir); err == nil {
+		if cfg.ServerURL != "" {
+			serverURL = cfg.ServerURL
+		}
+		if cfg.Name != "" {
+			name = cfg.Name
+		}
 	}
 
 	readB64 := func(path string) string {
@@ -418,20 +434,20 @@ clusters:
 - cluster:
     certificate-authority-data: %s
     server: %s
-  name: q8s
+  name: %s
 contexts:
 - context:
-    cluster: q8s
-    user: q8s-user
-  name: q8s
-current-context: q8s
+    cluster: %s
+    user: %s-user
+  name: %s
+current-context: %s
 preferences: {}
 users:
-- name: q8s-user
+- name: %s-user
   user:
     client-certificate-data: %s
     client-key-data: %s
-`, readB64(certDir+"/ca.crt"), serverURL, readB64(certDir+"/client.crt"), readB64(certDir+"/client.key"))
+`, readB64(certDir+"/ca.crt"), serverURL, name, name, name, name, name, name, readB64(certDir+"/client.crt"), readB64(certDir+"/client.key"))
 }
 
 // --- Server ---
