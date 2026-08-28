@@ -39,16 +39,36 @@ kubectl config use-context q8s
 ## Commands
 
 ```sh
-q8s install    # generate certs, install systemd units, copy binary to ~/.local/bin/
+q8s install    # generate certs, create dirs, install systemd units
+q8s install --server https://myhost:6443  # set server URL for kubeconfig
+q8s install --san-ip 10.0.0.5 --san-dns myhost  # add cert SANs (persisted)
+q8s install --regenerate-certs  # regen certs keeping persisted SANs
 q8s uninstall  # remove systemd units
 q8s serve      # run API server directly (no systemd)
 q8s start      # start q8s.socket (begin accepting connections)
 q8s stop       # stop socket and service
-q8s enable     # enable and start socket (persist across reboots)
+q8s enable     # enable and start socket on boot
 q8s disable    # disable socket
 q8s status     # show socket/service state
-q8s kubeconfig # print kubeconfig to stdout
+q8s kubeconfig # print kubeconfig to stdout (uses persisted server URL)
 ```
+
+## Persistent configuration
+
+`q8s install` writes `{dataDir}/config.json` with install-time settings:
+
+```json
+{
+  "port": 6443,
+  "serverURL": "https://myhost:6443",
+  "extraSANIPs": ["10.0.0.5"],
+  "extraSANDNS": ["myhost"]
+}
+```
+
+- **Port** and **serverURL** are used by `q8s kubeconfig` and `q8s status`
+- **SANs** survive cert regeneration — no need to re-pass `--san-ip`/`--san-dns`
+- Port can be overridden per-invocation with `Q8S_PORT` env var
 
 ## Pod-to-Quadlet mapping
 

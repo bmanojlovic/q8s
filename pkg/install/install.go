@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -23,12 +25,56 @@ type InstallConfig struct {
 	Home    string
 	// Port is the TCP port the API server listens on. Defaults to 6443.
 	Port int
+	// ServerURL is the server address for kubeconfig. Defaults to https://localhost:{port}.
+	ServerURL string
 	// ExtraSANIPs are additional IP addresses to include in the server certificate SAN.
 	ExtraSANIPs []net.IP
 	// ExtraSANDNS are additional DNS names to include in the server certificate SAN.
 	ExtraSANDNS []string
 	// RegenerateCerts forces certificate regeneration even if they already exist.
 	RegenerateCerts bool
+}
+
+// PersistentConfig is the install-time configuration persisted to config.json.
+// It survives cert regeneration and is the source of truth for port, server URL,
+// and certificate SANs.
+type PersistentConfig struct {
+	Port        int      `json:"port"`
+	ServerURL   string   `json:"serverURL"`
+	ExtraSANIPs []string `json:"extraSANIPs,omitempty"`
+	ExtraSANDNS []string `json:"extraSANDNS,omitempty"`
+}
+
+// ConfigPath returns the path to config.json for the given dataDir.
+func ConfigPath(dataDir string) string {
+	return filepath.Join(dataDir, "config.json")
+}
+
+// LoadConfig reads the persistent config from dataDir/config.json.
+// Returns a zero-value config (not an error) if the file doesn't exist.
+func LoadConfig(dataDir string) (PersistentConfig, error) {
+	data, err := os.ReadFile(ConfigPath(dataDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return PersistentConfig{}, nil
+		}
+		return PersistentConfig{}, err
+	}
+	var cfg PersistentConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return PersistentConfig{}, fmt.Errorf("parse config.json: %w", err)
+	}
+	return cfg, nil
+}
+
+// SaveConfig writes the persistent config to dataDir/config.json.
+func SaveConfig(dataDir string, cfg PersistentConfig) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(ConfigPath(dataDir), data, 0600)
 }
 
 // DefaultPort is the standard q8s API port (matches kube-apiserver's default).
@@ -119,6 +165,59 @@ func Install(cfg InstallConfig) error {
 		}
 	}
 
+	// Load existing persistent config (preserves SANs across regen).
+	existing, _ := LoadConfig(dataDir)
+
+	// Merge: new flags override, existing values fill gaps.
+	pcfg := PersistentConfig{Port: cfg.Port}
+
+	if cfg.ServerURL != "" {
+		pcfg.ServerURL = normalizeServerURL(cfg.ServerURL, cfg.Port)
+	} else if existing.ServerURL != "" {
+		pcfg.ServerURL = existing.ServerURL
+	} else {
+		pcfg.ServerURL = fmt.Sprintf("https://localhost:%d", cfg.Port)
+	}
+
+	// SANs: merge new flags with previously persisted ones.
+	sanIPSet := make(map[string]bool)
+	var sanIPs []net.IP
+	addIP := func(ip net.IP) {
+		s := ip.String()
+		if !sanIPSet[s] {
+			sanIPSet[s] = true
+			sanIPs = append(sanIPs, ip)
+			pcfg.ExtraSANIPs = append(pcfg.ExtraSANIPs, s)
+		}
+	}
+	for _, ip := range cfg.ExtraSANIPs {
+		addIP(ip)
+	}
+	for _, s := range existing.ExtraSANIPs {
+		if ip := net.ParseIP(s); ip != nil {
+			addIP(ip)
+		}
+	}
+
+	sanDNSSet := make(map[string]bool)
+	addDNS := func(name string) {
+		if !sanDNSSet[name] {
+			sanDNSSet[name] = true
+			pcfg.ExtraSANDNS = append(pcfg.ExtraSANDNS, name)
+		}
+	}
+	for _, name := range cfg.ExtraSANDNS {
+		addDNS(name)
+	}
+	for _, name := range existing.ExtraSANDNS {
+		addDNS(name)
+	}
+
+	// Persist config before anything else so SANs survive partial failures.
+	if err := SaveConfig(dataDir, pcfg); err != nil {
+		return fmt.Errorf("failed to write config.json: %w", err)
+	}
+
 	// Install binary to a well-known PATH location
 	binPath := binInstallPath(cfg.Rootful, cfg.Home)
 	if err := installBinary(binPath); err != nil {
@@ -132,8 +231,9 @@ func Install(cfg InstallConfig) error {
 		certsExist = true
 	}
 	certsRegenerated := false
-	if !certsExist || cfg.RegenerateCerts || len(cfg.ExtraSANIPs) > 0 || len(cfg.ExtraSANDNS) > 0 {
-		certs := generateCerts(cfg.ExtraSANIPs, cfg.ExtraSANDNS)
+	newSANs := len(cfg.ExtraSANIPs) > 0 || len(cfg.ExtraSANDNS) > 0
+	if !certsExist || cfg.RegenerateCerts || newSANs {
+		certs := generateCerts(sanIPs, pcfg.ExtraSANDNS)
 		if err := writeCerts(dataDir, certs); err != nil {
 			return fmt.Errorf("failed to write certs: %w", err)
 		}
@@ -168,13 +268,15 @@ func Install(cfg InstallConfig) error {
 	fmt.Println("=== q8s installed successfully ===")
 	fmt.Println()
 	fmt.Printf("Data directory: %s\n", dataDir)
-	fmt.Printf("Quadlet directory: %s/quadlets\n", dataDir)
 	fmt.Println()
 	fmt.Println("To configure kubectl, run:")
-	fmt.Printf("  kubectl config set-cluster q8s --server=https://localhost:%d --certificate-authority=%s/certs/ca.crt --client-certificate=%s/certs/client.crt --client-key=%s/certs/client.key --embed-certs=true\n", cfg.Port, dataDir, dataDir, dataDir)
+	fmt.Printf("  kubectl config set-cluster q8s --server=%s --certificate-authority=%s/certs/ca.crt --client-certificate=%s/certs/client.crt --client-key=%s/certs/client.key --embed-certs=true\n", pcfg.ServerURL, dataDir, dataDir, dataDir)
 	fmt.Println("  kubectl config set-credentials q8s-user --embed-certs=true")
 	fmt.Println("  kubectl config set-context q8s --cluster=q8s --user=q8s-user")
 	fmt.Println("  kubectl config use-context q8s")
+	fmt.Println()
+	fmt.Println("Or import directly:")
+	fmt.Printf("  %s kubeconfig | kubectl config merge --flatten -\n", binInstallPath(cfg.Rootful, cfg.Home))
 	fmt.Println()
 	fmt.Println("To start the API server via systemd:")
 	if cfg.Rootful {
@@ -427,4 +529,19 @@ func appendStrings(base, extra []string) []string {
 		}
 	}
 	return base
+}
+
+// normalizeServerURL ensures the server URL has an https:// scheme and a port.
+func normalizeServerURL(raw string, port int) string {
+	if !strings.HasPrefix(raw, "https://") && !strings.HasPrefix(raw, "http://") {
+		raw = "https://" + raw
+	}
+	// If no port in the URL, append the configured port.
+	// A bare hostname like "https://myhost" has no colon after the host.
+	u := strings.TrimPrefix(raw, "https://")
+	u = strings.TrimPrefix(u, "http://")
+	if !strings.Contains(u, ":") {
+		raw = fmt.Sprintf("%s:%d", raw, port)
+	}
+	return raw
 }

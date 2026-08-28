@@ -114,6 +114,7 @@ All API traffic uses mutual TLS (mTLS). No certificate = 401. Certificates are E
 
 ```
 ~/.local/share/q8s/                  # dataDir (rootless)
+  config.json                        # persistent install config (port, serverURL, SANs)
   store.json                         # persisted resource state
   certs/                             # TLS certificates
 

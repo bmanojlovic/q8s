@@ -137,6 +137,10 @@ func resolvePort(d dirs) int {
 		}
 		fmt.Fprintf(os.Stderr, "warning: ignoring invalid Q8S_PORT %q\n", v)
 	}
+	if cfg, err := install.LoadConfig(d.dataDir); err == nil && cfg.Port > 0 {
+		return cfg.Port
+	}
+	// Fallback: parse from socket unit (pre-config.json installs).
 	if data, err := os.ReadFile(d.systemdDir + "/q8s.socket"); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			v, ok := strings.CutPrefix(strings.TrimSpace(line), "ListenStream=")
@@ -159,6 +163,7 @@ func cmdInstall() {
 
 	var extraIPs []net.IP
 	var extraDNS []string
+	var serverURL string
 	regenCerts := false
 
 	args := os.Args[2:]
@@ -170,6 +175,7 @@ func cmdInstall() {
 			fmt.Println("Flags:")
 			fmt.Println("  --san-ip <ip>        Add extra IP to server certificate SAN")
 			fmt.Println("  --san-dns <name>     Add extra DNS name to server certificate SAN")
+			fmt.Println("  --server <url>       Server URL for kubeconfig (default: https://localhost:{port})")
 			fmt.Println("  --regenerate-certs   Force certificate regeneration")
 			return
 		case "--san-ip":
@@ -193,6 +199,13 @@ func cmdInstall() {
 			}
 			extraDNS = append(extraDNS, args[i])
 			regenCerts = true
+		case "--server":
+			i++
+			if i >= len(args) {
+				fmt.Fprintln(os.Stderr, "--server requires a value")
+				os.Exit(1)
+			}
+			serverURL = args[i]
 		case "--regenerate-certs":
 			regenCerts = true
 		default:
@@ -205,6 +218,7 @@ func cmdInstall() {
 		Rootful:         rootful,
 		Home:            os.Getenv("HOME"),
 		Port:            resolvePort(d),
+		ServerURL:       serverURL,
 		ExtraSANIPs:     extraIPs,
 		ExtraSANDNS:     extraDNS,
 		RegenerateCerts: regenCerts,
@@ -384,6 +398,12 @@ func cmdKubeconfig() {
 	d := resolveDirs(os.Getuid() == 0)
 	certDir := d.dataDir + "/certs"
 	port := resolvePort(d)
+
+	serverURL := fmt.Sprintf("https://localhost:%d", port)
+	if cfg, err := install.LoadConfig(d.dataDir); err == nil && cfg.ServerURL != "" {
+		serverURL = cfg.ServerURL
+	}
+
 	readB64 := func(path string) string {
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -397,7 +417,7 @@ kind: Config
 clusters:
 - cluster:
     certificate-authority-data: %s
-    server: https://localhost:%d
+    server: %s
   name: q8s
 contexts:
 - context:
@@ -411,7 +431,7 @@ users:
   user:
     client-certificate-data: %s
     client-key-data: %s
-`, readB64(certDir+"/ca.crt"), port, readB64(certDir+"/client.crt"), readB64(certDir+"/client.key"))
+`, readB64(certDir+"/ca.crt"), serverURL, readB64(certDir+"/client.crt"), readB64(certDir+"/client.key"))
 }
 
 // --- Server ---
