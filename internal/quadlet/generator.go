@@ -297,7 +297,16 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 		b.WriteString("StartLimitBurst=5\n")
 		b.WriteString("StartLimitIntervalSec=60\n")
 		b.WriteString("\n[Service]\n")
-		b.WriteString("Restart=on-failure\n")
+		if pod.Spec.RestartPolicy == corev1.RestartPolicyAlways {
+			// Always means restart regardless of exit code -- on-failure
+			// would silently strand the pod as "Succeeded" on a clean
+			// exit 0 (confirmed live 2026-08-29: a container that exited
+			// 0 due to missing config never restarted, even though the
+			// Deployment's replicas stayed at 1).
+			b.WriteString("Restart=always\n")
+		} else {
+			b.WriteString("Restart=on-failure\n")
+		}
 		b.WriteString("RestartSec=5\n")
 	}
 
