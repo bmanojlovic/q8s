@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -125,6 +126,76 @@ func installBinary(dst string) error {
 		return err
 	}
 	return os.Rename(tmp, dst)
+}
+
+// certsNeedRegen decides whether TLS certs must be regenerated: always when
+// they don't exist or --regenerate-certs was passed; otherwise only when the
+// merged SAN list differs from what was previously persisted. Unchanged SANs
+// on re-run must not mint a fresh identity.
+func certsNeedRegen(certsExist, force bool, merged, existing PersistentConfig) bool {
+	if !certsExist || force {
+		return true
+	}
+	return !sameStrings(merged.ExtraSANIPs, existing.ExtraSANIPs) ||
+		!sameStrings(merged.ExtraSANDNS, existing.ExtraSANDNS)
+}
+
+// sameStrings reports whether two string slices contain the same set.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]bool, len(a))
+	for _, s := range a {
+		seen[s] = true
+	}
+	for _, s := range b {
+		if !seen[s] {
+			return false
+		}
+	}
+	return true
+}
+
+// restartService restarts q8s-api and verifies the restart actually
+// happened. A plain `systemctl restart` can report success without anything
+// changing (e.g. on a socket-activated service whose process was started
+// outside systemd), which would leave the server serving the old
+// certificate silently. The MainPID check plus the stop/start fallback turn
+// that failure mode into a loud warning instead.
+func restartService(systemctlArgs []string) {
+	mainPID := func() int {
+		out, err := exec.Command("systemctl", append(systemctlArgs, "show", "q8s-api.service", "-p", "MainPID", "--value")...).Output()
+		if err != nil {
+			return -1
+		}
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(out)))
+		return pid
+	}
+
+	before := mainPID()
+	if err := exec.Command("systemctl", append(systemctlArgs, "restart", "q8s-api.service")...).Run(); err != nil {
+		fmt.Printf("Warning: systemctl restart q8s-api.service failed: %v — restart it manually to load the new certificates.\n", err)
+		return
+	}
+	time.Sleep(500 * time.Millisecond)
+	if after := mainPID(); after > 0 && after != before {
+		fmt.Println("Restarted q8s-api.service to load new certificates.")
+		return
+	}
+	// The restart didn't move the service (or it wasn't managed by systemd
+	// at all) — try an explicit stop/start.
+	exec.Command("systemctl", append(systemctlArgs, "stop", "q8s-api.service")...).Run()
+	if err := exec.Command("systemctl", append(systemctlArgs, "start", "q8s-api.service")...).Run(); err != nil {
+		fmt.Printf("Warning: starting q8s-api.service failed: %v — start it manually to load the new certificates.\n", err)
+		return
+	}
+	time.Sleep(500 * time.Millisecond)
+	if after := mainPID(); after > 0 && after != before {
+		fmt.Println("Restarted q8s-api.service to load new certificates.")
+		return
+	}
+	fmt.Println("Warning: could not verify q8s-api.service restarted — restart it manually to load the new certificates.")
 }
 
 // Install sets up q8s: generates TLS certs, creates directories, installs systemd units.
@@ -241,14 +312,16 @@ func Install(cfg InstallConfig) error {
 	}
 	fmt.Printf("Binary installed to %s\n", binPath)
 
-	// Generate TLS certs if they don't exist or regeneration is requested
+	// Generate TLS certs if they don't exist or regeneration is requested.
+	// Re-running install with an unchanged SAN list must not mint a fresh
+	// CA/client identity — callers that merge repeated kubeconfig fetches
+	// would otherwise accumulate stale, unusable entries under one context.
 	certsExist := false
 	if _, err := os.Stat(filepath.Join(dataDir, "certs", "ca.crt")); err == nil {
 		certsExist = true
 	}
 	certsRegenerated := false
-	newSANs := len(cfg.ExtraSANIPs) > 0 || len(cfg.ExtraSANDNS) > 0
-	if !certsExist || cfg.RegenerateCerts || newSANs {
+	if certsNeedRegen(certsExist, cfg.RegenerateCerts, pcfg, existing) {
 		certs := generateCerts(sanIPs, pcfg.ExtraSANDNS)
 		if err := writeCerts(dataDir, certs); err != nil {
 			return fmt.Errorf("failed to write certs: %w", err)
@@ -274,10 +347,7 @@ func Install(cfg InstallConfig) error {
 		if cfg.Rootful {
 			systemctlArgs = nil
 		}
-		restartArgs := append(systemctlArgs, "restart", "q8s-api.service")
-		if err := exec.Command("systemctl", restartArgs...).Run(); err == nil {
-			fmt.Println("Restarted q8s-api.service to load new certificates.")
-		}
+		restartService(systemctlArgs)
 	}
 
 	// Print instructions
@@ -287,8 +357,8 @@ func Install(cfg InstallConfig) error {
 	fmt.Println()
 	fmt.Println("To configure kubectl, run:")
 	fmt.Printf("  kubectl config set-cluster %s --server=%s --certificate-authority=%s/certs/ca.crt --client-certificate=%s/certs/client.crt --client-key=%s/certs/client.key --embed-certs=true\n", pcfg.Name, pcfg.ServerURL, dataDir, dataDir, dataDir)
-	fmt.Printf("  kubectl config set-credentials %s-user --embed-certs=true\n", pcfg.Name)
-	fmt.Printf("  kubectl config set-context %s --cluster=%s --user=%s-user\n", pcfg.Name, pcfg.Name, pcfg.Name)
+	fmt.Printf("  kubectl config set-credentials %s --embed-certs=true\n", pcfg.Name)
+	fmt.Printf("  kubectl config set-context %s --cluster=%s --user=%s\n", pcfg.Name, pcfg.Name, pcfg.Name)
 	fmt.Printf("  kubectl config use-context %s\n", pcfg.Name)
 	fmt.Println()
 	fmt.Println("Or import directly:")

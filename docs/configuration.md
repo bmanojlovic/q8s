@@ -22,8 +22,8 @@ kubectl config set-cluster q8s \
   --client-key=~/.local/share/q8s/certs/client.key \
   --embed-certs=true
 
-kubectl config set-credentials q8s-user --embed-certs=true
-kubectl config set-context q8s --cluster=q8s --user=q8s-user
+kubectl config set-credentials q8s --embed-certs=true
+kubectl config set-context q8s --cluster=q8s --user=q8s
 kubectl config use-context q8s
 ```
 
@@ -69,6 +69,10 @@ q8s kubeconfig # print kubeconfig to stdout (uses persisted server URL)
 - **Port** and **serverURL** are used by `q8s kubeconfig` and `q8s status`
 - **SANs** survive cert regeneration — no need to re-pass `--san-ip`/`--san-dns`
 - Port can be overridden per-invocation with `Q8S_PORT` env var
+- **Idempotency**: re-running `q8s install` or `q8s kubeconfig` with unchanged
+  settings does not mint a fresh CA/client identity — certs regenerate only
+  when the SAN list changes or `--regenerate-certs` is passed. Repeated
+  `q8s kubeconfig` fetches are byte-identical and safe to merge.
 
 ## Pod-to-Quadlet mapping
 
