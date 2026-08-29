@@ -1492,9 +1492,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		if s.config.QuadletDir != "" {
-			if content, err := quadlet.JobContainer(updated.Name, updated, s.config.ConfigDir, s.podPVCMap(updated.Namespace, updated.Spec.Template.Spec)); err == nil {
+			resolved := s.resolvedJobEnv(updated)
+			if content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec)); err == nil {
 				writeQuadletFile(s.config.QuadletDir,
-					fmt.Sprintf("%s-%s-job.container", updated.Namespace, updated.Name), content)
+					fmt.Sprintf("%s-%s-job.container", resolved.Namespace, resolved.Name), content)
 			}
 		}
 		encode(w, updated, http.StatusOK)
@@ -1891,7 +1892,8 @@ func (s *Server) ReconcileQuadlets() {
 				Spec:       dep.Spec.Template.Spec,
 			}
 			pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
-			content, err := quadlet.Container(instanceName, pod, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, pod.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec))
+			resolved := s.resolveEnvFrom(pod)
+			content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec))
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
@@ -1906,7 +1908,8 @@ func (s *Server) ReconcileQuadlets() {
 		if !missing(f) {
 			continue
 		}
-		content, err := quadlet.Container(pod.Name, pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec))
+		resolved := s.resolveEnvFrom(pod)
+		content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec))
 		if err != nil {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
@@ -1965,7 +1968,8 @@ func (s *Server) ReconcileQuadlets() {
 		if !missing(f) {
 			continue
 		}
-		content, err := quadlet.JobContainer(job.Name, job, s.config.ConfigDir, s.podPVCMap(job.Namespace, job.Spec.Template.Spec))
+		resolved := s.resolvedJobEnv(job)
+		content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec))
 		if err != nil {
 			fmt.Printf("reconcile job %s/%s: %v\n", job.Namespace, job.Name, err)
 			continue
@@ -1983,7 +1987,8 @@ func (s *Server) ReconcileQuadlets() {
 		tf := fmt.Sprintf("%s/%s-%s-cron.timer", timerDir, cj.Namespace, cj.Name)
 		regen := false
 		if missing(cf) {
-			content, err := quadlet.CronContainer(cj.Name, cj, s.config.ConfigDir, s.podPVCMap(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec))
+			resolved := s.resolvedCronJobEnv(cj)
+			content, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec))
 			if err != nil {
 				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
 				continue
@@ -2180,7 +2185,8 @@ func (s *Server) generateJobQuadlet(job *batchv1.Job) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	content, err := quadlet.JobContainer(job.Name, job, s.config.ConfigDir, s.podPVCMap(job.Namespace, job.Spec.Template.Spec))
+	resolved := s.resolvedJobEnv(job)
+	content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("job quadlet %s: %v\n", job.Name, err)
 		return
@@ -2213,7 +2219,8 @@ func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
 	if timerDir == "" {
 		timerDir = quadletDir
 	}
-	containerContent, err := quadlet.CronContainer(cj.Name, cj, s.config.ConfigDir, s.podPVCMap(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec))
+	resolved := s.resolvedCronJobEnv(cj)
+	containerContent, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("cronjob container %s: %v\n", cj.Name, err)
 		return
@@ -2654,15 +2661,65 @@ func (s *Server) removeSecretFiles(sec *corev1.Secret) {
 // Returns a deep copy of the pod with envFrom replaced by resolved Env entries.
 func (s *Server) resolveEnvFrom(pod *corev1.Pod) *corev1.Pod {
 	copied := pod.DeepCopy()
-	for ci := range copied.Spec.Containers {
-		c := &copied.Spec.Containers[ci]
+	s.resolveContainerEnv(pod.Namespace, copied.Spec.Containers)
+	return copied
+}
+
+// resolvedJobEnv returns a deep copy of the job with template container env
+// references resolved, for quadlet generation. The copy keeps the stored job
+// (and any API response built from it) free of inlined plaintext values.
+func (s *Server) resolvedJobEnv(job *batchv1.Job) *batchv1.Job {
+	resolved := job.DeepCopy()
+	s.resolveContainerEnv(resolved.Namespace, resolved.Spec.Template.Spec.Containers)
+	return resolved
+}
+
+// resolvedCronJobEnv is resolvedJobEnv for CronJob templates.
+func (s *Server) resolvedCronJobEnv(cj *batchv1.CronJob) *batchv1.CronJob {
+	resolved := cj.DeepCopy()
+	s.resolveContainerEnv(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec.Containers)
+	return resolved
+}
+
+// resolveContainerEnv resolves Env[i].ValueFrom.{ConfigMapKeyRef,SecretKeyRef}
+// and EnvFrom references in place. The quadlet generator only ever emits
+// env.Value verbatim, so an unresolved ValueFrom silently renders as an
+// empty Environment= line (confirmed live 2026-08-29: MOZAK_VIEW_TOKEN etc.
+// all came out blank, and the app exited 0 on missing config instead of
+// crash-looping visibly).
+func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) {
+	for ci := range containers {
+		c := &containers[ci]
+		for ei := range c.Env {
+			ev := &c.Env[ei]
+			if ev.ValueFrom == nil {
+				continue
+			}
+			if ref := ev.ValueFrom.ConfigMapKeyRef; ref != nil {
+				if cm, err := s.config.Store.GetConfigMap(ns, ref.Name); err == nil {
+					if v, ok := cm.Data[ref.Key]; ok {
+						ev.Value = v
+					}
+				}
+			}
+			if ref := ev.ValueFrom.SecretKeyRef; ref != nil {
+				if sec, err := s.config.Store.GetSecret(ns, ref.Name); err == nil {
+					if v, ok := sec.Data[ref.Key]; ok {
+						ev.Value = string(v)
+					} else if v, ok := sec.StringData[ref.Key]; ok {
+						ev.Value = v
+					}
+				}
+			}
+			ev.ValueFrom = nil
+		}
 		if len(c.EnvFrom) == 0 {
 			continue
 		}
 		for _, ef := range c.EnvFrom {
 			prefix := ef.Prefix
 			if ef.ConfigMapRef != nil {
-				cm, err := s.config.Store.GetConfigMap(pod.Namespace, ef.ConfigMapRef.Name)
+				cm, err := s.config.Store.GetConfigMap(ns, ef.ConfigMapRef.Name)
 				if err != nil {
 					continue
 				}
@@ -2671,7 +2728,7 @@ func (s *Server) resolveEnvFrom(pod *corev1.Pod) *corev1.Pod {
 				}
 			}
 			if ef.SecretRef != nil {
-				sec, err := s.config.Store.GetSecret(pod.Namespace, ef.SecretRef.Name)
+				sec, err := s.config.Store.GetSecret(ns, ef.SecretRef.Name)
 				if err != nil {
 					continue
 				}
@@ -2685,5 +2742,4 @@ func (s *Server) resolveEnvFrom(pod *corev1.Pod) *corev1.Pod {
 		}
 		c.EnvFrom = nil
 	}
-	return copied
 }

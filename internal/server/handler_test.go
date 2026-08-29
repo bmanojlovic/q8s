@@ -903,6 +903,82 @@ func jobBody(ns, name string) map[string]interface{} {
 	}
 }
 
+func TestEnvValueFromResolvedInQuadlet(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	cmBody := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]interface{}{"name": "envsrc", "namespace": "default"},
+		"data":       map[string]interface{}{"TOKEN": "cm-val"},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/configmaps", cmBody)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	secBody := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "envsec", "namespace": "default"},
+		"stringData": map[string]interface{}{"PW": "sec-val"},
+	}
+	resp = post(t, ts.URL+"/api/v1/namespaces/default/secrets", secBody)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	env := []interface{}{
+		map[string]interface{}{"name": "FROM_CM", "valueFrom": map[string]interface{}{"configMapKeyRef": map[string]interface{}{"name": "envsrc", "key": "TOKEN"}}},
+		map[string]interface{}{"name": "FROM_SEC", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": "envsec", "key": "PW"}}},
+	}
+
+	// Pod path
+	podB := podBody("default", "envpod", "myimage")
+	podB["spec"].(map[string]interface{})["containers"].([]interface{})[0].(map[string]interface{})["env"] = env
+	resp = post(t, ts.URL+"/api/v1/namespaces/default/pods", podB)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	podOut := readTestFile(t, filepath.Join(quadletDir, "default-envpod.container"))
+	if !strings.Contains(podOut, "Environment=FROM_CM=cm-val") || !strings.Contains(podOut, "Environment=FROM_SEC=sec-val") {
+		t.Fatalf("expected resolved env values in pod quadlet:\n%s", podOut)
+	}
+
+	// The stored pod keeps the ValueFrom references, not the plaintext values.
+	got, err := st.GetPod("default", "envpod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedEnv := got.Spec.Containers[0].Env
+	if len(storedEnv) != 2 || storedEnv[0].ValueFrom == nil || storedEnv[1].ValueFrom == nil {
+		t.Fatalf("expected unresolved ValueFrom refs in stored pod, got %+v", storedEnv)
+	}
+
+	// Job path
+	jobB := jobBody("default", "envjob")
+	jobB["spec"].(map[string]interface{})["template"].(map[string]interface{})["spec"].(map[string]interface{})["containers"].([]interface{})[0].(map[string]interface{})["env"] = env
+	resp = post(t, ts.URL+"/apis/batch/v1/namespaces/default/jobs", jobB)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	jobOut := readTestFile(t, filepath.Join(quadletDir, "default-envjob-job.container"))
+	if !strings.Contains(jobOut, "Environment=FROM_CM=cm-val") || !strings.Contains(jobOut, "Environment=FROM_SEC=sec-val") {
+		t.Fatalf("expected resolved env values in job quadlet:\n%s", jobOut)
+	}
+}
+
+func readTestFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
 func TestJobCRUD(t *testing.T) {
 	ts, _ := newTestServer(t)
 

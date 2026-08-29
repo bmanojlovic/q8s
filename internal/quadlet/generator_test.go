@@ -235,7 +235,7 @@ func TestContainerRestartPolicyAlways(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	assertContains(t, out, "[Service]")
-	assertContains(t, out, "Restart=on-failure")
+	assertContains(t, out, "Restart=always")
 	assertContains(t, out, "RestartSec=5")
 }
 
