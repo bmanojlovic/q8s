@@ -62,6 +62,14 @@
 | `standard-shared` | Podman named volume | `:z` (shared) | Multiple pods sharing a volume |
 | `hostpath` | Bind mount from host | `:Z` (exclusive) | Pre-existing host directories |
 
+PVCs bind immediately at creation (`status.phase: Bound`) — the backing
+volume is a quadlet file, so there is no asynchronous provisioner to wait
+on. A claim without `storageClassName` is defaulted to `standard`, matching
+the `is-default-class` annotation on that class. For `standard`/`standard-shared`
+the named Podman volume is created right away (the volume unit is started at
+PVC creation); `hostpath` claims bind to the directory named in their
+annotation.
+
 The `hostpath` class requires a `q8s.io/host-path` annotation on the PVC specifying the absolute host directory:
 
 ```yaml

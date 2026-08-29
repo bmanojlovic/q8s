@@ -14,11 +14,14 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/server"
 	"q8s/internal/store"
 )
@@ -551,6 +554,99 @@ func TestPVCCRUD(t *testing.T) {
 	resp = get(t, ts.URL+"/api/v1/namespaces/default/persistentvolumeclaims/data")
 	assertStatus(t, resp, 404)
 	resp.Body.Close()
+}
+
+func newTestServerWithQuadletDir(t *testing.T, st *store.Store, quadletDir string) *server.Server {
+	t.Helper()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:      st,
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		QuadletDir: quadletDir,
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	return srv
+}
+
+func TestPVCCreateBindsAndWritesQuadlet(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/persistentvolumeclaims", pvcBody("default", "data"))
+	assertStatus(t, resp, 201)
+	body := decodeBody(t, resp)
+
+	status := body["status"].(map[string]interface{})
+	if status["phase"] != "Bound" {
+		t.Fatalf("expected status.phase Bound, got %v", status["phase"])
+	}
+	spec := body["spec"].(map[string]interface{})
+	if spec["storageClassName"] != "standard" {
+		t.Fatalf("expected defaulted storageClassName standard, got %v", spec["storageClassName"])
+	}
+	if spec["volumeName"] != "data" {
+		t.Fatalf("expected volumeName data, got %v", spec["volumeName"])
+	}
+
+	content, err := os.ReadFile(filepath.Join(quadletDir, "default-data.volume"))
+	if err != nil {
+		t.Fatalf("expected quadlet volume file: %v", err)
+	}
+	if want := "[Volume]\nVolumeName=data\n"; string(content) != want {
+		t.Fatalf("unexpected volume file content:\n%s", content)
+	}
+
+	events := st.AllEvents()
+	if len(events) != 1 || events[0].Reason != "ProvisioningSucceeded" {
+		t.Fatalf("expected 1 ProvisioningSucceeded event, got %+v", events)
+	}
+}
+
+func TestReconcileQuadletsBindsExistingPVC(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+
+	// Simulate a PVC created before binding existed: create through the
+	// store, then revert it to the legacy empty-status shape.
+	created, err := st.CreatePVC(&corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy", Namespace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("CreatePVC: %v", err)
+	}
+	legacy := created.DeepCopy()
+	legacy.Status = corev1.PersistentVolumeClaimStatus{}
+	legacy.Spec.StorageClassName = nil
+	legacy.Spec.VolumeName = ""
+	if _, err := st.UpdatePVC(legacy); err != nil {
+		t.Fatalf("UpdatePVC: %v", err)
+	}
+
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	srv.ReconcileQuadlets()
+
+	got, err := st.GetPVC("default", "legacy")
+	if err != nil {
+		t.Fatalf("GetPVC: %v", err)
+	}
+	if got.Status.Phase != corev1.ClaimBound {
+		t.Fatalf("expected reconcile to bind legacy PVC, phase=%q", got.Status.Phase)
+	}
+	if got.Spec.StorageClassName == nil || *got.Spec.StorageClassName != "standard" {
+		t.Fatalf("expected defaulted storageClassName, got %v", got.Spec.StorageClassName)
+	}
+	if got.Spec.VolumeName != "legacy" {
+		t.Fatalf("expected volumeName legacy, got %q", got.Spec.VolumeName)
+	}
+	if _, err := os.Stat(filepath.Join(quadletDir, "default-legacy.volume")); err != nil {
+		t.Fatalf("expected reconcile to write volume file: %v", err)
+	}
 }
 
 // --- ConfigMap ---

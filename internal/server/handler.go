@@ -652,9 +652,6 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		s.generatePVCVolume(created)
-		if s.config.Manager != nil {
-			s.config.Manager.DaemonReload()
-		}
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
 		pvc, err := s.config.Store.GetPVC(ns, name)
@@ -1796,6 +1793,21 @@ func (s *Server) ReconcileQuadlets() {
 	}
 
 	for _, pvc := range s.config.Store.AllPVCs() {
+		// PVCs bind immediately at creation now; this heals claims created
+		// before binding existed, which are stuck with an empty status.
+		if pvc.Status.Phase != corev1.ClaimBound {
+			pvc.Status.Phase = corev1.ClaimBound
+			if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
+				class := quadlet.StorageClassStandard
+				pvc.Spec.StorageClassName = &class
+			}
+			if pvc.Spec.VolumeName == "" && *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath {
+				pvc.Spec.VolumeName = pvc.Name
+			}
+			if _, err := s.config.Store.UpdatePVC(pvc); err != nil {
+				fmt.Printf("reconcile pvc %s/%s: bind: %v\n", pvc.Namespace, pvc.Name, err)
+			}
+		}
 		f := fmt.Sprintf("%s/%s-%s.volume", quadletDir, pvc.Namespace, pvc.Name)
 		if !missing(f) {
 			continue
@@ -1809,7 +1821,8 @@ func (s *Server) ReconcileQuadlets() {
 			// hostpath PVCs don't need a .volume file.
 			continue
 		}
-		write(quadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name), content, "")
+		write(quadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name), content,
+			fmt.Sprintf("%s-%s-volume.service", pvc.Namespace, pvc.Name))
 	}
 
 	for _, job := range s.config.Store.AllJobs() {
@@ -1975,15 +1988,41 @@ func (s *Server) generatePVCVolume(pvc *corev1.PersistentVolumeClaim) {
 	content, err := quadlet.Volume(pvc)
 	if err != nil {
 		fmt.Printf("pvc volume %s: %v\n", pvc.Name, err)
+		s.recordPVCEvent(pvc, corev1.EventTypeWarning, "ProvisioningFailed", "generating quadlet volume: "+err.Error())
 		return
 	}
 	if content == nil {
 		// hostpath PVCs don't need a .volume file.
 		return
 	}
-	if err := writeQuadletFile(s.config.QuadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name), content); err != nil {
+	filename := fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name)
+	unitName := fmt.Sprintf("%s-%s-volume.service", pvc.Namespace, pvc.Name)
+	if err := writeQuadletFile(s.config.QuadletDir, filename, content); err != nil {
 		fmt.Printf("write pvc volume: %v\n", err)
+		s.recordPVCEvent(pvc, corev1.EventTypeWarning, "ProvisioningFailed", "writing quadlet volume: "+err.Error())
+		return
 	}
+	// Immediate provisioning: start the quadlet volume unit so the named
+	// podman volume exists right away, not only once a pod happens to mount
+	// it. Pods starting later just re-run the idempotent volume create.
+	mgr := s.config.Manager
+	if mgr == nil {
+		return
+	}
+	if err := mgr.DaemonReload(); err != nil {
+		fmt.Printf("daemon-reload: %v\n", err)
+		s.recordPVCEvent(pvc, corev1.EventTypeWarning, "ProvisioningFailed", "daemon-reload: "+err.Error())
+		return
+	}
+	if err := mgr.StartUnit(unitName); err != nil {
+		fmt.Printf("start %s: %v\n", unitName, err)
+		s.recordPVCEvent(pvc, corev1.EventTypeWarning, "ProvisioningFailed", "starting volume unit: "+err.Error())
+	}
+}
+
+// recordPVCEvent records a lifecycle event for a PVC.
+func (s *Server) recordPVCEvent(pvc *corev1.PersistentVolumeClaim, eventType, reason, message string) {
+	s.config.Store.RecordEvent("PersistentVolumeClaim", pvc.Namespace, pvc.Name, pvc.UID, eventType, reason, message)
 }
 
 func (s *Server) removePVCVolume(pvc *corev1.PersistentVolumeClaim) {
