@@ -104,7 +104,7 @@ spec:
 
 - **Watch**: all list endpoints support `?watch=true` (kubectl get -w, Freelens, k9s)
 - **Label selectors**: `key=value`, `key==value`, `key!=value`, `key`, `!key` on all list endpoints
-- **Patch**: JSON merge patch and strategic merge patch (array-merge-by-name for containers/env/volumes)
+- **Patch**: JSON merge patch and strategic merge patch (array-merge-by-name for containers/env/volumes); RFC 6902 JSON Patch (`application/json-patch+json`) for secrets — Terraform's provider patches Secret `data` keys this way
 - **Resource limits**: `resources.limits.memory` → Quadlet `Memory=` + `--memory-swap=-1`, `resources.limits.cpu` → `--cpus=N` (skipped when cgroup controllers not delegated)
 - **Port semantics**: `containerPort` is internal-only (namespace network); `hostPort` publishes to host via `PublishPort=`; Service creates a systemd `.socket` unit. hostPort and Service are mutually exclusive on the same port.
 - **CrashLoopBackOff**: detected from restart count + non-zero exit, shown in pod status

@@ -887,13 +887,29 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		}
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(sec)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			// RFC 6902 JSON Patch — an array of ops (Terraform's provider
+			// patches Secret data keys this way, since merge patches cannot
+			// delete map entries).
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched corev1.Secret
 		if err := json.Unmarshal(merged, &patched); err != nil {
@@ -909,6 +925,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
 			return
 		}
+		s.removeStaleSecretFiles(updated)
 		s.writeSecretFiles(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
@@ -2472,6 +2489,37 @@ func (s *Server) writeSecretFiles(sec *corev1.Secret) {
 	for k, v := range sec.StringData {
 		if err := os.WriteFile(filepath.Join(dir, k), []byte(v), 0600); err != nil {
 			fmt.Printf("write secret %s/%s/%s: %v\n", sec.Namespace, sec.Name, k, err)
+		}
+	}
+}
+
+// removeStaleSecretFiles deletes files in the secret's directory for keys
+// that no longer exist in the secret. Called after updates (e.g. a JSON
+// Patch removing a data key) so pods mounting the directory stop seeing the
+// removed key.
+func (s *Server) removeStaleSecretFiles(sec *corev1.Secret) {
+	secretDir := s.secretBaseDir()
+	if secretDir == "" {
+		return
+	}
+	dir := filepath.Join(secretDir, sec.Namespace, sec.Name)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	live := make(map[string]bool, len(sec.Data)+len(sec.StringData))
+	for k := range sec.Data {
+		live[k] = true
+	}
+	for k := range sec.StringData {
+		live[k] = true
+	}
+	for _, e := range entries {
+		if e.IsDir() || live[e.Name()] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+			fmt.Printf("remove secret file %s/%s: %v\n", dir, e.Name(), err)
 		}
 	}
 }
