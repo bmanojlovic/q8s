@@ -285,7 +285,7 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 			b.WriteString(fmt.Sprintf("HealthCmd=%s\n", strings.Join(cmd.Command, " ")))
 		}
 		if pod.Spec.Containers[0].LivenessProbe.InitialDelaySeconds > 0 {
-			b.WriteString(fmt.Sprintf("HealthStartPeriod=%d\n", pod.Spec.Containers[0].LivenessProbe.InitialDelaySeconds))
+			b.WriteString(fmt.Sprintf("HealthStartPeriod=%ds\n", pod.Spec.Containers[0].LivenessProbe.InitialDelaySeconds))
 		}
 	}
 
