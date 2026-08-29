@@ -13,6 +13,8 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"q8s/internal/quadlet"
 )
 
 // snapshot is the on-disk JSON format for the store.
@@ -99,6 +101,13 @@ func (s *Store) recordEvent(kind, ns, name string, uid types.UID, eventType, rea
 	}
 	s.eventsMu.Unlock()
 	s.notifyChanged()
+}
+
+// RecordEvent is the exported wrapper for recordEvent, for callers outside
+// the store's own lifecycle methods (e.g. the API server surfacing a failed
+// quadlet write as a PVC event).
+func (s *Store) RecordEvent(kind, ns, name string, uid types.UID, eventType, reason, message string) {
+	s.recordEvent(kind, ns, name, uid, eventType, reason, message)
 }
 
 func eventAPIVersion(kind string) string {
@@ -822,9 +831,29 @@ func (s *Store) CreatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 	if pvc.Labels == nil {
 		pvc.Labels = make(map[string]string)
 	}
+	// Default the storage class the way k8s's DefaultStorageClass admission
+	// plugin would: "standard" carries the is-default-class annotation, so a
+	// claim without an explicit class lands on it.
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
+		class := quadlet.StorageClassStandard
+		pvc.Spec.StorageClassName = &class
+	}
+	// Immediate binding: there is no asynchronous provisioner — the quadlet
+	// volume file is the provisioned volume — so the claim is bound as soon
+	// as it exists. hostpath claims have no named volume to point at.
+	pvc.Status.Phase = corev1.ClaimBound
+	if *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath {
+		pvc.Spec.VolumeName = pvc.Name
+	}
 	s.pvcs[key] = pvc
 	s.mu.Unlock()
 	go s.save()
+	msg := "Bound (hostpath backing)"
+	if pvc.Spec.VolumeName != "" {
+		msg = fmt.Sprintf("Bound to podman volume %q", pvc.Spec.VolumeName)
+	}
+	s.recordEvent("PersistentVolumeClaim", pvc.Namespace, pvc.Name, pvc.UID,
+		corev1.EventTypeNormal, "ProvisioningSucceeded", msg)
 	return pvc.DeepCopy(), nil
 }
 

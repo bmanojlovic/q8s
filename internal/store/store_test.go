@@ -9,6 +9,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/quadlet"
 	"q8s/internal/store"
 )
 
@@ -374,6 +375,15 @@ func TestPVCCRUD(t *testing.T) {
 	if created.Name != "mydata" {
 		t.Fatalf("unexpected name: %s", created.Name)
 	}
+	if created.Status.Phase != corev1.ClaimBound {
+		t.Fatalf("expected phase %q, got %q", corev1.ClaimBound, created.Status.Phase)
+	}
+	if created.Spec.StorageClassName == nil || *created.Spec.StorageClassName != quadlet.StorageClassStandard {
+		t.Fatalf("expected defaulted storageClassName %q, got %v", quadlet.StorageClassStandard, created.Spec.StorageClassName)
+	}
+	if created.Spec.VolumeName != "mydata" {
+		t.Fatalf("expected volumeName mydata, got %q", created.Spec.VolumeName)
+	}
 
 	got, err := st.GetPVC("default", "mydata")
 	if err != nil {
@@ -398,6 +408,42 @@ func TestPVCCRUD(t *testing.T) {
 		t.Fatal("expected error after delete")
 	}
 }
+
+func TestPVCCreateBindsAndRecordsEvent(t *testing.T) {
+	st := newStore(t)
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: strPtr(quadlet.StorageClassHostPath),
+		},
+	}
+	created, err := st.CreatePVC(pvc)
+	if err != nil {
+		t.Fatalf("CreatePVC: %v", err)
+	}
+	// hostpath claims bind too, but have no named volume to point at.
+	if created.Status.Phase != corev1.ClaimBound {
+		t.Fatalf("expected phase %q, got %q", corev1.ClaimBound, created.Status.Phase)
+	}
+	if created.Spec.VolumeName != "" {
+		t.Fatalf("expected empty volumeName for hostpath, got %q", created.Spec.VolumeName)
+	}
+
+	events := st.AllEvents()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	ev := events[0]
+	if ev.Reason != "ProvisioningSucceeded" || ev.Type != corev1.EventTypeNormal {
+		t.Fatalf("unexpected event: reason=%q type=%q", ev.Reason, ev.Type)
+	}
+	if ev.InvolvedObject.Kind != "PersistentVolumeClaim" || ev.InvolvedObject.Name != "data" {
+		t.Fatalf("unexpected involved object: %+v", ev.InvolvedObject)
+	}
+}
+
+func strPtr(s string) *string { return &s }
 
 // --- ConfigMap ---
 
