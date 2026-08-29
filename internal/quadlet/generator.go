@@ -126,7 +126,7 @@ func detectCgroupControllers() {
 // pvcMap maps PVC claim names to their full objects so that volume mounts
 // can inspect storageClassName and annotations. A nil map is safe and falls
 // back to the default (named volume with :Z).
-func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim) ([]byte, error) {
+func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
 	var b strings.Builder
 
 	b.WriteString("[Container]\n")
@@ -165,6 +165,13 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 	}
 
 	writeResourceLimits(&b, pod.Spec.Containers[0].Resources.Limits)
+
+	if envFile != "" {
+		if err := validatePath("envFile", envFile); err != nil {
+			return nil, err
+		}
+		b.WriteString(fmt.Sprintf("EnvironmentFile=%s\n", envFile))
+	}
 
 	for _, env := range pod.Spec.Containers[0].Env {
 		if err := validateEnvName(env.Name); err != nil {
@@ -318,7 +325,7 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 
 // JobContainer generates a .container quadlet for a Job's pod template.
 // The unit runs once (no Restart) and exits with the container's exit code.
-func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim) ([]byte, error) {
+func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
 	spec := job.Spec.Template.Spec
 	ns := job.Namespace
 
@@ -351,6 +358,13 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 	}
 
 	writeResourceLimits(&b, spec.Containers[0].Resources.Limits)
+
+	if envFile != "" {
+		if err := validatePath("envFile", envFile); err != nil {
+			return nil, err
+		}
+		b.WriteString(fmt.Sprintf("EnvironmentFile=%s\n", envFile))
+	}
 
 	for _, env := range spec.Containers[0].Env {
 		if err := validateEnvName(env.Name); err != nil {
@@ -435,7 +449,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 
 // CronContainer generates the .container quadlet for a CronJob's pod template.
 // It is triggered by the paired .timer unit, not installed directly.
-func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim) ([]byte, error) {
+func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
 	spec := cj.Spec.JobTemplate.Spec.Template.Spec
 	ns := cj.Namespace
 
@@ -468,6 +482,13 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 	}
 
 	writeResourceLimits(&b, spec.Containers[0].Resources.Limits)
+
+	if envFile != "" {
+		if err := validatePath("envFile", envFile); err != nil {
+			return nil, err
+		}
+		b.WriteString(fmt.Sprintf("EnvironmentFile=%s\n", envFile))
+	}
 
 	for _, env := range spec.Containers[0].Env {
 		if err := validateEnvName(env.Name); err != nil {
