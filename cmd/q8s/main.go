@@ -199,7 +199,6 @@ func cmdInstall() {
 				os.Exit(1)
 			}
 			extraIPs = append(extraIPs, ip)
-			regenCerts = true
 		case "--san-dns":
 			i++
 			if i >= len(args) {
@@ -207,7 +206,6 @@ func cmdInstall() {
 				os.Exit(1)
 			}
 			extraDNS = append(extraDNS, args[i])
-			regenCerts = true
 		case "--server":
 			i++
 			if i >= len(args) {
@@ -438,12 +436,12 @@ clusters:
 contexts:
 - context:
     cluster: %s
-    user: %s-user
+    user: %s
   name: %s
 current-context: %s
 preferences: {}
 users:
-- name: %s-user
+- name: %s
   user:
     client-certificate-data: %s
     client-key-data: %s
