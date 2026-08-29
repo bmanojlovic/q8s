@@ -843,7 +843,7 @@ func (s *Store) CreatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 	// as it exists. hostpath claims have no named volume to point at.
 	pvc.Status.Phase = corev1.ClaimBound
 	if *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath {
-		pvc.Spec.VolumeName = pvc.Name
+		pvc.Spec.VolumeName = quadlet.PVCVolumeName(pvc.Namespace, pvc.Name)
 	}
 	s.pvcs[key] = pvc
 	s.mu.Unlock()

@@ -70,6 +70,12 @@ the named Podman volume is created right away (the volume unit is started at
 PVC creation); `hostpath` claims bind to the directory named in their
 annotation.
 
+Named volumes are namespace-scoped as `{namespace}-{name}` (also surfaced
+in `spec.volumeName`), so same-named claims in different namespaces — or a
+claim colliding with a volume some unrelated non-q8s deployment created —
+never share one backing volume, and `podman volume ls` shows which
+namespace/claim owns each volume.
+
 The `hostpath` class requires a `q8s.io/host-path` annotation on the PVC specifying the absolute host directory:
 
 ```yaml

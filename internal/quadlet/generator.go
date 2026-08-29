@@ -617,6 +617,15 @@ func pvcStorageClass(pvc *corev1.PersistentVolumeClaim) string {
 	return StorageClassStandard
 }
 
+// PVCVolumeName is the Podman named volume backing a PVC. Namespace-scoped
+// so two claims with the same name in different namespaces (or from
+// unrelated non-q8s deployments on the same host) can't silently collide on
+// one volume — and so `podman volume ls` self-documents which claim owns
+// what instead of requiring a live cross-reference.
+func PVCVolumeName(ns, name string) string {
+	return fmt.Sprintf("%s-%s", ns, name)
+}
+
 // Volume generates a .volume quadlet file content.
 // For hostpath PVCs no .volume file is needed — the caller should skip
 // writing when nil bytes are returned with no error.
@@ -628,7 +637,7 @@ func Volume(pvc *corev1.PersistentVolumeClaim) ([]byte, error) {
 	var b strings.Builder
 
 	b.WriteString("[Volume]\n")
-	b.WriteString(fmt.Sprintf("VolumeName=%s\n", pvc.Name))
+	b.WriteString(fmt.Sprintf("VolumeName=%s\n", PVCVolumeName(pvc.Namespace, pvc.Name)))
 
 	return []byte(b.String()), nil
 }

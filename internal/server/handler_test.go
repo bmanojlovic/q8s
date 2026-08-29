@@ -590,15 +590,15 @@ func TestPVCCreateBindsAndWritesQuadlet(t *testing.T) {
 	if spec["storageClassName"] != "standard" {
 		t.Fatalf("expected defaulted storageClassName standard, got %v", spec["storageClassName"])
 	}
-	if spec["volumeName"] != "data" {
-		t.Fatalf("expected volumeName data, got %v", spec["volumeName"])
+	if spec["volumeName"] != "default-data" {
+		t.Fatalf("expected volumeName default-data, got %v", spec["volumeName"])
 	}
 
 	content, err := os.ReadFile(filepath.Join(quadletDir, "default-data.volume"))
 	if err != nil {
 		t.Fatalf("expected quadlet volume file: %v", err)
 	}
-	if want := "[Volume]\nVolumeName=data\n"; string(content) != want {
+	if want := "[Volume]\nVolumeName=default-data\n"; string(content) != want {
 		t.Fatalf("unexpected volume file content:\n%s", content)
 	}
 
@@ -628,6 +628,13 @@ func TestReconcileQuadletsBindsExistingPVC(t *testing.T) {
 		t.Fatalf("UpdatePVC: %v", err)
 	}
 
+	// Pre-write the pre-scoping volume file shape: same claim, but the
+	// volume name is the bare claim name, not namespace-scoped.
+	volFile := filepath.Join(quadletDir, "default-legacy.volume")
+	if err := os.WriteFile(volFile, []byte("[Volume]\nVolumeName=legacy\n"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
 	srv := newTestServerWithQuadletDir(t, st, quadletDir)
 	srv.ReconcileQuadlets()
 
@@ -641,11 +648,15 @@ func TestReconcileQuadletsBindsExistingPVC(t *testing.T) {
 	if got.Spec.StorageClassName == nil || *got.Spec.StorageClassName != "standard" {
 		t.Fatalf("expected defaulted storageClassName, got %v", got.Spec.StorageClassName)
 	}
-	if got.Spec.VolumeName != "legacy" {
-		t.Fatalf("expected volumeName legacy, got %q", got.Spec.VolumeName)
+	if got.Spec.VolumeName != "default-legacy" {
+		t.Fatalf("expected volumeName default-legacy, got %q", got.Spec.VolumeName)
 	}
-	if _, err := os.Stat(filepath.Join(quadletDir, "default-legacy.volume")); err != nil {
+	content, err := os.ReadFile(volFile)
+	if err != nil {
 		t.Fatalf("expected reconcile to write volume file: %v", err)
+	}
+	if want := "[Volume]\nVolumeName=default-legacy\n"; string(content) != want {
+		t.Fatalf("expected reconcile to rewrite unscoped volume file, got:\n%s", content)
 	}
 }
 

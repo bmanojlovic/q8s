@@ -381,8 +381,8 @@ func TestPVCCRUD(t *testing.T) {
 	if created.Spec.StorageClassName == nil || *created.Spec.StorageClassName != quadlet.StorageClassStandard {
 		t.Fatalf("expected defaulted storageClassName %q, got %v", quadlet.StorageClassStandard, created.Spec.StorageClassName)
 	}
-	if created.Spec.VolumeName != "mydata" {
-		t.Fatalf("expected volumeName mydata, got %q", created.Spec.VolumeName)
+	if created.Spec.VolumeName != "default-mydata" {
+		t.Fatalf("expected volumeName default-mydata, got %q", created.Spec.VolumeName)
 	}
 
 	got, err := st.GetPVC("default", "mydata")
