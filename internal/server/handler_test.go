@@ -764,6 +764,125 @@ func TestSecretDuplicate(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestSecretJSONPatch(t *testing.T) {
+	ts, st := newTestServer(t)
+
+	body := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "creds", "namespace": "default"},
+		"data":       map[string]interface{}{"user": "YWRtaW4=", "pass": "c2VjcmV0"},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/secrets", body)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	jsonPatch := func(t *testing.T, ops []map[string]interface{}) *http.Response {
+		t.Helper()
+		b, err := json.Marshal(ops)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/namespaces/default/secrets/creds", bytes.NewReader(b))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json-patch+json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// Terraform-style JSON Patch: replace one key, remove another, add a third.
+	resp = jsonPatch(t, []map[string]interface{}{
+		{"op": "replace", "path": "/data/pass", "value": "bjN3cGFzcw=="},
+		{"op": "remove", "path": "/data/user"},
+		{"op": "add", "path": "/data/token", "value": "dG9rZW4="},
+	})
+	assertStatus(t, resp, 200)
+	patched := decodeBody(t, resp)
+	data := patched["data"].(map[string]interface{})
+	if len(data) != 2 || data["pass"] != "bjN3cGFzcw==" || data["token"] != "dG9rZW4=" {
+		t.Fatalf("unexpected patched data: %v", data)
+	}
+	if _, ok := data["user"]; ok {
+		t.Fatalf("user key should have been removed: %v", data)
+	}
+
+	// A failing patch must not mutate the stored secret (atomicity).
+	resp = jsonPatch(t, []map[string]interface{}{
+		{"op": "remove", "path": "/data/nonexistent"},
+	})
+	assertStatus(t, resp, 400)
+	resp.Body.Close()
+
+	got, err := st.GetSecret("default", "creds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Data) != 2 || got.Data["pass"] == nil || got.Data["token"] == nil {
+		t.Fatalf("secret mutated by failed patch: %v", got.Data)
+	}
+}
+
+func TestSecretJSONPatchRemovesStaleFiles(t *testing.T) {
+	certPEM, keyPEM := genTestCert(t)
+	st := store.New()
+	cfgDir := t.TempDir()
+	srv, err := server.New(server.Config{
+		Store:     st,
+		CertPEM:   certPEM,
+		KeyPEM:    keyPEM,
+		ConfigDir: filepath.Join(cfgDir, "configmaps"),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "creds", "namespace": "default"},
+		"data":       map[string]interface{}{"user": "YWRtaW4=", "pass": "c2VjcmV0"},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/secrets", body)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	secretDir := filepath.Join(cfgDir, "secrets", "default", "creds")
+	if _, err := os.Stat(filepath.Join(secretDir, "user")); err != nil {
+		t.Fatalf("expected user file after create: %v", err)
+	}
+
+	b, _ := json.Marshal([]map[string]interface{}{
+		{"op": "remove", "path": "/data/user"},
+		{"op": "replace", "path": "/data/pass", "value": "bjN3cGFzcw=="},
+	})
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/namespaces/default/secrets/creds", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json-patch+json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, 200)
+	resp.Body.Close()
+
+	if _, err := os.Stat(filepath.Join(secretDir, "user")); !os.IsNotExist(err) {
+		t.Fatalf("stale user file should have been removed, stat err: %v", err)
+	}
+	pass, err := os.ReadFile(filepath.Join(secretDir, "pass"))
+	if err != nil {
+		t.Fatalf("read pass file: %v", err)
+	}
+	if string(pass) != "n3wpass" {
+		t.Fatalf("expected updated pass file, got %q", pass)
+	}
+}
+
 // --- Job ---
 
 func jobBody(ns, name string) map[string]interface{} {
