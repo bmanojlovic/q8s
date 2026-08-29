@@ -71,7 +71,7 @@ func (s *Server) handleAPIV1(w http.ResponseWriter, r *http.Request) {
 			{Name: "pods", SingularName: "pod", Namespaced: true, Kind: "Pod", Verbs: verbList(), ShortNames: []string{"po"}, Categories: []string{"all"}},
 			{Name: "services", SingularName: "service", Namespaced: true, Kind: "Service", Verbs: verbList(), ShortNames: []string{"svc"}, Categories: []string{"all"}},
 			{Name: "namespaces", SingularName: "namespace", Namespaced: false, Kind: "Namespace", Verbs: verbList(), ShortNames: []string{"ns"}},
-			{Name: "persistentvolumeclaims", SingularName: "persistentvolumeclaim", Namespaced: true, Kind: "PersistentVolumeClaim", Verbs: verbList(), ShortNames: []string{"pvc"}, Categories: []string{"all"}},
+			{Name: "persistentvolumeclaims", SingularName: "persistentvolumeclaim", Namespaced: true, Kind: "PersistentVolumeClaim", Verbs: verbList(), ShortNames: []string{"pvc"}},
 			{Name: "configmaps", SingularName: "configmap", Namespaced: true, Kind: "ConfigMap", Verbs: verbList(), ShortNames: []string{"cm"}},
 			{Name: "secrets", SingularName: "secret", Namespaced: true, Kind: "Secret", Verbs: verbList()},
 			{Name: "events", SingularName: "event", Namespaced: true, Kind: "Event", Verbs: []string{"get", "list", "watch"}, ShortNames: []string{"ev"}},
@@ -254,7 +254,7 @@ func (s *Server) handleNetworkingV1(w http.ResponseWriter, r *http.Request) {
 		},
 		GroupVersion: "networking.k8s.io/v1",
 		APIResources: []metav1.APIResource{
-			{Name: "ingresses", SingularName: "ingress", Namespaced: true, Kind: "Ingress", Verbs: verbList(), ShortNames: []string{"ing"}, Categories: []string{"all"}},
+			{Name: "ingresses", SingularName: "ingress", Namespaced: true, Kind: "Ingress", Verbs: verbList(), ShortNames: []string{"ing"}},
 		},
 	})
 	w.Header().Set("Content-Type", "application/json")
