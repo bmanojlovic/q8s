@@ -1235,6 +1235,33 @@ func TestDeploymentReplicas(t *testing.T) {
 	if spec["replicas"] != float64(2) {
 		t.Fatalf("expected replicas=2 after patch, got %v", spec["replicas"])
 	}
+
+	// Explicit 0 is a real desired state (scale to zero) and must survive,
+	// not be floored to the 1-replica default.
+	patchBody = map[string]interface{}{
+		"spec": map[string]interface{}{"replicas": 0},
+	}
+	resp = do(t, http.MethodPatch, ts.URL+"/apis/apps/v1/namespaces/default/deployments/scaled", patchBody)
+	assertStatus(t, resp, 200)
+	m = decodeBody(t, resp)
+	spec = m["spec"].(map[string]interface{})
+	if spec["replicas"] != float64(0) {
+		t.Fatalf("expected replicas=0 after patch, got %v", spec["replicas"])
+	}
+
+	// Scale back up from zero via the /scale subresource.
+	scaleBody = map[string]interface{}{
+		"apiVersion": "autoscaling/v1",
+		"kind":       "Scale",
+		"spec":       map[string]interface{}{"replicas": 2},
+	}
+	resp = do(t, http.MethodPatch, ts.URL+"/apis/apps/v1/namespaces/default/deployments/scaled/scale", scaleBody)
+	assertStatus(t, resp, 200)
+	m = decodeBody(t, resp)
+	scaleSpec = m["spec"].(map[string]interface{})
+	if scaleSpec["replicas"] != float64(2) {
+		t.Fatalf("expected replicas=2 after scale-up from zero, got %v", scaleSpec["replicas"])
+	}
 }
 
 func TestAppsDiscovery(t *testing.T) {

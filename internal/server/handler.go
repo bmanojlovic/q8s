@@ -2331,8 +2331,17 @@ func mergeNamedArray(base, overlay []interface{}) []interface{} {
 }
 
 func deploymentReplicas(dep *appsv1.Deployment) int32 {
-	if dep.Spec.Replicas == nil || *dep.Spec.Replicas < 1 {
+	// nil (field omitted) defaults to 1, matching real Kubernetes semantics —
+	// but an explicit 0 is a legitimate, meaningful desired state (scaled
+	// down) and must NOT be floored to 1, or oldR/newR diffing in
+	// scaleDeployment/handleDeploymentScale can never detect a scale-to-zero
+	// or a subsequent scale-up from zero (confirmed live 2026-08-29: PATCH
+	// {"spec":{"replicas":0}} came back reporting spec.replicas=1).
+	if dep.Spec.Replicas == nil {
 		return 1
+	}
+	if *dep.Spec.Replicas < 0 {
+		return 0
 	}
 	return *dep.Spec.Replicas
 }
