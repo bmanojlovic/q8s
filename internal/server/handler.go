@@ -389,13 +389,26 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(pod)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched corev1.Pod
 		if err := json.Unmarshal(merged, &patched); err != nil {
@@ -569,13 +582,26 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(svc)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched corev1.Service
 		if err := json.Unmarshal(merged, &patched); err != nil {
@@ -661,13 +687,26 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(pvc)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched corev1.PersistentVolumeClaim
 		if err := json.Unmarshal(merged, &patched); err != nil {
@@ -788,13 +827,26 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(cm)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched corev1.ConfigMap
 		if err := json.Unmarshal(merged, &patched); err != nil {
@@ -1088,18 +1140,33 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			return
 		}
 		oldR := deploymentReplicas(dep)
-		// JSON-merge the patch into the existing deployment so annotations,
-		// template changes (e.g. kubectl rollout restart), and replica changes
-		// all get persisted correctly.
+		// JSON-merge (or RFC 6902 JSON Patch) the patch into the existing
+		// deployment so annotations, template changes (e.g. kubectl rollout
+		// restart), and replica changes all get persisted correctly.
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(dep)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			// Terraform's provider sends container/spec changes this way
+			// (see the Secret PATCH handler above for the same pattern).
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched appsv1.Deployment
 		if err := json.Unmarshal(merged, &patched); err != nil {
@@ -1393,13 +1460,26 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(job)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched batchv1.Job
 		if err := json.Unmarshal(merged, &patched); err != nil {
@@ -1492,13 +1572,26 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(cj)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched batchv1.CronJob
 		if err := json.Unmarshal(merged, &patched); err != nil {
@@ -1615,13 +1708,26 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		}
 		body, _ := io.ReadAll(r.Body)
 		existing, _ := json.Marshal(ing)
-		var base, overlay map[string]interface{}
+		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
-		if err := json.Unmarshal(body, &overlay); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
-			return
+		if isJSONPatch(r) {
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
 		}
-		jsonMerge(base, overlay)
 		merged, _ := json.Marshal(base)
 		var patched networkingv1.Ingress
 		if err := json.Unmarshal(merged, &patched); err != nil {
