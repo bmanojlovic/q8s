@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -564,6 +565,10 @@ func newTestServerWithQuadletDir(t *testing.T, st *store.Store, quadletDir strin
 		CertPEM:    certPEM,
 		KeyPEM:     keyPEM,
 		QuadletDir: quadletDir,
+		// secretBaseDir() derives from ConfigDir's parent -- set so tests
+		// that resolve Secret-sourced env vars into an EnvironmentFile
+		// (TestEnvValueFromResolvedInQuadlet) have somewhere to write it.
+		ConfigDir: filepath.Join(t.TempDir(), "configmaps"),
 	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
@@ -943,8 +948,29 @@ func TestEnvValueFromResolvedInQuadlet(t *testing.T) {
 	resp.Body.Close()
 
 	podOut := readTestFile(t, filepath.Join(quadletDir, "default-envpod.container"))
-	if !strings.Contains(podOut, "Environment=FROM_CM=cm-val") || !strings.Contains(podOut, "Environment=FROM_SEC=sec-val") {
-		t.Fatalf("expected resolved env values in pod quadlet:\n%s", podOut)
+	if !strings.Contains(podOut, "Environment=FROM_CM=cm-val") {
+		t.Fatalf("expected resolved ConfigMap env value in pod quadlet:\n%s", podOut)
+	}
+	// Secret-derived values must NOT land inline in the 0644 .container file
+	// -- they go to a 0600 EnvironmentFile instead (see writeEnvFile).
+	if strings.Contains(podOut, "sec-val") {
+		t.Fatalf("secret value leaked into the world-readable quadlet file:\n%s", podOut)
+	}
+	envFileMatch := regexp.MustCompile(`EnvironmentFile=(\S+)`).FindStringSubmatch(podOut)
+	if envFileMatch == nil {
+		t.Fatalf("expected EnvironmentFile= line in pod quadlet:\n%s", podOut)
+	}
+	envFilePath := envFileMatch[1]
+	info, err := os.Stat(envFilePath)
+	if err != nil {
+		t.Fatalf("stat env file %s: %v", envFilePath, err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Fatalf("expected env file mode 0600, got %o", perm)
+	}
+	envFileContent := readTestFile(t, envFilePath)
+	if !strings.Contains(envFileContent, "FROM_SEC=sec-val") {
+		t.Fatalf("expected FROM_SEC in env file:\n%s", envFileContent)
 	}
 
 	// The stored pod keeps the ValueFrom references, not the plaintext values.
@@ -965,8 +991,58 @@ func TestEnvValueFromResolvedInQuadlet(t *testing.T) {
 	resp.Body.Close()
 
 	jobOut := readTestFile(t, filepath.Join(quadletDir, "default-envjob-job.container"))
-	if !strings.Contains(jobOut, "Environment=FROM_CM=cm-val") || !strings.Contains(jobOut, "Environment=FROM_SEC=sec-val") {
-		t.Fatalf("expected resolved env values in job quadlet:\n%s", jobOut)
+	if !strings.Contains(jobOut, "Environment=FROM_CM=cm-val") {
+		t.Fatalf("expected resolved ConfigMap env value in job quadlet:\n%s", jobOut)
+	}
+	if strings.Contains(jobOut, "sec-val") {
+		t.Fatalf("secret value leaked into the world-readable quadlet file:\n%s", jobOut)
+	}
+	if !strings.Contains(jobOut, "EnvironmentFile=") {
+		t.Fatalf("expected EnvironmentFile= line in job quadlet:\n%s", jobOut)
+	}
+}
+
+// TestEnvValueFromMissingRefNotSilentlyBlank verifies that a non-optional
+// secretKeyRef/configMapKeyRef pointing at something that doesn't exist
+// stops quadlet generation instead of rendering as an empty Environment=
+// line -- matching real Kubernetes, which never starts such a pod
+// (CreateContainerConfigError) rather than running it with a blank value
+// (confirmed live 2026-08-29: this exact gap left MOZAK_VIEW_TOKEN empty
+// and the app exited 0 looking "successful").
+func TestEnvValueFromMissingRefNotSilentlyBlank(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	env := []interface{}{
+		map[string]interface{}{"name": "MISSING", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": "no-such-secret", "key": "PW"}}},
+	}
+	podB := podBody("default", "missingrefpod", "myimage")
+	podB["spec"].(map[string]interface{})["containers"].([]interface{})[0].(map[string]interface{})["env"] = env
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", podB)
+	// The pod object itself is still allowed to be stored (matches real k8s:
+	// the Pod resource creates fine, it just never gets a running container).
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	if _, err := os.Stat(filepath.Join(quadletDir, "default-missingrefpod.container")); !os.IsNotExist(err) {
+		t.Fatalf("expected no quadlet file to be written for a pod with an unresolvable required secretKeyRef, err=%v", err)
+	}
+
+	// Optional refs, by contrast, must not block generation.
+	optEnv := []interface{}{
+		map[string]interface{}{"name": "MISSING_OPT", "valueFrom": map[string]interface{}{"secretKeyRef": map[string]interface{}{"name": "no-such-secret", "key": "PW", "optional": true}}},
+	}
+	podB2 := podBody("default", "optionalrefpod", "myimage")
+	podB2["spec"].(map[string]interface{})["containers"].([]interface{})[0].(map[string]interface{})["env"] = optEnv
+	resp = post(t, ts.URL+"/api/v1/namespaces/default/pods", podB2)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	if _, err := os.Stat(filepath.Join(quadletDir, "default-optionalrefpod.container")); err != nil {
+		t.Fatalf("expected quadlet file for a pod with only an optional unresolvable ref, err=%v", err)
 	}
 }
 

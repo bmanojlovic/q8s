@@ -355,7 +355,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		// server-side only) that its spec can't be safely turned into a
 		// unit file — e.g. an image reference or env value containing
 		// characters that would corrupt the generated quadlet.
-		if _, err := quadlet.Container(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec)); err != nil {
+		if _, err := quadlet.Container(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec), ""); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1492,10 +1492,11 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		if s.config.QuadletDir != "" {
-			resolved := s.resolvedJobEnv(updated)
-			if content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec)); err == nil {
-				writeQuadletFile(s.config.QuadletDir,
-					fmt.Sprintf("%s-%s-job.container", resolved.Namespace, resolved.Name), content)
+			if resolved, envFile, err := s.resolvedJobEnv(updated); err == nil {
+				if content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile); err == nil {
+					writeQuadletFile(s.config.QuadletDir,
+						fmt.Sprintf("%s-%s-job.container", resolved.Namespace, resolved.Name), content)
+				}
 			}
 		}
 		encode(w, updated, http.StatusOK)
@@ -1892,8 +1893,12 @@ func (s *Server) ReconcileQuadlets() {
 				Spec:       dep.Spec.Template.Spec,
 			}
 			pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
-			resolved := s.resolveEnvFrom(pod)
-			content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec))
+			resolved, envFile, err := s.resolveEnvFrom(pod)
+			if err != nil {
+				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
+				continue
+			}
+			content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile)
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
@@ -1908,8 +1913,12 @@ func (s *Server) ReconcileQuadlets() {
 		if !missing(f) {
 			continue
 		}
-		resolved := s.resolveEnvFrom(pod)
-		content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec))
+		resolved, envFile, err := s.resolveEnvFrom(pod)
+		if err != nil {
+			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
+			continue
+		}
+		content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
 		if err != nil {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
@@ -1968,8 +1977,12 @@ func (s *Server) ReconcileQuadlets() {
 		if !missing(f) {
 			continue
 		}
-		resolved := s.resolvedJobEnv(job)
-		content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec))
+		resolved, envFile, err := s.resolvedJobEnv(job)
+		if err != nil {
+			fmt.Printf("reconcile job %s/%s: %v\n", job.Namespace, job.Name, err)
+			continue
+		}
+		content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile)
 		if err != nil {
 			fmt.Printf("reconcile job %s/%s: %v\n", job.Namespace, job.Name, err)
 			continue
@@ -1987,8 +2000,12 @@ func (s *Server) ReconcileQuadlets() {
 		tf := fmt.Sprintf("%s/%s-%s-cron.timer", timerDir, cj.Namespace, cj.Name)
 		regen := false
 		if missing(cf) {
-			resolved := s.resolvedCronJobEnv(cj)
-			content, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec))
+			resolved, envFile, err := s.resolvedCronJobEnv(cj)
+			if err != nil {
+				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
+				continue
+			}
+			content, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec), envFile)
 			if err != nil {
 				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
 				continue
@@ -2059,8 +2076,12 @@ func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	resolved := s.resolveEnvFrom(pod)
-	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec))
+	resolved, envFile, err := s.resolveEnvFrom(pod)
+	if err != nil {
+		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
+		return
+	}
+	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
 	if err != nil {
 		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
 		return
@@ -2075,8 +2096,12 @@ func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	resolved := s.resolveEnvFrom(pod)
-	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec))
+	resolved, envFile, err := s.resolveEnvFrom(pod)
+	if err != nil {
+		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
+		return
+	}
+	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
 	if err != nil {
 		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
 		return
@@ -2185,8 +2210,12 @@ func (s *Server) generateJobQuadlet(job *batchv1.Job) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	resolved := s.resolvedJobEnv(job)
-	content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec))
+	resolved, envFile, err := s.resolvedJobEnv(job)
+	if err != nil {
+		fmt.Printf("job quadlet %s: %v\n", job.Name, err)
+		return
+	}
+	content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile)
 	if err != nil {
 		fmt.Printf("job quadlet %s: %v\n", job.Name, err)
 		return
@@ -2219,8 +2248,12 @@ func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
 	if timerDir == "" {
 		timerDir = quadletDir
 	}
-	resolved := s.resolvedCronJobEnv(cj)
-	containerContent, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec))
+	resolved, envFile, err := s.resolvedCronJobEnv(cj)
+	if err != nil {
+		fmt.Printf("cronjob container %s: %v\n", cj.Name, err)
+		return
+	}
+	containerContent, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec), envFile)
 	if err != nil {
 		fmt.Printf("cronjob container %s: %v\n", cj.Name, err)
 		return
@@ -2388,8 +2421,12 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 		Spec: dep.Spec.Template.Spec,
 	}
 	pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
-	resolved := s.resolveEnvFrom(pod)
-	content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec))
+	resolved, envFile, err := s.resolveEnvFrom(pod)
+	if err != nil {
+		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
+		return
+	}
+	content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile)
 	if err != nil {
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return
@@ -2657,28 +2694,51 @@ func (s *Server) removeSecretFiles(sec *corev1.Secret) {
 	}
 }
 
-// resolveEnvFrom expands envFrom configMapRef/secretRef entries into individual env vars.
-// Returns a deep copy of the pod with envFrom replaced by resolved Env entries.
-func (s *Server) resolveEnvFrom(pod *corev1.Pod) *corev1.Pod {
+// resolveEnvFrom resolves a Pod's env references and returns a deep copy plus
+// the path to a 0600 EnvironmentFile holding any Secret-derived values (empty
+// string if none). Fails if a non-optional ConfigMap/Secret/key ref can't be
+// resolved -- matching real Kubernetes, which refuses to start such a pod
+// (CreateContainerConfigError) rather than silently running it with a blank
+// value.
+func (s *Server) resolveEnvFrom(pod *corev1.Pod) (*corev1.Pod, string, error) {
 	copied := pod.DeepCopy()
-	s.resolveContainerEnv(pod.Namespace, copied.Spec.Containers)
-	return copied
+	secretNames, err := s.resolveContainerEnv(pod.Namespace, copied.Spec.Containers)
+	if err != nil {
+		return nil, "", err
+	}
+	envFile, err := s.writeEnvFile(pod.Namespace, pod.Name, copied.Spec.Containers, secretNames)
+	if err != nil {
+		return nil, "", err
+	}
+	return copied, envFile, nil
 }
 
-// resolvedJobEnv returns a deep copy of the job with template container env
-// references resolved, for quadlet generation. The copy keeps the stored job
-// (and any API response built from it) free of inlined plaintext values.
-func (s *Server) resolvedJobEnv(job *batchv1.Job) *batchv1.Job {
+// resolvedJobEnv is resolveEnvFrom for a Job's pod template.
+func (s *Server) resolvedJobEnv(job *batchv1.Job) (*batchv1.Job, string, error) {
 	resolved := job.DeepCopy()
-	s.resolveContainerEnv(resolved.Namespace, resolved.Spec.Template.Spec.Containers)
-	return resolved
+	secretNames, err := s.resolveContainerEnv(resolved.Namespace, resolved.Spec.Template.Spec.Containers)
+	if err != nil {
+		return nil, "", err
+	}
+	envFile, err := s.writeEnvFile(resolved.Namespace, resolved.Name+"-job", resolved.Spec.Template.Spec.Containers, secretNames)
+	if err != nil {
+		return nil, "", err
+	}
+	return resolved, envFile, nil
 }
 
-// resolvedCronJobEnv is resolvedJobEnv for CronJob templates.
-func (s *Server) resolvedCronJobEnv(cj *batchv1.CronJob) *batchv1.CronJob {
+// resolvedCronJobEnv is resolveEnvFrom for a CronJob's pod template.
+func (s *Server) resolvedCronJobEnv(cj *batchv1.CronJob) (*batchv1.CronJob, string, error) {
 	resolved := cj.DeepCopy()
-	s.resolveContainerEnv(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec.Containers)
-	return resolved
+	secretNames, err := s.resolveContainerEnv(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec.Containers)
+	if err != nil {
+		return nil, "", err
+	}
+	envFile, err := s.writeEnvFile(resolved.Namespace, resolved.Name+"-cron", resolved.Spec.JobTemplate.Spec.Template.Spec.Containers, secretNames)
+	if err != nil {
+		return nil, "", err
+	}
+	return resolved, envFile, nil
 }
 
 // resolveContainerEnv resolves Env[i].ValueFrom.{ConfigMapKeyRef,SecretKeyRef}
@@ -2686,8 +2746,12 @@ func (s *Server) resolvedCronJobEnv(cj *batchv1.CronJob) *batchv1.CronJob {
 // env.Value verbatim, so an unresolved ValueFrom silently renders as an
 // empty Environment= line (confirmed live 2026-08-29: MOZAK_VIEW_TOKEN etc.
 // all came out blank, and the app exited 0 on missing config instead of
-// crash-looping visibly).
-func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) {
+// crash-looping visibly). Returns the set of env var names whose value came
+// from a Secret, so callers can route them to a 0600 EnvironmentFile instead
+// of the world-readable-ish quadlet .container file, and errors out if a
+// non-optional ref can't be resolved instead of leaving it silently blank.
+func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) (map[string]bool, error) {
+	secretNames := map[string]bool{}
 	for ci := range containers {
 		c := &containers[ci]
 		for ei := range c.Env {
@@ -2696,20 +2760,37 @@ func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) {
 				continue
 			}
 			if ref := ev.ValueFrom.ConfigMapKeyRef; ref != nil {
-				if cm, err := s.config.Store.GetConfigMap(ns, ref.Name); err == nil {
-					if v, ok := cm.Data[ref.Key]; ok {
-						ev.Value = v
-					}
+				cm, err := s.config.Store.GetConfigMap(ns, ref.Name)
+				v, ok := "", false
+				if err == nil {
+					v, ok = cm.Data[ref.Key]
 				}
+				if !ok {
+					if ref.Optional != nil && *ref.Optional {
+						continue
+					}
+					return nil, fmt.Errorf("env %s: configMapKeyRef %s/%s key %q not found", ev.Name, ns, ref.Name, ref.Key)
+				}
+				ev.Value = v
 			}
 			if ref := ev.ValueFrom.SecretKeyRef; ref != nil {
-				if sec, err := s.config.Store.GetSecret(ns, ref.Name); err == nil {
-					if v, ok := sec.Data[ref.Key]; ok {
-						ev.Value = string(v)
-					} else if v, ok := sec.StringData[ref.Key]; ok {
-						ev.Value = v
+				sec, err := s.config.Store.GetSecret(ns, ref.Name)
+				v, ok := "", false
+				if err == nil {
+					if bv, bok := sec.Data[ref.Key]; bok {
+						v, ok = string(bv), true
+					} else if sv, sok := sec.StringData[ref.Key]; sok {
+						v, ok = sv, true
 					}
 				}
+				if !ok {
+					if ref.Optional != nil && *ref.Optional {
+						continue
+					}
+					return nil, fmt.Errorf("env %s: secretKeyRef %s/%s key %q not found", ev.Name, ns, ref.Name, ref.Key)
+				}
+				ev.Value = v
+				secretNames[ev.Name] = true
 			}
 			ev.ValueFrom = nil
 		}
@@ -2721,7 +2802,10 @@ func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) {
 			if ef.ConfigMapRef != nil {
 				cm, err := s.config.Store.GetConfigMap(ns, ef.ConfigMapRef.Name)
 				if err != nil {
-					continue
+					if ef.ConfigMapRef.Optional != nil && *ef.ConfigMapRef.Optional {
+						continue
+					}
+					return nil, fmt.Errorf("envFrom: configMapRef %s/%s not found", ns, ef.ConfigMapRef.Name)
 				}
 				for k, v := range cm.Data {
 					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: v})
@@ -2730,16 +2814,69 @@ func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) {
 			if ef.SecretRef != nil {
 				sec, err := s.config.Store.GetSecret(ns, ef.SecretRef.Name)
 				if err != nil {
-					continue
+					if ef.SecretRef.Optional != nil && *ef.SecretRef.Optional {
+						continue
+					}
+					return nil, fmt.Errorf("envFrom: secretRef %s/%s not found", ns, ef.SecretRef.Name)
 				}
 				for k, v := range sec.Data {
 					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: string(v)})
+					secretNames[prefix+k] = true
 				}
 				for k, v := range sec.StringData {
 					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: v})
+					secretNames[prefix+k] = true
 				}
 			}
 		}
 		c.EnvFrom = nil
 	}
+	return secretNames, nil
+}
+
+// writeEnvFile splits any Secret-derived Env entries (per secretNames) out of
+// containers[0].Env and writes them as a 0600 systemd EnvironmentFile, next to
+// the per-secret files writeSecretFiles already writes at the same
+// permissions -- unlike those, they don't otherwise land on disk anywhere, so
+// without this they'd only ever have been emitted as Environment= lines in
+// the quadlet .container file, which writeQuadletFile writes 0644 (confirmed
+// live 2026-08-29: MOZAK_VIEW_TOKEN and DEEPSEEK_API_KEY were both readable
+// in that file to any local user). Returns "" if there was nothing to split.
+func (s *Server) writeEnvFile(ns, name string, containers []corev1.Container, secretNames map[string]bool) (string, error) {
+	if len(containers) == 0 || len(secretNames) == 0 {
+		return "", nil
+	}
+	c := &containers[0]
+	var lines strings.Builder
+	kept := c.Env[:0]
+	for _, ev := range c.Env {
+		if !secretNames[ev.Name] {
+			kept = append(kept, ev)
+			continue
+		}
+		if strings.ContainsAny(ev.Value, "\n\r\x00") {
+			return "", fmt.Errorf("env %s: secret value must not contain control characters", ev.Name)
+		}
+		lines.WriteString(ev.Name)
+		lines.WriteByte('=')
+		lines.WriteString(ev.Value)
+		lines.WriteByte('\n')
+	}
+	c.Env = kept
+	if lines.Len() == 0 {
+		return "", nil
+	}
+	secretDir := s.secretBaseDir()
+	if secretDir == "" {
+		return "", fmt.Errorf("no secret directory configured, cannot write env file for %s/%s", ns, name)
+	}
+	dir := filepath.Join(secretDir, ns, "_env")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("env dir %s: %w", dir, err)
+	}
+	path := filepath.Join(dir, name+".env")
+	if err := os.WriteFile(path, []byte(lines.String()), 0600); err != nil {
+		return "", fmt.Errorf("write env file %s: %w", path, err)
+	}
+	return path, nil
 }
