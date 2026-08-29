@@ -441,7 +441,7 @@ func TestVolume(t *testing.T) {
 	out := string(b)
 
 	assertContains(t, out, "[Volume]")
-	assertContains(t, out, "VolumeName=my-pvc")
+	assertContains(t, out, "VolumeName=default-my-pvc")
 }
 
 func TestVolumeHostpathReturnsNil(t *testing.T) {
@@ -472,7 +472,7 @@ func TestVolumeSharedClass(t *testing.T) {
 	}
 	out := string(b)
 	assertContains(t, out, "[Volume]")
-	assertContains(t, out, "VolumeName=shared-vol")
+	assertContains(t, out, "VolumeName=default-shared-vol")
 }
 
 // --- StorageClass volume mounts in Container ---

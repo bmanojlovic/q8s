@@ -1793,24 +1793,29 @@ func (s *Server) ReconcileQuadlets() {
 	}
 
 	for _, pvc := range s.config.Store.AllPVCs() {
-		// PVCs bind immediately at creation now; this heals claims created
-		// before binding existed, which are stuck with an empty status.
+		// PVCs bind immediately at creation; this heals claims created
+		// before that existed (empty status) and refreshes claims whose
+		// volume name predates namespace scoping.
+		dirty := false
 		if pvc.Status.Phase != corev1.ClaimBound {
 			pvc.Status.Phase = corev1.ClaimBound
-			if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
-				class := quadlet.StorageClassStandard
-				pvc.Spec.StorageClassName = &class
+			dirty = true
+		}
+		if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
+			class := quadlet.StorageClassStandard
+			pvc.Spec.StorageClassName = &class
+			dirty = true
+		}
+		if *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath {
+			if want := quadlet.PVCVolumeName(pvc.Namespace, pvc.Name); pvc.Spec.VolumeName != want {
+				pvc.Spec.VolumeName = want
+				dirty = true
 			}
-			if pvc.Spec.VolumeName == "" && *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath {
-				pvc.Spec.VolumeName = pvc.Name
-			}
+		}
+		if dirty {
 			if _, err := s.config.Store.UpdatePVC(pvc); err != nil {
 				fmt.Printf("reconcile pvc %s/%s: bind: %v\n", pvc.Namespace, pvc.Name, err)
 			}
-		}
-		f := fmt.Sprintf("%s/%s-%s.volume", quadletDir, pvc.Namespace, pvc.Name)
-		if !missing(f) {
-			continue
 		}
 		content, err := quadlet.Volume(pvc)
 		if err != nil {
@@ -1819,6 +1824,13 @@ func (s *Server) ReconcileQuadlets() {
 		}
 		if content == nil {
 			// hostpath PVCs don't need a .volume file.
+			continue
+		}
+		// Rewrite only when the file is missing or predates namespace
+		// scoping — an existing file with the old unscoped VolumeName would
+		// otherwise keep pointing at a volume another deployment may own.
+		f := fmt.Sprintf("%s/%s-%s.volume", quadletDir, pvc.Namespace, pvc.Name)
+		if existing, _ := os.ReadFile(f); string(existing) == string(content) {
 			continue
 		}
 		write(quadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name), content,
@@ -2014,8 +2026,13 @@ func (s *Server) generatePVCVolume(pvc *corev1.PersistentVolumeClaim) {
 		s.recordPVCEvent(pvc, corev1.EventTypeWarning, "ProvisioningFailed", "daemon-reload: "+err.Error())
 		return
 	}
-	if err := mgr.StartUnit(unitName); err != nil {
-		fmt.Printf("start %s: %v\n", unitName, err)
+	// Restart, not start: if the claim name was used before and its volume
+	// was removed out-of-band (a Retain-policy volume deleted by hand), the
+	// unit may still sit in active/exited state and a plain start would
+	// no-op, leaving no volume. The unit is oneshot + idempotent, so
+	// re-running it is always safe.
+	if err := mgr.RestartUnit(unitName); err != nil {
+		fmt.Printf("restart %s: %v\n", unitName, err)
 		s.recordPVCEvent(pvc, corev1.EventTypeWarning, "ProvisioningFailed", "starting volume unit: "+err.Error())
 	}
 }
