@@ -1690,3 +1690,63 @@ func fnv32(s string) uint32 {
 	}
 	return h
 }
+
+// --- NodePort allocation ---
+
+const (
+	// NodePortMin/Max bound the range for type: NodePort Services, matching
+	// the Kubernetes default service-node-port range. Unlike replica ports
+	// (loopback-bound, internal to the Traefik backend path), a NodePort is
+	// published on 0.0.0.0 — a real LAN listener on the backing pod.
+	NodePortMin = 30000
+	NodePortMax = 32767
+)
+
+// nodePortInUse reports whether a node port is already claimed by another
+// Service's nodePort or by a published hostPort on any pod. The caller holds
+// no lock; this takes its own read lock.
+func (s *Store) nodePortInUse(port int32, exceptSvc types.NamespacedName) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for key, svc := range s.services {
+		if key == exceptSvc {
+			continue
+		}
+		for _, sp := range svc.Spec.Ports {
+			if sp.NodePort == port {
+				return true
+			}
+		}
+	}
+	for _, pod := range s.pods {
+		for _, c := range pod.Spec.Containers {
+			for _, cp := range c.Ports {
+				if cp.HostPort == port {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// AllocateNodePort returns a free node port in [NodePortMin, NodePortMax] for
+// the given Service, skipping ports already used by other Services' nodePorts
+// or by any pod's published hostPort. Returns 0 if the range is exhausted.
+func (s *Store) AllocateNodePort(svc types.NamespacedName) int32 {
+	for p := int32(NodePortMin); p <= NodePortMax; p++ {
+		if !s.nodePortInUse(p, svc) {
+			return p
+		}
+	}
+	return 0
+}
+
+// NodePortAvailable reports whether an explicitly-requested node port is in
+// range and not already claimed (excluding the Service requesting it).
+func (s *Store) NodePortAvailable(port int32, svc types.NamespacedName) bool {
+	if port < NodePortMin || port > NodePortMax {
+		return false
+	}
+	return !s.nodePortInUse(port, svc)
+}

@@ -2546,3 +2546,87 @@ func TestDeleteCollectionPodsAndDeployments(t *testing.T) {
 		t.Errorf("expected 0 deployments after collection delete, got %d", len(deps.Items))
 	}
 }
+
+
+// --- NodePort services ---
+
+// nodePortSvcBody builds a type: NodePort service body; nodePort 0 means
+// "let q8s allocate".
+func nodePortSvcBody(ns, name string, port, nodePort int) map[string]interface{} {
+	p := map[string]interface{}{"port": port, "protocol": "TCP", "targetPort": port}
+	if nodePort != 0 {
+		p["nodePort"] = nodePort
+	}
+	return map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Service",
+		"metadata":   map[string]interface{}{"name": name, "namespace": ns},
+		"spec": map[string]interface{}{
+			"type":     "NodePort",
+			"selector": map[string]interface{}{"app": name},
+			"ports":    []interface{}{p},
+		},
+	}
+}
+
+// svcNodePort pulls spec.ports[0].nodePort out of a decoded service body.
+func svcNodePort(t *testing.T, m map[string]interface{}) int {
+	t.Helper()
+	spec, ok := m["spec"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("no spec in service: %v", m)
+	}
+	ports, ok := spec["ports"].([]interface{})
+	if !ok || len(ports) == 0 {
+		t.Fatalf("no ports in service spec: %v", spec)
+	}
+	p0 := ports[0].(map[string]interface{})
+	np, ok := p0["nodePort"].(float64)
+	if !ok {
+		t.Fatalf("no nodePort in port[0]: %v", p0)
+	}
+	return int(np)
+}
+
+// TestNodePortAutoAllocated: a NodePort service with no explicit nodePort
+// gets one assigned in range and returned in the created object.
+func TestNodePortAutoAllocated(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "web", 80, 0))
+	assertStatus(t, resp, 201)
+	np := svcNodePort(t, decodeBody(t, resp))
+	if np < store.NodePortMin || np > store.NodePortMax {
+		t.Fatalf("auto-allocated nodePort %d out of range %d-%d", np, store.NodePortMin, store.NodePortMax)
+	}
+}
+
+// TestNodePortExplicitHonored: an in-range explicit nodePort is kept.
+func TestNodePortExplicitHonored(t *testing.T) {
+	ts, _ := newTestServer(t)
+	want := store.NodePortMin + 100
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "web", 80, want))
+	assertStatus(t, resp, 201)
+	if np := svcNodePort(t, decodeBody(t, resp)); np != want {
+		t.Fatalf("explicit nodePort not honored: got %d want %d", np, want)
+	}
+}
+
+// TestNodePortOutOfRangeRejected: an explicit nodePort below the range is a 409.
+func TestNodePortOutOfRangeRejected(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "web", 80, 8080))
+	assertStatus(t, resp, 409)
+	resp.Body.Close()
+}
+
+// TestNodePortDuplicateRejected: two services can't claim the same nodePort.
+func TestNodePortDuplicateRejected(t *testing.T) {
+	ts, _ := newTestServer(t)
+	want := store.NodePortMin + 200
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "a", 80, want))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+	resp = post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "b", 80, want))
+	assertStatus(t, resp, 409)
+	resp.Body.Close()
+}
