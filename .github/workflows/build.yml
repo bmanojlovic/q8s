@@ -80,6 +80,14 @@ jobs:
       - name: build
         run: go build -o /tmp/q8s-e2e ./cmd/q8s/
 
+      - name: generate certs (install without a systemd session)
+        # The e2e suite runs a standalone `q8s serve` but needs TLS certs to
+        # exist first (q8s kubeconfig/serve read them, they are not
+        # auto-generated). `q8s install` generates them; its systemd
+        # daemon-reload is non-fatal on a runner with no user manager, so
+        # install exits 0 with the certs written.
+        run: /tmp/q8s-e2e install
+
       - name: run e2e
         run: |
           python3 -m pip install --user pexpect
