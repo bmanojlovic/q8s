@@ -3,6 +3,7 @@ package store_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -756,5 +757,96 @@ func TestLoadCorruptedFile(t *testing.T) {
 	_, err := store.Load(file)
 	if err == nil {
 		t.Fatal("expected error loading corrupted store file")
+	}
+}
+
+// --- replica port allocator ---
+
+func TestAllocateReplicaPortStableAndUnique(t *testing.T) {
+	s := store.New()
+	a := s.AllocateReplicaPort("default", "web", 0, 8080)
+	b := s.AllocateReplicaPort("default", "web", 1, 8080)
+	c := s.AllocateReplicaPort("default", "api", 0, 9090)
+
+	if a == b || a == c || b == c {
+		t.Errorf("expected distinct ports, got %d %d %d", a, b, c)
+	}
+	if a < store.ReplicaPortMin || a > store.ReplicaPortMax {
+		t.Errorf("port %d outside allocation range", a)
+	}
+	// Idempotent: same key returns the same port, every time.
+	if again := s.AllocateReplicaPort("default", "web", 0, 8080); again != a {
+		t.Errorf("allocation not stable: %d then %d", a, again)
+	}
+	// Distinct namespaces are distinct keys.
+	if x := s.AllocateReplicaPort("other", "web", 0, 8080); x == a {
+		t.Errorf("namespace not part of key: both got %d", x)
+	}
+}
+
+func TestFreeReplicaPortsScaleDownAndReuse(t *testing.T) {
+	s := store.New()
+	p0 := s.AllocateReplicaPort("default", "web", 0, 8080)
+	p1 := s.AllocateReplicaPort("default", "web", 1, 8080)
+	p2 := s.AllocateReplicaPort("default", "web", 2, 8080)
+
+	// Scale 3 -> 1: allocations for instances >= 1 are freed.
+	s.FreeReplicaPorts("default", "web", 1)
+	if got := s.AllocateReplicaPort("default", "web", 0, 8080); got != p0 {
+		t.Errorf("instance 0 should keep its port, got %d want %d", got, p0)
+	}
+	// Re-scale up: freed ports come back (lowest-first reuse).
+	if got := s.AllocateReplicaPort("default", "web", 1, 8080); got != p1 {
+		t.Errorf("freed port not reused: got %d want %d", got, p1)
+	}
+	_ = p2
+}
+
+func TestAllocateReplicaPortAvoidsManualHostPorts(t *testing.T) {
+	s := store.New()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "manual", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Ports: []corev1.ContainerPort{{ContainerPort: 80, HostPort: store.ReplicaPortMin}},
+		}}},
+	}
+	if _, err := s.CreatePod(pod); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.AllocateReplicaPort("default", "web", 0, 8080); got != store.ReplicaPortMin+1 {
+		t.Errorf("allocator should skip the manually-used port, got %d want %d", got, store.ReplicaPortMin+1)
+	}
+}
+
+// TestReplicaPortsPersistAcrossLoad: allocations must survive a restart so
+// published ports (and the Traefik configs pointing at them) stay stable.
+func TestReplicaPortsPersistAcrossLoad(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "store.json")
+	st, err := store.Load(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := st.AllocateReplicaPort("default", "web", 3, 8080)
+
+	// save() is asynchronous; wait for the file to contain the allocation.
+	deadline := time.Now().Add(5 * time.Second)
+persisted:
+	for {
+		data, err := os.ReadFile(file)
+		if err == nil && strings.Contains(string(data), `"default/web/3/8080"`) {
+			break persisted
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("store.json never received the replicaPorts entry")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	st2, err := store.Load(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st2.AllocateReplicaPort("default", "web", 3, 8080); got != p {
+		t.Errorf("allocation not persisted: got %d want %d", got, p)
 	}
 }

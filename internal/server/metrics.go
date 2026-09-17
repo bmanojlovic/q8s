@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -165,7 +166,9 @@ func (s *Server) handlePodMetrics(w http.ResponseWriter, r *http.Request) {
 // getPodStats runs `podman stats --no-stream` for a container and returns
 // CPU (nanocores string) and memory (Ki string) usage.
 func getPodStats(containerName string) (cpu, mem string) {
-	out, err := exec.Command("podman", "stats", "--no-stream", "--format",
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "podman", "stats", "--no-stream", "--format",
 		"{{.CPUPerc}} {{.MemUsage}}", containerName).Output()
 	if err != nil {
 		return "0", "0Ki"
@@ -304,7 +307,6 @@ func getMemoryUsageKi() int64 {
 	freeKi := int64(sysinfo.Freeram * uint64(sysinfo.Unit) / 1024)
 	return totalKi - freeKi
 }
-
 
 // --- coordination.k8s.io (node lease for kubectl describe node) ---
 

@@ -86,7 +86,11 @@ func validateHost(value string) error {
 // Those values get spliced into the generated Traefik dynamic-config file,
 // so an unescaped newline is the same injection shape as the quadlet bug:
 // it can break out of its field and add attacker-controlled config blocks.
-var ingressPathRE = regexp.MustCompile(`^/[^\x00-\x1f]*$`)
+// Backtick (0x60) and double quote (0x22) are rejected for the same reason:
+// the path is interpolated into a Traefik rule expression (PathPrefix(`…`))
+// and into a YAML double-quoted scalar — either character terminates its
+// enclosing context and injects rule/config syntax.
+var ingressPathRE = regexp.MustCompile(`^/[^\x00-\x1f\x22\x60]*$`)
 
 func validateIngressPath(value string) error {
 	if value == "" {
@@ -158,11 +162,36 @@ func validateIngress(ing *networkingv1.Ingress) error {
 				return err
 			}
 		}
+		// secretName is validated for shape only and then deliberately
+		// ignored: TLS termination is Traefik's job (its default cert unless
+		// the admin configures one there). q8s does not read certificate
+		// secrets — see "TLS termination" in docs/ingress.md before adding
+		// anything here.
 		if tls.SecretName != "" {
 			if err := validateName("tls secretName", tls.SecretName); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// validatePatchedIdentity checks that a PATCH did not alter the object's
+// namespace or name. Real k8s rejects metadata.name/namespace changes, and
+// q8s's Store.Update* keys on the patched object's own identity — so a
+// patch that changed them would either fail the lookup (benign 404-shaped
+// InternalError) or, when a same-named object exists at the target identity,
+// silently re-key and overwrite that other object. Enforcing immutability
+// here keeps the identity that the POST-time validateName call vetted.
+func validatePatchedIdentity(kind, patchedNS, patchedName, urlNS, urlName string) error {
+	if err := validateName("namespace", patchedNS); err != nil {
+		return err
+	}
+	if err := validateName("name", patchedName); err != nil {
+		return err
+	}
+	if patchedNS != urlNS || patchedName != urlName {
+		return fmt.Errorf("%s %q: namespace and name are immutable", kind, urlName)
 	}
 	return nil
 }

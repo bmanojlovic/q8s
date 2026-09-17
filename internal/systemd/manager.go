@@ -8,9 +8,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
-	godbus "github.com/godbus/dbus/v5"
 	"github.com/coreos/go-systemd/v22/dbus"
+	godbus "github.com/godbus/dbus/v5"
 )
 
 // UnitState holds the relevant systemd unit state for a container.
@@ -68,7 +69,7 @@ func (m *Manager) RestartUnit(name string) error {
 type Mode string
 
 const (
-	ModeRootful Mode = "rootful"
+	ModeRootful  Mode = "rootful"
 	ModeRootless Mode = "rootless"
 )
 
@@ -238,13 +239,20 @@ func (m *Manager) ReadUnitFile(name string) (string, error) {
 	return string(content), nil
 }
 
+// systemctlTimeout bounds one-shot systemctl calls. The reconcile loop
+// queries unit state through this on every pass; a hung systemctl would
+// freeze reconciliation indefinitely without a deadline.
+const systemctlTimeout = 15 * time.Second
+
 // RunSystemctl runs a systemctl command and returns output.
 func (m *Manager) RunSystemctl(args ...string) (string, error) {
 	cmdArgs := append([]string{"--no-pager"}, args...)
 	if m.mode == ModeRootless {
 		cmdArgs = append([]string{"--user"}, cmdArgs...)
 	}
-	cmd := exec.Command("systemctl", cmdArgs...)
+	ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", cmdArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("systemctl %s: %w: %s", args, err, string(output))

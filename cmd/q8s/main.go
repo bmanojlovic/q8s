@@ -124,12 +124,12 @@ func systemctlFlags(rootful bool) []string {
 }
 
 // resolvePort determines the q8s API port with the following precedence:
-// 1. Q8S_PORT env var, if set — an explicit override for this invocation.
-// 2. The port already baked into the installed q8s.socket unit, if any —
-//    the systemd unit is the durable source of truth once installed, so
-//    separate invocations (install, serve, status, kubeconfig) agree on the
-//    port without needing Q8S_PORT set consistently in every shell.
-// 3. install.DefaultPort (6443).
+//  1. Q8S_PORT env var, if set — an explicit override for this invocation.
+//  2. The port already baked into the installed q8s.socket unit, if any —
+//     the systemd unit is the durable source of truth once installed, so
+//     separate invocations (install, serve, status, kubeconfig) agree on the
+//     port without needing Q8S_PORT set consistently in every shell.
+//  3. install.DefaultPort (6443).
 func resolvePort(d dirs) int {
 	if v := os.Getenv("Q8S_PORT"); v != "" {
 		if port, err := strconv.Atoi(v); err == nil && port > 0 {
@@ -248,6 +248,11 @@ func cmdUninstall() {
 
 	storeFile := d.dataDir + "/store.json"
 	st, storeErr := store.Load(storeFile)
+	if storeErr != nil {
+		// Don't silently skip quadlet cleanup and still claim success: the
+		// user must know container/volume/network files remain.
+		fmt.Fprintf(os.Stderr, "warning: could not read %s (%v) — resource quadlet files were NOT cleaned up\n", storeFile, storeErr)
+	}
 	if storeErr == nil {
 		removed := 0
 		rm := func(path string) {
@@ -297,6 +302,23 @@ func cmdUninstall() {
 	}
 	exec.Command("systemctl", append(flags, "daemon-reload")...).Run()
 
+	// Remove the rest of the installation. store.json.bak is kept: it is
+	// the restore path for `q8s install && q8s serve` after uninstall.
+	// The certs directory includes the CA private key — an "uninstall" that
+	// leaves a CA key on disk is not an uninstall.
+	for _, p := range []string{
+		d.dataDir + "/certs",    // ca.key, server/client keys
+		d.dataDir + "/traefik",  // generated ingress dynamic configs
+		d.dataDir + "/quadlets", // legacy empty dir from old installs
+		d.dataDir + "/config.json",
+	} {
+		if err := os.RemoveAll(p); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not remove %s: %v\n", p, err)
+		} else {
+			fmt.Printf("  removed %s\n", p)
+		}
+	}
+
 	fmt.Println("q8s uninstalled.")
 	if storeErr == nil {
 		fmt.Println("Run 'q8s install && q8s serve' to reinstall — existing resources will be restored from backup.")
@@ -338,6 +360,14 @@ func cmdStatus() {
 		conn.Close()
 	}
 	listening := dialErr == nil
+
+	if !rootful {
+		if on, err := install.LingerEnabled(); err == nil && !on {
+			fmt.Println("linger: disabled (workloads stop at logout — run: q8s install, or sudo loginctl enable-linger $USER)")
+		} else if err != nil {
+			fmt.Println("linger: unknown (loginctl unavailable)")
+		}
+	}
 
 	if !socketActive {
 		fmt.Println("q8s socket: inactive (run: q8s start)")
@@ -660,6 +690,15 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) {
 		if ns == "" || name == "" {
 			continue
 		}
+		// Labels are attacker-controllable at `podman run --label` time.
+		// A name/namespace that isn't a valid RFC-1123 label can't be
+		// safely materialized (quadlet injection / filename traversal), so
+		// it is never imported — with a loud log, since a silently skipped
+		// container is a debugging dead end.
+		if !isValidObjectName(name) || !isValidObjectName(ns) {
+			fmt.Printf("reconcile pods: skipping container with unsafe label name %q ns %q\n", name, ns)
+			continue
+		}
 		live[ns+"/"+name] = true
 
 		// Only import into namespaces that exist — prevents re-importing
@@ -742,6 +781,26 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) {
 			fmt.Printf("pruned deployment pod: %s/%s (container gone)\n", pod.Namespace, pod.Name)
 		}
 	}
+}
+
+// isValidObjectName matches the RFC-1123 label rule the API boundary
+// enforces (internal/server validateName). Duplicated here so the import
+// path doesn't depend on the server package.
+func isValidObjectName(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+			continue
+		}
+		if c == '-' && i > 0 && i < len(s)-1 {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func isDeploymentOwned(pod *corev1.Pod) bool {

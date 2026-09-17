@@ -1,11 +1,18 @@
 package podman
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
+
+// cmdTimeout bounds one-shot podman invocations. A wedged podman (locked
+// store, stalled varlink) must not freeze the reconcile loop that calls
+// these — the 30s resync ticker cannot fire while a child hangs.
+const cmdTimeout = 10 * time.Second
 
 // ContainerInfo holds the fields we care about from `podman ps --format json`.
 type ContainerInfo struct {
@@ -30,7 +37,9 @@ func (c ContainerInfo) PodDeployment() string { return c.Labels["io.kubernetes.p
 
 // List returns all containers (running and stopped).
 func List() ([]ContainerInfo, error) {
-	out, err := exec.Command("podman", "ps", "--all", "--format", "json").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "podman", "ps", "--all", "--format", "json").Output()
 	if err != nil {
 		return nil, fmt.Errorf("podman ps: %w", err)
 	}
@@ -50,7 +59,9 @@ type ContainerState struct {
 // InspectState returns the current state of a single container by name.
 // Returns an error if the container does not exist.
 func InspectState(name string) (*ContainerState, error) {
-	out, err := exec.Command("podman", "inspect", "--format", "json", name).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "podman", "inspect", "--format", "json", name).Output()
 	if err != nil {
 		return nil, fmt.Errorf("podman inspect %s: %w", name, err)
 	}

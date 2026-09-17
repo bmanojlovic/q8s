@@ -23,7 +23,12 @@ CFGDIR   = f"{XDG_RUN}/q8s/configmaps"
 SECDIR   = f"{XDG_RUN}/q8s/secrets"
 SOCK     = f"{XDG_RUN}/q8s/api.sock"
 
-env = {**os.environ, "KUBECONFIG": KUBE}
+# The e2e suite runs its own standalone `q8s serve`. Use a dedicated port so
+# it never collides with an installed, enabled q8s instance (the recommended
+# setup) — binding :6443 there fails instantly and aborts the whole suite.
+PORT     = int(os.environ.get("Q8S_E2E_PORT", "16443"))
+
+env = {**os.environ, "KUBECONFIG": KUBE, "Q8S_PORT": str(PORT)}
 
 PASS = 0
 FAIL = 0
@@ -107,23 +112,31 @@ def start_server():
     # remove stale socket
     if os.path.exists(SOCK):
         os.remove(SOCK)
-    # clear kubectl cache so stale OpenAPI schema isn't reused across runs
-    cache_dir = os.path.expanduser("~/.kube/cache")
-    if os.path.isdir(cache_dir):
-        import shutil
-        shutil.rmtree(cache_dir)
+    # Clear only OUR discovery cache (kubectl caches per host_port), not the
+    # whole ~/.kube/cache — that would nuke discovery for every other cluster
+    # on this machine.
+    import shutil
+    our_cache = os.path.expanduser(f"~/.kube/cache/localhost_{PORT}")
+    if os.path.isdir(our_cache):
+        shutil.rmtree(our_cache)
     # kill any lingering containers from a previous aborted run
     out, _ = run(f"podman ps -a --format '{{{{.Names}}}}' --filter 'name=^{NS}-'")
     for name in out.splitlines():
         name = name.strip()
         if name:
             run(f"podman rm -f {name}")
-    # generate kubeconfig
-    subprocess.run([BINARY, "kubeconfig"], stdout=open(KUBE, "w"), check=True)
+    # generate kubeconfig (picks up Q8S_PORT from env → points at our port)
+    # umask 077: the file embeds the client key.
+    old_umask = os.umask(0o077)
+    try:
+        subprocess.run([BINARY, "kubeconfig"], stdout=open(KUBE, "w"), check=True, env=env)
+    finally:
+        os.umask(old_umask)
     server = subprocess.Popen(
         [BINARY, "serve"],
         stdout=open("/tmp/q8s-e2e.log", "w"),
         stderr=subprocess.STDOUT,
+        env=env,  # Q8S_PORT must reach serve, or it binds the installed port
     )
     # wait up to 10s
     for _ in range(10):
@@ -390,6 +403,13 @@ def port_open(host="localhost", port=6443, timeout=2):
     except OSError:
         return False
 
+def installed_port():
+    """The port of the (installed) q8s instance this section manipulates."""
+    out, _ = run(f"{BINARY} status")
+    import re
+    m = re.search(r"q8s port (\d+)", out)
+    return int(m.group(1)) if m else 6443
+
 def test_socket_management():
     section("Socket management (start / stop / enable / disable / status)")
 
@@ -398,6 +418,19 @@ def test_socket_management():
         print(f"  \033[33mSKIP\033[0m socket unit not installed (run: {BINARY} install)")
         return
 
+    # This section manipulates the INSTALLED instance, whose port comes from
+    # config.json / its socket unit — not Q8S_PORT, which points at the
+    # standalone e2e server's port (and whose process is gone by now).
+    # Leaving Q8S_PORT in the env would make `q8s status` report the e2e port
+    # and every reachability check below test the wrong address.
+    saved_port = env.pop("Q8S_PORT", None)
+    try:
+        _socket_management_checks(socket_unit, BINARY)
+    finally:
+        if saved_port is not None:
+            env["Q8S_PORT"] = saved_port
+
+def _socket_management_checks(socket_unit, BINARY):
     # ensure clean slate
     run(f"{BINARY} stop")
     time.sleep(1)
@@ -412,11 +445,12 @@ def test_socket_management():
     # start
     check("q8s start", f"{BINARY} start", expect="started")
     time.sleep(1)
+    ip_port = installed_port()
 
-    if port_open():
-        ok("port 6443 listening after start")
+    if port_open(port=ip_port):
+        ok(f"port {ip_port} listening after start")
     else:
-        fail("port 6443 listening after start", "connection refused")
+        fail(f"port {ip_port} listening after start", "connection refused")
 
     out, rc = run(f"{BINARY} status")
     if rc == 0 and "active" in out and "reachable" in out:
@@ -428,10 +462,10 @@ def test_socket_management():
     check("q8s stop", f"{BINARY} stop", expect="stopped")
     time.sleep(1)
 
-    if not port_open():
-        ok("port 6443 not listening after stop")
+    if not port_open(port=ip_port):
+        ok(f"port {ip_port} not listening after stop")
     else:
-        fail("port 6443 not listening after stop", "connection still succeeded")
+        fail(f"port {ip_port} not listening after stop", "connection still succeeded")
 
     _, rc = run(f"{BINARY} status")
     if rc != 0:
@@ -449,10 +483,10 @@ def test_socket_management():
     else:
         fail("socket is-enabled after q8s enable", out)
 
-    if port_open():
-        ok("port 6443 listening after enable")
+    if port_open(port=ip_port):
+        ok(f"port {ip_port} listening after enable")
     else:
-        fail("port 6443 listening after enable", "connection refused")
+        fail(f"port {ip_port} listening after enable", "connection refused")
 
     # disable
     check("q8s disable", f"{BINARY} disable", expect="disabled")
@@ -464,10 +498,10 @@ def test_socket_management():
     else:
         fail("socket is-disabled after q8s disable", out)
 
-    if not port_open():
-        ok("port 6443 not listening after disable")
+    if not port_open(port=ip_port):
+        ok(f"port {ip_port} not listening after disable")
     else:
-        fail("port 6443 not listening after disable", "connection still succeeded")
+        fail(f"port {ip_port} not listening after disable", "connection still succeeded")
 
 def cleanup():
     section("Cleanup")

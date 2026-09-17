@@ -66,6 +66,11 @@ func (c *wsConn) writeChan(ch byte, data []byte) {
 	c.writeFrame(wsOpBinary, msg)
 }
 
+// maxWSFrameBytes caps a single WebSocket frame. RFC 6455 lengths are 64-bit;
+// allocating straight from the header would let an authenticated client ask
+// for exabytes before sending a byte.
+const maxWSFrameBytes = 1 << 20 // 1 MiB — stdin chunks from kubectl are far smaller
+
 // readFrame reads one WebSocket frame from r. Returns opcode and unmasked payload.
 func readFrame(r io.Reader) (op byte, payload []byte, err error) {
 	hdr := make([]byte, 2)
@@ -98,6 +103,9 @@ func readFrame(r io.Reader) (op byte, payload []byte, err error) {
 		}
 	}
 
+	if plen > maxWSFrameBytes {
+		return 0, nil, fmt.Errorf("websocket frame of %d bytes exceeds limit %d", plen, maxWSFrameBytes)
+	}
 	payload = make([]byte, plen)
 	if _, err = io.ReadFull(r, payload); err != nil {
 		return

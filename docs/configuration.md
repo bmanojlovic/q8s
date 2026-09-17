@@ -18,11 +18,13 @@ After `q8s install` prints the commands, run them:
 kubectl config set-cluster q8s \
   --server=https://localhost:6443 \
   --certificate-authority=~/.local/share/q8s/certs/ca.crt \
+  --embed-certs=true
+
+kubectl config set-credentials q8s \
   --client-certificate=~/.local/share/q8s/certs/client.crt \
   --client-key=~/.local/share/q8s/certs/client.key \
   --embed-certs=true
 
-kubectl config set-credentials q8s --embed-certs=true
 kubectl config set-context q8s --cluster=q8s --user=q8s
 kubectl config use-context q8s
 ```
@@ -35,6 +37,18 @@ kubectl config use-context q8s
 | Quadlet dir | `~/.config/containers/systemd/` | `/etc/containers/systemd/` |
 | Systemd | `systemctl --user` | `systemctl` |
 | Runtime | `$XDG_RUNTIME_DIR/q8s/` | `/run/q8s/` |
+| Container IPs | private to the user netns (backends via published hostPorts) | routable from the host |
+
+Rootless needs **lingering** so the systemd user manager (and with it every
+q8s unit and container) keeps running after you log out:
+
+```sh
+q8s install          # enables linger automatically (falls back to a warning)
+# or manually:
+sudo loginctl enable-linger $USER
+```
+
+`q8s status` warns when lingering is off.
 
 ## Commands
 
@@ -122,9 +136,10 @@ The `hostpath` class reads the host directory from the `q8s.io/host-path` annota
 |---|---|---|
 | `containerPort` | Internal only — reachable within the `q8s-{ns}` podman network via NetworkAlias | None |
 | `hostPort` | Binds to the host | `PublishPort=hostPort:containerPort/proto` |
-| Service `.ports` | Binds to host via systemd socket unit | `{name}-{port}.socket` |
+| `hostPort` + `hostIP` | Binds one interface (e.g. loopback only) | `PublishPort=hostIP:hostPort:containerPort/proto` |
+| Deployment replicas | Auto-allocated loopback port per replica | `PublishPort=127.0.0.1:20000-32767:containerPort` |
 
-`hostPort` and Service are **mutually exclusive** on the same port. q8s rejects creation if both would bind the same host port.
+A Service never binds a host port. It is a **selector + port map**: its name becomes a DNS alias on the namespace network (aardvark), and its selector + `targetPort` drive ingress backend resolution (one Traefik server per matching pod). For host reachability use `hostPort`, a Deployment (auto-allocated), or an Ingress. q8s rejects a Service whose port collides with a matching pod's `hostPort` — that combination double-binds and can't work.
 
 ## Resource limits and cgroup delegation
 

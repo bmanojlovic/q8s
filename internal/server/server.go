@@ -37,7 +37,15 @@ type Server struct {
 	config     Config
 	mux        *http.ServeMux
 	auth       *AuthMiddleware
+	// handler is mux wrapped in the auth middleware, built once. Wrapping
+	// per request allocated a new middleware closure on every call.
+	handler http.Handler
 }
+
+// maxRequestBodyBytes caps request bodies (same order of magnitude as real
+// kube-apiserver's ~3MB). Without it, every handler's io.ReadAll happily
+// buffers whatever an authenticated client streams until the process OOMs.
+const maxRequestBodyBytes = 3 << 20
 
 // New creates a new Server.
 func New(cfg Config) (*Server, error) {
@@ -48,11 +56,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("TLS certificate and key are required")
 	}
 
+	auth, err := NewAuthMiddleware(cfg.CACert)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set up client-cert auth: %w", err)
+	}
 	s := &Server{
 		config: cfg,
 		mux:    http.NewServeMux(),
-		auth:   NewAuthMiddleware(cfg.CACert),
+		auth:   auth,
 	}
+	s.handler = auth.Handler(s.mux)
 
 	s.setupRoutes()
 
@@ -111,7 +124,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.auth.Handler(s.mux).ServeHTTP(w, r)
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	s.handler.ServeHTTP(w, r)
 }
 
 func (s *Server) setupRoutes() {

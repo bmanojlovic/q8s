@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	jsonser "k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"q8s/internal/quadlet"
 )
 
@@ -38,9 +41,50 @@ func encoder() *jsonser.Serializer {
 	return jsonser.NewSerializer(jsonser.SimpleMetaFactory{}, scheme, scheme, false)
 }
 
+// readBody reads the request body, mapping MaxBytesReader overflow to a
+// 413 Status the way real kube-apiserver does. Returns ok=false (and has
+// already written the response) when reading failed.
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.respondStatus(w, http.StatusRequestEntityTooLarge, "RequestEntityTooLarge",
+				"request body exceeds %d bytes", maxRequestBodyBytes)
+			return nil, false
+		}
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "failed to read request body: %s", err.Error())
+		return nil, false
+	}
+	return body, true
+}
+
+// errBodyTooLarge marks a request body rejected by MaxBytesReader so POST
+// handlers can answer 413 instead of a generic 400.
+var errBodyTooLarge = fmt.Errorf("request body exceeds %d bytes", maxRequestBodyBytes)
+
+// decodeOrRespond decodes a create/update body, writing a 413/400 Status
+// and returning false on failure. POST/PUT handlers that would otherwise
+// repeat this block use it.
+func (s *Server) decodeOrRespond(w http.ResponseWriter, r *http.Request, obj runtime.Object) bool {
+	if err := decode(r, obj); err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			s.respondStatus(w, http.StatusRequestEntityTooLarge, "RequestEntityTooLarge", "%s", err.Error())
+		} else {
+			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		}
+		return false
+	}
+	return true
+}
+
 func decode(r *http.Request, obj runtime.Object) error {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			return errBodyTooLarge
+		}
 		return fmt.Errorf("failed to read request body: %w", err)
 	}
 	ct := r.Header.Get("Content-Type")
@@ -333,14 +377,19 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 	case http.MethodPost:
 		var pod corev1.Pod
-		if err := decode(r, &pod); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &pod) {
 			return
 		}
 		pod.APIVersion = "v1"
 		pod.Kind = "Pod"
 		if pod.Namespace == "" {
 			pod.Namespace = ns
+		}
+		// k8s defaulting: an unset restartPolicy is Always. Without this,
+		// empty reached the quadlet generator, whose defensive Never
+		// handling would strand the pod after a clean exit 0.
+		if pod.Spec.RestartPolicy == "" {
+			pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
 		}
 		if err := validateName("namespace", pod.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -380,6 +429,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		s.generatePodQuadlet(created)
+		s.regenerateIngressConfigs(ns)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
 		pod, err := s.config.Store.GetPod(ns, name)
@@ -387,7 +437,10 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(pod)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -415,6 +468,21 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if patched.Spec.RestartPolicy == "" {
+			patched.Spec.RestartPolicy = corev1.RestartPolicyAlways
+		}
+		if err := validatePatchedIdentity("pod", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		// Same fail-fast dry-run as create: a patch whose merged spec can't
+		// be rendered into a unit file must be rejected here, not stored and
+		// then silently left unapplied (200 OK while the running container
+		// keeps the old spec).
+		if _, err := quadlet.Container(patched.Name, &patched, s.config.ConfigDir, s.matchingServiceAliases(patched.Namespace, patched.Labels), s.podPVCMap(patched.Namespace, patched.Spec), ""); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		updated, err := s.config.Store.UpdatePod(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -423,14 +491,19 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		s.redeployPodQuadlet(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		pod, err := s.config.Store.GetPod(ns, name)
-		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, p := range s.config.Store.Pods(ns) {
+						names = append(names, p.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deletePodByName(ns, n) })
 			return
 		}
-		s.stopPodUnit(pod)
-		s.removePodQuadlet(pod)
-		if err := s.config.Store.DeletePod(ns, name); err != nil {
+		if err := s.deletePodByName(ns, name); err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
@@ -544,8 +617,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		}
 	case http.MethodPost:
 		var svc corev1.Service
-		if err := decode(r, &svc); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &svc) {
 			return
 		}
 		svc.APIVersion = "v1"
@@ -572,7 +644,6 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 				"service port %d conflicts with hostPort on a matching pod — use one or the other", port)
 			return
 		}
-		s.generateServiceSocket(created)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
 		svc, err := s.config.Store.GetService(ns, name)
@@ -580,7 +651,10 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(svc)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -608,6 +682,10 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if err := validatePatchedIdentity("service", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		updated, err := s.config.Store.UpdateService(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -618,10 +696,23 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 				"service port %d conflicts with hostPort on a matching pod — use one or the other", port)
 			return
 		}
-		s.generateServiceSocket(updated)
+		// Clean up legacy per-port socket files (see removeLegacyServiceSockets).
+		s.removeLegacyServiceSockets(svc)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		if err := s.config.Store.DeleteService(ns, name); err != nil {
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, svc := range s.config.Store.Services(ns) {
+						names = append(names, svc.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deleteServiceByName(ns, n) })
+			return
+		}
+		if err := s.deleteServiceByName(ns, name); err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
@@ -655,8 +746,7 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 	case http.MethodPost:
 		var pvc corev1.PersistentVolumeClaim
-		if err := decode(r, &pvc); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &pvc) {
 			return
 		}
 		pvc.APIVersion = "v1"
@@ -685,7 +775,10 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(pvc)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -713,6 +806,10 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if err := validatePatchedIdentity("persistentvolumeclaim", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		updated, err := s.config.Store.UpdatePVC(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -720,13 +817,21 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		pvc, _ := s.config.Store.GetPVC(ns, name)
-		if err := s.config.Store.DeletePVC(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, pvc := range s.config.Store.PVCs(ns) {
+						names = append(names, pvc.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deletePVCByName(ns, n) })
 			return
 		}
-		if pvc != nil {
-			s.removePVCVolume(pvc)
+		if err := s.deletePVCByName(ns, name); err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 	default:
@@ -758,8 +863,7 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 	case http.MethodPost:
 		var cm corev1.ConfigMap
-		if err := decode(r, &cm); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &cm) {
 			return
 		}
 		cm.APIVersion = "v1"
@@ -788,8 +892,7 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		encode(w, created, http.StatusCreated)
 	case http.MethodPut:
 		var cm corev1.ConfigMap
-		if err := decode(r, &cm); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &cm) {
 			return
 		}
 		cm.APIVersion = "v1"
@@ -825,7 +928,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(cm)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -853,6 +959,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if err := validatePatchedIdentity("configmap", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		if err := validateDataKeys(patched.Data, patched.BinaryData); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
@@ -865,13 +975,21 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		s.writeConfigMapFiles(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		cm, _ := s.config.Store.GetConfigMap(ns, name)
-		if err := s.config.Store.DeleteConfigMap(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, cm := range s.config.Store.ConfigMaps(ns) {
+						names = append(names, cm.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deleteConfigMapByName(ns, n) })
 			return
 		}
-		if cm != nil {
-			s.removeConfigMapFiles(cm)
+		if err := s.deleteConfigMapByName(ns, name); err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 	default:
@@ -903,8 +1021,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		}
 	case http.MethodPost:
 		var secret corev1.Secret
-		if err := decode(r, &secret); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &secret) {
 			return
 		}
 		secret.APIVersion = "v1"
@@ -937,7 +1054,10 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(sec)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -968,6 +1088,10 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if err := validatePatchedIdentity("secret", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		if err := validateDataKeys(patched.StringData, patched.Data); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
@@ -981,13 +1105,21 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		s.writeSecretFiles(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		sec, _ := s.config.Store.GetSecret(ns, name)
-		if err := s.config.Store.DeleteSecret(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, sec := range s.config.Store.Secrets(ns) {
+						names = append(names, sec.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deleteSecretByName(ns, n) })
 			return
 		}
-		if sec != nil {
-			s.removeSecretFiles(sec)
+		if err := s.deleteSecretByName(ns, name); err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 	default:
@@ -1109,8 +1241,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 	case http.MethodPost:
 		var dep appsv1.Deployment
-		if err := decode(r, &dep); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &dep) {
 			return
 		}
 		dep.APIVersion = "apps/v1"
@@ -1132,6 +1263,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			return
 		}
 		s.generateDeploymentQuadlets(created)
+		s.regenerateIngressConfigs(ns)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
 		dep, err := s.config.Store.GetDeployment(ns, name)
@@ -1143,7 +1275,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		// JSON-merge (or RFC 6902 JSON Patch) the patch into the existing
 		// deployment so annotations, template changes (e.g. kubectl rollout
 		// restart), and replica changes all get persisted correctly.
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(dep)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -1173,6 +1308,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if err := validatePatchedIdentity("deployment", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		updated, err := s.config.Store.UpdateDeployment(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -1186,17 +1325,22 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 				s.redeployDeploymentInstanceQuadlet(updated, i)
 			}
 		}
+		s.regenerateIngressConfigs(ns)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		dep, err := s.config.Store.GetDeployment(ns, name)
-		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, dep := range s.config.Store.Deployments(ns) {
+						names = append(names, dep.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deleteDeploymentByName(ns, n) })
 			return
 		}
-		s.stopDeploymentUnits(dep)
-		s.removeDeploymentQuadlets(dep)
-		s.deleteDeploymentPods(dep)
-		if err := s.config.Store.DeleteDeployment(ns, name); err != nil {
+		if err := s.deleteDeploymentByName(ns, name); err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
@@ -1227,7 +1371,10 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 		scaleResp(dep)
 	case http.MethodPatch, http.MethodPut:
 		oldR := deploymentReplicas(dep)
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		var patch struct {
 			Spec struct {
 				Replicas *int32 `json:"replicas"`
@@ -1242,6 +1389,7 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 			return
 		}
 		s.scaleDeployment(updated, oldR, deploymentReplicas(updated))
+		s.regenerateIngressConfigs(ns)
 		scaleResp(updated)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1311,8 +1459,7 @@ func (s *Server) handleNamespaceGet(w http.ResponseWriter, r *http.Request, name
 
 func (s *Server) handleNamespaceCreate(w http.ResponseWriter, r *http.Request) {
 	var ns corev1.Namespace
-	if err := decode(r, &ns); err != nil {
-		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+	if !s.decodeOrRespond(w, r, &ns) {
 		return
 	}
 	ns.APIVersion = "v1"
@@ -1352,7 +1499,49 @@ func (s *Server) purgeNamespaceResources(ns string) {
 	for _, sec := range s.config.Store.Secrets(ns) {
 		s.removeSecretFiles(sec)
 	}
+	// PVCs: drop the .volume quadlet files. The podman volumes themselves
+	// are deliberately kept — data is never deleted automatically.
+	for _, pvc := range s.config.Store.PVCs(ns) {
+		s.removePVCVolume(pvc)
+	}
+	// Ingresses: drop the Traefik dynamic configs, or the hostnames keep
+	// routing to backends in a namespace that no longer exists.
+	for _, ing := range s.config.Store.Ingresses(ns) {
+		s.removeTraefikConfig(ing.Namespace, ing.Name)
+	}
+	// Services: drop legacy per-port socket files (see
+	// removeLegacyServiceSockets) along with them.
+	for _, svc := range s.config.Store.Services(ns) {
+		s.removeLegacyServiceSockets(svc)
+	}
+	// Secret-derived EnvironmentFiles live in {secretDir}/{ns}/_env/.
+	// The per-secret loop above removed the per-secret dirs; removing the
+	// namespace parent now also clears _env in one step.
+	if secretDir := s.secretBaseDir(); secretDir != "" {
+		if err := os.RemoveAll(filepath.Join(secretDir, ns)); err != nil {
+			fmt.Printf("remove secret tree %s/%s: %v\n", secretDir, ns, err)
+		}
+	}
 	s.config.Store.PurgeNamespace(ns)
+}
+
+// removeLegacyServiceSockets deletes per-port .socket files that very old
+// q8s versions wrote for Service ports. That feature never worked (the files
+// landed in the quadlet dir, which systemd never loads; nothing bound the
+// port) and has been removed — Service ports are a port map for DNS aliases
+// and ingress backend resolution, not a host binding. This cleanup exists
+// only so upgraded installs don't keep the dead files forever.
+func (s *Server) removeLegacyServiceSockets(svc *corev1.Service) {
+	if s.config.QuadletDir == "" {
+		return
+	}
+	var paths []string
+	for _, port := range svc.Spec.Ports {
+		paths = append(paths, filepath.Join(s.config.QuadletDir, fmt.Sprintf("%s-%d.socket", svc.Name, port.Port)))
+	}
+	if len(paths) > 0 {
+		s.reloadAfterRemove(paths...)
+	}
 }
 
 func (s *Server) handleNamespaceDelete(w http.ResponseWriter, r *http.Request, name string) {
@@ -1428,8 +1617,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 	case http.MethodPost:
 		var job batchv1.Job
-		if err := decode(r, &job); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &job) {
 			return
 		}
 		job.APIVersion = "batch/v1"
@@ -1458,7 +1646,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(job)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -1486,6 +1677,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if err := validatePatchedIdentity("job", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		updated, err := s.config.Store.UpdateJob(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -1501,14 +1696,19 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		job, err := s.config.Store.GetJob(ns, name)
-		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, j := range s.config.Store.Jobs(ns) {
+						names = append(names, j.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deleteJobByName(ns, n) })
 			return
 		}
-		s.stopJobUnit(job)
-		s.removeJobQuadlet(job)
-		if err := s.config.Store.DeleteJob(ns, name); err != nil {
+		if err := s.deleteJobByName(ns, name); err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
@@ -1542,8 +1742,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 	case http.MethodPost:
 		var cj batchv1.CronJob
-		if err := decode(r, &cj); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &cj) {
 			return
 		}
 		cj.APIVersion = "batch/v1"
@@ -1572,7 +1771,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(cj)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -1600,6 +1802,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if err := validatePatchedIdentity("cronjob", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		updated, err := s.config.Store.UpdateCronJob(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -1608,13 +1814,19 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		s.generateCronJobQuadlets(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		cj, err := s.config.Store.GetCronJob(ns, name)
-		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, cj := range s.config.Store.CronJobs(ns) {
+						names = append(names, cj.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deleteCronJobByName(ns, n) })
 			return
 		}
-		s.removeCronJobQuadlets(cj)
-		if err := s.config.Store.DeleteCronJob(ns, name); err != nil {
+		if err := s.deleteCronJobByName(ns, name); err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
@@ -1674,8 +1886,7 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		}
 	case http.MethodPost:
 		var ing networkingv1.Ingress
-		if err := decode(r, &ing); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		if !s.decodeOrRespond(w, r, &ing) {
 			return
 		}
 		ing.APIVersion = "networking.k8s.io/v1"
@@ -1708,7 +1919,10 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		body, _ := io.ReadAll(r.Body)
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
 		existing, _ := json.Marshal(ing)
 		var base map[string]interface{}
 		json.Unmarshal(existing, &base)
@@ -1736,6 +1950,10 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
+		if err := validatePatchedIdentity("ingress", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		if err := validateIngress(&patched); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
@@ -1748,11 +1966,22 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		s.generateTraefikConfig(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
-		if err := s.config.Store.DeleteIngress(ns, name); err != nil {
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, ing := range s.config.Store.Ingresses(ns) {
+						names = append(names, ing.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.deleteIngressByName(ns, n) })
+			return
+		}
+		if err := s.deleteIngressByName(ns, name); err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
-		s.removeTraefikConfig(ns, name)
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1776,6 +2005,14 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 			continue
 		}
 		for _, path := range rule.HTTP.Paths {
+			// A path may have no Service backend (resource backends, or an
+			// intentionally empty path entry). There is nothing to route to,
+			// and dereferencing Backend.Service unconditionally panics —
+			// after the object was already stored, leaving the client with
+			// a dropped connection and a half-created Ingress.
+			if path.Backend.Service == nil {
+				continue
+			}
 			routerName := fmt.Sprintf("%s-%s-%d", ing.Namespace, ing.Name, idx)
 			idx++
 			svcName := path.Backend.Service.Name
@@ -1784,19 +2021,15 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 				svcPort = path.Backend.Service.Port.Number
 			}
 
-			// Resolve the actual host port from the Service object
-			hostPort := svcPort
-			if svc, err := s.config.Store.GetService(ing.Namespace, svcName); err == nil {
-				for _, p := range svc.Spec.Ports {
-					if p.Port == svcPort || p.Name == path.Backend.Service.Port.Name {
-						if p.NodePort != 0 {
-							hostPort = p.NodePort
-						} else {
-							hostPort = p.Port
-						}
-						break
-					}
-				}
+			// Resolve backend addresses via the Service's selector — the
+			// same Endpoints model real k8s uses: every pod the selector
+			// matches contributes one server, each with its own port.
+			servers := s.ingressBackendServers(ing.Namespace, svcName, svcPort, path.Backend.Service.Port.Name)
+			if len(servers) == 0 {
+				// No Service (or none with reachable pods): fall back to the
+				// ingress-declared port on localhost, preserving the
+				// pre-selector behavior.
+				servers = []string{fmt.Sprintf("http://localhost:%d", svcPort)}
 			}
 
 			// Build router rule
@@ -1822,7 +2055,9 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 			services.WriteString(fmt.Sprintf("    %s:\n", routerName))
 			services.WriteString("      loadBalancer:\n")
 			services.WriteString("        servers:\n")
-			services.WriteString(fmt.Sprintf("          - url: \"http://localhost:%d\"\n", hostPort))
+			for _, url := range servers {
+				services.WriteString(fmt.Sprintf("          - url: %q\n", url))
+			}
 		}
 	}
 
@@ -1888,11 +2123,18 @@ func (s *Server) ReconcileQuadlets() {
 			if !missing(f) {
 				continue
 			}
-			pod := &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: dep.Namespace, Labels: dep.Spec.Template.Labels},
-				Spec:       dep.Spec.Template.Spec,
+			pod := s.materializeDeploymentInstance(dep, i)
+			// Keep the store pod's ports in sync with the (idempotent)
+			// allocation, so ingresses resolve backends for instances whose
+			// store objects predate the allocator (or lost their ports).
+			if existing, err := s.config.Store.GetPod(dep.Namespace, instanceName); err == nil {
+				if len(existing.Spec.Containers) > 0 && len(existing.Spec.Containers[0].Ports) > 0 &&
+					existing.Spec.Containers[0].Ports[0].HostPort == 0 &&
+					len(pod.Spec.Containers) > 0 && len(pod.Spec.Containers[0].Ports) > 0 {
+					existing.Spec.Containers[0].Ports = pod.Spec.Containers[0].Ports
+					s.config.Store.UpdatePod(existing)
+				}
 			}
-			pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
 			resolved, envFile, err := s.resolveEnvFrom(pod)
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
@@ -2072,18 +2314,28 @@ func (s *Server) podPVCMap(ns string, spec corev1.PodSpec) map[string]*corev1.Pe
 	return m
 }
 
+// podMaterializeFailed records a Warning event on a pod whose quadlet could
+// not be generated/written/deployed, so `kubectl describe pod` shows why the
+// running container doesn't match the stored spec — instead of the failure
+// living only in the server log.
+func (s *Server) podMaterializeFailed(pod *corev1.Pod, stage string, err error) {
+	fmt.Printf("pod quadlet %s/%s: %s: %v\n", pod.Namespace, pod.Name, stage, err)
+	s.config.Store.RecordEvent("Pod", pod.Namespace, pod.Name, pod.UID,
+		corev1.EventTypeWarning, "MaterializationFailed", stage+": "+err.Error())
+}
+
 func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
 	if s.config.QuadletDir == "" {
 		return
 	}
 	resolved, envFile, err := s.resolveEnvFrom(pod)
 	if err != nil {
-		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
+		s.podMaterializeFailed(pod, "resolving env references", err)
 		return
 	}
 	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
 	if err != nil {
-		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
+		s.podMaterializeFailed(pod, "generating quadlet", err)
 		return
 	}
 	s.deployUnit(s.config.QuadletDir,
@@ -2098,18 +2350,18 @@ func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
 	}
 	resolved, envFile, err := s.resolveEnvFrom(pod)
 	if err != nil {
-		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
+		s.podMaterializeFailed(pod, "resolving env references", err)
 		return
 	}
 	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
 	if err != nil {
-		fmt.Printf("pod quadlet %s: %v\n", pod.Name, err)
+		s.podMaterializeFailed(pod, "generating quadlet", err)
 		return
 	}
 	filename := fmt.Sprintf("%s-%s.container", pod.Namespace, pod.Name)
 	unitName := fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name)
 	if err := writeQuadletFile(s.config.QuadletDir, filename, content); err != nil {
-		fmt.Printf("write %s: %v\n", filename, err)
+		s.podMaterializeFailed(pod, "writing "+filename, err)
 		return
 	}
 	mgr := s.config.Manager
@@ -2126,17 +2378,27 @@ func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
 func (s *Server) stopPodUnit(pod *corev1.Pod) {
 	unit := fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name)
 	containerName := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
+	s.stopAndRemoveUnit(unit, containerName)
+}
+
+// stopAndRemoveUnit stops a unit and force-removes its container.
+// StopUnit only queues an async job — it returns long before a container
+// that ignores SIGTERM actually dies. Without a synchronous, guaranteed
+// removal here, the container stays visible in `podman ps -a` (with its
+// q8s labels intact) after the store entry is deleted, and the next
+// reconcilePodmanPods tick re-imports it. For a standalone pod that means a
+// zombie pod that never gets pruned; for a deployment instance it is worse:
+// reconcile resurrects the deleted Deployment from a stub spec, and scaled-
+// down instances linger as stopped containers forever.
+func (s *Server) stopAndRemoveUnit(unit, containerName string) {
 	if mgr := s.config.Manager; mgr != nil {
 		mgr.StopUnit(unit)
 	}
-	// Force-remove synchronously regardless of systemd's involvement.
-	// StopUnit only queues an async job — it returns long before a container
-	// that ignores SIGTERM actually dies. Without a synchronous, guaranteed
-	// removal here, the container stays visible in `podman ps -a` (with its
-	// q8s labels intact) after this handler deletes the Store's Pod entry,
-	// and the next reconcilePodmanPods tick re-imports it as a zombie pod
-	// that — being standalone, not deployment-owned — never gets pruned.
-	exec.Command("podman", "rm", "-f", containerName).Run()
+	// Bounded: this runs inside HTTP DELETE handlers, and podman rm -f on a
+	// wedged container must not hold the request (and the goroutine) forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	exec.CommandContext(ctx, "podman", "rm", "-f", containerName).Run()
 }
 
 func (s *Server) removePodQuadlet(pod *corev1.Pod) {
@@ -2400,10 +2662,14 @@ func (s *Server) redeployDeploymentInstanceQuadlet(dep *appsv1.Deployment, i int
 	s.deployDeploymentInstance(dep, i, true)
 }
 
-func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, restart bool) {
-	if s.config.QuadletDir == "" {
-		return
-	}
+// materializeDeploymentInstance builds the Pod object for deployment
+// instance i from the template and injects the allocated per-replica
+// hostPorts (loopback-bound) onto the container ports. Deployment replicas
+// share one template, so they cannot declare distinct hostPorts themselves —
+// the allocator provides them, which is what lets Traefik address each
+// replica individually (kube-proxy/Endpoints role) on rootless podman where
+// container IPs are unreachable from the host.
+func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) *corev1.Pod {
 	instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2418,9 +2684,32 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 				Controller: boolPtr(true),
 			}},
 		},
-		Spec: dep.Spec.Template.Spec,
+		// DeepCopy: a plain struct copy would share the Containers/Ports
+		// slices with the template — writing a per-instance hostPort would
+		// then mutate the deployment template itself (and every sibling
+		// instance would end up with the last-written port).
+		Spec: *dep.Spec.Template.Spec.DeepCopy(),
 	}
 	pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
+	if !pod.Spec.HostNetwork && len(pod.Spec.Containers) > 0 {
+		for j := range pod.Spec.Containers[0].Ports {
+			cp := &pod.Spec.Containers[0].Ports[j]
+			if cp.ContainerPort == 0 {
+				continue
+			}
+			cp.HostPort = s.config.Store.AllocateReplicaPort(dep.Namespace, dep.Name, i, cp.ContainerPort)
+			cp.HostIP = "127.0.0.1"
+		}
+	}
+	return pod
+}
+
+func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, restart bool) {
+	if s.config.QuadletDir == "" {
+		return
+	}
+	instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+	pod := s.materializeDeploymentInstance(dep, i)
 	resolved, envFile, err := s.resolveEnvFrom(pod)
 	if err != nil {
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
@@ -2458,10 +2747,10 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 }
 
 func (s *Server) stopDeploymentUnits(dep *appsv1.Deployment) {
-	if mgr := s.config.Manager; mgr != nil {
-		for i := int32(0); i < deploymentReplicas(dep); i++ {
-			mgr.StopUnit(fmt.Sprintf("%s-%s-%d.service", dep.Namespace, dep.Name, i))
-		}
+	for i := int32(0); i < deploymentReplicas(dep); i++ {
+		s.stopAndRemoveUnit(
+			fmt.Sprintf("%s-%s-%d.service", dep.Namespace, dep.Name, i),
+			fmt.Sprintf("%s-%s-%d", dep.Namespace, dep.Name, i))
 	}
 }
 
@@ -2493,10 +2782,21 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 	}
 	for i := newR; i < oldR; i++ {
 		instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
-		if mgr := s.config.Manager; mgr != nil {
-			mgr.StopUnit(fmt.Sprintf("%s-%s.service", dep.Namespace, instanceName))
-		}
+		s.stopAndRemoveUnit(
+			fmt.Sprintf("%s-%s.service", dep.Namespace, instanceName),
+			fmt.Sprintf("%s-%s", dep.Namespace, instanceName))
 		s.reloadAfterRemove(fmt.Sprintf("%s/%s-%s.container", s.config.QuadletDir, dep.Namespace, instanceName))
+		// Remove the store pod immediately too. The reconcile loop would
+		// eventually prune it once the container disappears, but until then
+		// ingress backends (selector-driven) would keep routing to a
+		// scaled-down replica that no longer exists.
+		s.config.Store.DeletePod(dep.Namespace, instanceName)
+	}
+	// Allocations for removed instances re-enter the pool. Done after the
+	// containers are gone so a fresh allocation of the same port (e.g. a
+	// quick scale-up) can't race a dying container's publish.
+	if oldR > newR {
+		s.config.Store.FreeReplicaPorts(dep.Namespace, dep.Name, newR)
 	}
 }
 
@@ -2568,28 +2868,6 @@ func (s *Server) podHostPortConflict(pod *corev1.Pod) (int32, bool) {
 		}
 	}
 	return 0, false
-}
-
-func (s *Server) generateServiceSocket(svc *corev1.Service) {
-	quadletDir := s.config.QuadletDir
-	if quadletDir == "" {
-		return
-	}
-	for _, port := range svc.Spec.Ports {
-		content := fmt.Sprintf(`[Unit]
-Description=Socket for service %s/%s port %d
-
-[Socket]
-ListenStream=%d
-
-[Install]
-WantedBy=sockets.target
-`, svc.Namespace, svc.Name, port.Port, port.Port)
-		filename := fmt.Sprintf("%s-%d.socket", svc.Name, port.Port)
-		if err := writeQuadletFile(quadletDir, filename, []byte(content)); err != nil {
-			fmt.Printf("write socket %s: %v\n", filename, err)
-		}
-	}
 }
 
 func (s *Server) writeConfigMapFiles(cm *corev1.ConfigMap) {
@@ -2879,4 +3157,207 @@ func (s *Server) writeEnvFile(ns, name string, containers []corev1.Container, se
 		return "", fmt.Errorf("write env file %s: %w", path, err)
 	}
 	return path, nil
+}
+
+// ingressBackendServers resolves the backend URLs for one ingress path: the
+// Service's selector -> matching pods -> one URL per pod, in the spirit of
+// k8s Endpoints. Each pod contributes its own published hostPort, so pods
+// behind one Service do not need identical ports — only matching labels and
+// a container port equal to the Service's targetPort.
+//
+// Pods without a hostPort are skipped: on rootless podman, container
+// addresses are only reachable from the host through published ports, so a
+// pod that publishes nothing is not addressable by an on-host Traefik. (An
+// allocated-port scheme for deployment replicas — where the shared template
+// can't declare distinct hostPorts — is a follow-up; today this serves
+// standalone pods and single-replica deployments.)
+//
+// Returns nil when there is no such Service or no pod yields an address;
+// callers fall back to the ingress-declared port.
+func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portName string) []string {
+	svc, err := s.config.Store.GetService(ns, svcName)
+	if err != nil {
+		return nil
+	}
+
+	// Which ServicePort (and thus targetPort) the ingress refers to.
+	// targetPort may be numeric or a container-port name; resolve both.
+	targetNum := svcPort
+	targetName := ""
+	for _, p := range svc.Spec.Ports {
+		if (svcPort != 0 && p.Port == svcPort) || (portName != "" && p.Name == portName) {
+			if p.TargetPort.Type == intstr.String {
+				targetName = p.TargetPort.StrVal
+			} else if v := p.TargetPort.IntValue(); v != 0 {
+				targetNum = int32(v)
+			}
+			break
+		}
+	}
+
+	var servers []string
+	for _, pod := range s.config.Store.Pods(ns) {
+		if !matchesEqualitySelector(pod.Labels, svc.Spec.Selector) {
+			continue
+		}
+		// Endpoints-like liveness: terminal pods no longer have a listener
+		// behind their port, so they leave the rotation (their published
+		// port only binds while the container runs anyway).
+		if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+			continue
+		}
+		for _, c := range pod.Spec.Containers {
+			for _, cp := range c.Ports {
+				if cp.ContainerPort != targetNum && cp.Name != targetName {
+					continue
+				}
+				if cp.HostPort != 0 {
+					servers = append(servers, fmt.Sprintf("http://127.0.0.1:%d", cp.HostPort))
+				}
+				// A pod lists each container port once; stop at the first
+				// matching entry for this container.
+				break
+			}
+		}
+	}
+	return servers
+}
+
+// regenerateIngressConfigs rewrites the Traefik dynamic config for every
+// ingress in a namespace. Called whenever pod churn can change the backend
+// set a selector resolves to (pod create/delete, deployment scale/redeploy)
+// so the servers list tracks reality the way Endpoints do.
+func (s *Server) regenerateIngressConfigs(ns string) {
+	if s.config.TraefikDir == "" {
+		return
+	}
+	for _, ing := range s.config.Store.Ingresses(ns) {
+		s.generateTraefikConfig(ing)
+	}
+}
+
+// --- collection delete (deletecollection) ---
+//
+// Discovery advertises deletecollection for every resource, and kubectl
+// uses it for `kubectl delete pods --all`. These helpers give each DELETE
+// handler a single-object cleanup routine reused by the collection path.
+
+// deleteCollection deletes every name listFn returns via delFn and answers
+// with one Success Status. Errors on individual objects are logged and
+// skipped — a collection delete is best-effort like real k8s.
+func (s *Server) deleteCollection(w http.ResponseWriter, listFn func() []string, delFn func(name string) error) {
+	deleted := 0
+	for _, n := range listFn() {
+		if err := delFn(n); err != nil {
+			fmt.Printf("deletecollection %s: %v\n", n, err)
+			continue
+		}
+		deleted++
+	}
+	encode(w, &metav1.Status{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+		Status:   "Success",
+		Message:  fmt.Sprintf("deleted %d object(s)", deleted),
+	}, http.StatusOK)
+}
+
+func (s *Server) deletePodByName(ns, name string) error {
+	pod, err := s.config.Store.GetPod(ns, name)
+	if err != nil {
+		return err
+	}
+	s.stopPodUnit(pod)
+	s.removePodQuadlet(pod)
+	if err := s.config.Store.DeletePod(ns, name); err != nil {
+		return err
+	}
+	s.regenerateIngressConfigs(ns)
+	return nil
+}
+
+func (s *Server) deleteServiceByName(ns, name string) error {
+	svc, _ := s.config.Store.GetService(ns, name)
+	if err := s.config.Store.DeleteService(ns, name); err != nil {
+		return err
+	}
+	if svc != nil {
+		s.removeLegacyServiceSockets(svc)
+	}
+	return nil
+}
+
+func (s *Server) deletePVCByName(ns, name string) error {
+	pvc, _ := s.config.Store.GetPVC(ns, name)
+	if err := s.config.Store.DeletePVC(ns, name); err != nil {
+		return err
+	}
+	if pvc != nil {
+		s.removePVCVolume(pvc)
+	}
+	return nil
+}
+
+func (s *Server) deleteConfigMapByName(ns, name string) error {
+	cm, _ := s.config.Store.GetConfigMap(ns, name)
+	if err := s.config.Store.DeleteConfigMap(ns, name); err != nil {
+		return err
+	}
+	if cm != nil {
+		s.removeConfigMapFiles(cm)
+	}
+	return nil
+}
+
+func (s *Server) deleteSecretByName(ns, name string) error {
+	sec, _ := s.config.Store.GetSecret(ns, name)
+	if err := s.config.Store.DeleteSecret(ns, name); err != nil {
+		return err
+	}
+	if sec != nil {
+		s.removeSecretFiles(sec)
+	}
+	return nil
+}
+
+func (s *Server) deleteDeploymentByName(ns, name string) error {
+	dep, err := s.config.Store.GetDeployment(ns, name)
+	if err != nil {
+		return err
+	}
+	s.stopDeploymentUnits(dep)
+	s.removeDeploymentQuadlets(dep)
+	s.deleteDeploymentPods(dep)
+	if err := s.config.Store.DeleteDeployment(ns, name); err != nil {
+		return err
+	}
+	s.config.Store.FreeReplicaPorts(dep.Namespace, dep.Name, 0)
+	s.regenerateIngressConfigs(dep.Namespace)
+	return nil
+}
+
+func (s *Server) deleteJobByName(ns, name string) error {
+	job, err := s.config.Store.GetJob(ns, name)
+	if err != nil {
+		return err
+	}
+	s.stopJobUnit(job)
+	s.removeJobQuadlet(job)
+	return s.config.Store.DeleteJob(ns, name)
+}
+
+func (s *Server) deleteCronJobByName(ns, name string) error {
+	cj, err := s.config.Store.GetCronJob(ns, name)
+	if err != nil {
+		return err
+	}
+	s.removeCronJobQuadlets(cj)
+	return s.config.Store.DeleteCronJob(ns, name)
+}
+
+func (s *Server) deleteIngressByName(ns, name string) error {
+	if err := s.config.Store.DeleteIngress(ns, name); err != nil {
+		return err
+	}
+	s.removeTraefikConfig(ns, name)
+	return nil
 }

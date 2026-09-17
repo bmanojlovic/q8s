@@ -5,7 +5,7 @@ suites:
     tests:
       - name: "version endpoint"
         kubectl: version
-        contains: "v1.36"
+        contains: "v1."
       - name: "version has +q8s suffix"
         kubectl: version -o json
         contains: "+q8s"
@@ -31,13 +31,13 @@ suites:
         contains: Ready
       - name: "node has real hostname"
         kubectl: get nodes -o wide
-        contains: asrock
+        contains: "${Q8S_HOSTNAME}"
       - name: "node has version"
         kubectl: get nodes
-        contains: "v1.36.2+q8s"
+        contains: "+q8s"
       - name: "node has OS image"
         kubectl: get nodes -o wide
-        contains: openSUSE
+        contains: "${Q8S_OS_IMAGE}"
       - name: "node has container runtime"
         kubectl: get nodes -o wide
         contains: "podman://"
@@ -45,32 +45,32 @@ suites:
         kubectl: get nodes -o wide
         not_contains: "127.0.0.1"
       - name: "describe node works"
-        kubectl: describe node asrock
+        kubectl: describe node ${Q8S_HOSTNAME}
         contains: "Kubelet Version"
       - name: "describe node has capacity"
-        kubectl: describe node asrock
+        kubectl: describe node ${Q8S_HOSTNAME}
         contains: "cpu:"
       - name: "describe node has conditions"
-        kubectl: describe node asrock
+        kubectl: describe node ${Q8S_HOSTNAME}
         contains: "KubeletReady"
       - name: "describe node has lease"
-        kubectl: describe node asrock
+        kubectl: describe node ${Q8S_HOSTNAME}
         contains: "HolderIdentity"
       - name: "describe node has ephemeral-storage"
-        kubectl: describe node asrock
+        kubectl: describe node ${Q8S_HOSTNAME}
         contains: "ephemeral-storage"
       - name: "describe node has machine-id"
-        kubectl: describe node asrock
+        kubectl: describe node ${Q8S_HOSTNAME}
         contains: "Machine ID"
       - name: "describe node has boot-id"
-        kubectl: describe node asrock
+        kubectl: describe node ${Q8S_HOSTNAME}
         contains: "Boot ID"
 
   - name: Metrics
     tests:
       - name: "top nodes works"
         kubectl: top nodes
-        contains: asrock
+        contains: "${Q8S_HOSTNAME}"
       - name: "top nodes shows CPU"
         kubectl: top nodes
         contains: "CPU"

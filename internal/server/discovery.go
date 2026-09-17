@@ -360,16 +360,16 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		t := newTable("1", nodeColumns)
 		t.Rows = append(t.Rows, tableRow{
 			Cells: []interface{}{
-				hostname,          // Name
-				"Ready",           // Status
-				"<none>",          // Roles
-				age(bootTime),     // Age
-				kubeletVersion,    // Version
-				internalIP,        // Internal-IP
-				"<none>",          // External-IP
-				osImage,           // OS-Image
-				kernelVersion,     // Kernel-Version
-				containerRuntime,  // Container-Runtime
+				hostname,         // Name
+				"Ready",          // Status
+				"<none>",         // Roles
+				age(bootTime),    // Age
+				kubeletVersion,   // Version
+				internalIP,       // Internal-IP
+				"<none>",         // External-IP
+				osImage,          // OS-Image
+				kernelVersion,    // Kernel-Version
+				containerRuntime, // Container-Runtime
 			},
 			Object: partialMeta{
 				Kind:       "Node",
@@ -798,17 +798,17 @@ func (s *Server) handleStorageClasses(w http.ResponseWriter, r *http.Request) {
 			"volumeBindingMode": "Immediate",
 		},
 		{
-			"apiVersion": "storage.k8s.io/v1",
-			"kind":       "StorageClass",
-			"metadata":   map[string]interface{}{"name": quadlet.StorageClassShared},
+			"apiVersion":        "storage.k8s.io/v1",
+			"kind":              "StorageClass",
+			"metadata":          map[string]interface{}{"name": quadlet.StorageClassShared},
 			"provisioner":       "q8s.io/podman-volume",
 			"reclaimPolicy":     "Retain",
 			"volumeBindingMode": "Immediate",
 		},
 		{
-			"apiVersion": "storage.k8s.io/v1",
-			"kind":       "StorageClass",
-			"metadata":   map[string]interface{}{"name": quadlet.StorageClassHostPath},
+			"apiVersion":        "storage.k8s.io/v1",
+			"kind":              "StorageClass",
+			"metadata":          map[string]interface{}{"name": quadlet.StorageClassHostPath},
 			"provisioner":       "q8s.io/host-path",
 			"reclaimPolicy":     "Retain",
 			"volumeBindingMode": "Immediate",

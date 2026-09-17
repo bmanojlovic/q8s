@@ -132,3 +132,17 @@ $XDG_RUNTIME_DIR/q8s/               # runtime (tmpfs)
   configmaps/{ns}/{name}/{key}
   secrets/{ns}/{name}/{key}          # mode 0600
 ```
+
+## Design boundary: translate, don't operate
+
+q8s is deliberately controller-like but minimal. It *translates* Kubernetes
+API objects into local primitives (quadlets, systemd units, Traefik config
+files) and reconciles them; it does not take ownership of lifecycles that
+another component already owns. Consequences:
+
+- **Public TLS** is Traefik's (`secretName` on Ingress is accepted, not read).
+- **Service fan-out** is Traefik's `loadBalancer.servers`, kept in sync from
+  selectors — q8s doesn't proxy traffic itself.
+- **DNS/ACME/cert renewal, RBAC, scheduling, multi-node** — out of scope by
+  design; if a feature needs q8s to become a participant in a runtime path,
+  the default answer is no.

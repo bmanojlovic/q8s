@@ -32,7 +32,7 @@ This generates TLS certificates, installs systemd units, and prints the exact `k
 Alternatively, export a standalone kubeconfig file:
 
 ```sh
-q8s kubeconfig > ~/.kube/q8s.yaml
+(umask 077; q8s kubeconfig > ~/.kube/q8s.yaml)   # file contains the client key
 export KUBECONFIG=~/.kube/config:~/.kube/q8s.yaml
 ```
 
