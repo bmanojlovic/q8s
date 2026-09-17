@@ -918,7 +918,6 @@ persisted:
 	}
 }
 
-
 // --- NodePort allocation ---
 
 // TestAllocateNodePortInRange: an allocated node port lands in the k8s
