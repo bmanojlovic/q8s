@@ -10,6 +10,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"q8s/internal/quadlet"
 	"q8s/internal/store"
 )
@@ -848,5 +849,74 @@ persisted:
 	}
 	if got := st2.AllocateReplicaPort("default", "web", 3, 8080); got != p {
 		t.Errorf("allocation not persisted: got %d want %d", got, p)
+	}
+}
+
+
+// --- NodePort allocation ---
+
+// TestAllocateNodePortInRange: an allocated node port lands in the k8s
+// service-node-port range and is stable/skippable.
+func TestAllocateNodePortInRange(t *testing.T) {
+	s := store.New()
+	key := types.NamespacedName{Namespace: "default", Name: "svc"}
+	p := s.AllocateNodePort(key)
+	if p < store.NodePortMin || p > store.NodePortMax {
+		t.Fatalf("nodePort %d out of range %d-%d", p, store.NodePortMin, store.NodePortMax)
+	}
+}
+
+// TestAllocateNodePortSkipsUsed: allocation avoids a node port another
+// Service already holds.
+func TestAllocateNodePortSkipsUsed(t *testing.T) {
+	s := store.New()
+	sc := corev1.ServiceTypeNodePort
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "taken", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Type:  sc,
+			Ports: []corev1.ServicePort{{Port: 80, NodePort: store.NodePortMin}},
+		},
+	}
+	if _, err := s.CreateService(svc); err != nil {
+		t.Fatal(err)
+	}
+	other := types.NamespacedName{Namespace: "default", Name: "other"}
+	if got := s.AllocateNodePort(other); got == store.NodePortMin {
+		t.Errorf("allocator handed out an already-used nodePort %d", got)
+	}
+}
+
+// TestNodePortAvailable: range and collision checks for an explicit request.
+func TestNodePortAvailable(t *testing.T) {
+	s := store.New()
+	svc := types.NamespacedName{Namespace: "default", Name: "svc"}
+	if s.NodePortAvailable(80, svc) {
+		t.Error("port 80 is below the nodePort range but reported available")
+	}
+	if s.NodePortAvailable(store.NodePortMax+1, svc) {
+		t.Error("port above the range reported available")
+	}
+	if !s.NodePortAvailable(store.NodePortMin, svc) {
+		t.Error("a free in-range nodePort should be available")
+	}
+}
+
+// TestNodePortConflictsWithHostPort: a pod's published hostPort blocks the
+// same number being handed out as a nodePort (both bind the host).
+func TestNodePortConflictsWithHostPort(t *testing.T) {
+	s := store.New()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Ports: []corev1.ContainerPort{{ContainerPort: 80, HostPort: store.NodePortMin}},
+		}}},
+	}
+	if _, err := s.CreatePod(pod); err != nil {
+		t.Fatal(err)
+	}
+	svc := types.NamespacedName{Namespace: "default", Name: "svc"}
+	if s.NodePortAvailable(store.NodePortMin, svc) {
+		t.Error("nodePort colliding with a pod hostPort should be unavailable")
 	}
 }

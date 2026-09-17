@@ -22,8 +22,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	jsonser "k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"q8s/internal/quadlet"
+	"q8s/internal/store"
 )
 
 var scheme = runtime.NewScheme()
@@ -644,6 +646,12 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 				"service port %d conflicts with hostPort on a matching pod — use one or the other", port)
 			return
 		}
+		if err := s.reconcileNodePort(created); err != nil {
+			s.config.Store.DeleteService(ns, created.Name)
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+			return
+		}
+		s.config.Store.UpdateService(created)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
 		svc, err := s.config.Store.GetService(ns, name)
@@ -696,6 +704,11 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 				"service port %d conflicts with hostPort on a matching pod — use one or the other", port)
 			return
 		}
+		if err := s.reconcileNodePort(updated); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+			return
+		}
+		s.config.Store.UpdateService(updated)
 		// Clean up legacy per-port socket files (see removeLegacyServiceSockets).
 		s.removeLegacyServiceSockets(svc)
 		encode(w, updated, http.StatusOK)
@@ -2328,6 +2341,7 @@ func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
 	if s.config.QuadletDir == "" {
 		return
 	}
+	pod = s.applyNodePorts(pod)
 	resolved, envFile, err := s.resolveEnvFrom(pod)
 	if err != nil {
 		s.podMaterializeFailed(pod, "resolving env references", err)
@@ -2344,10 +2358,32 @@ func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
 		fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name))
 }
 
+// applyNodePorts returns a copy of pod with any NodePort-Service-driven host
+// ports bound on 0.0.0.0 (empty HostIP). If no NodePort targets this pod the
+// original is returned unchanged. Done at generation time (not stored on the
+// pod) so the binding always reflects current Services and never fights the
+// hostPort conflict checks on the stored spec.
+func (s *Server) applyNodePorts(pod *corev1.Pod) *corev1.Pod {
+	bindings := s.nodePortHostPorts(pod)
+	if len(bindings) == 0 || len(pod.Spec.Containers) == 0 {
+		return pod
+	}
+	cp := pod.DeepCopy()
+	for i := range cp.Spec.Containers[0].Ports {
+		p := &cp.Spec.Containers[0].Ports[i]
+		if np, ok := bindings[p.ContainerPort]; ok {
+			p.HostPort = np
+			p.HostIP = "" // all interfaces — real LAN listener
+		}
+	}
+	return cp
+}
+
 func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
 	if s.config.QuadletDir == "" {
 		return
 	}
+	pod = s.applyNodePorts(pod)
 	resolved, envFile, err := s.resolveEnvFrom(pod)
 	if err != nil {
 		s.podMaterializeFailed(pod, "resolving env references", err)
@@ -2701,6 +2737,37 @@ func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) 
 			cp.HostIP = "127.0.0.1"
 		}
 	}
+	// A NodePort Service targeting this pod publishes its port on 0.0.0.0 as
+	// well — the loopback replica port stays (Ingress/Traefik backend), the
+	// nodePort adds the real LAN listener. A host port can only be bound by
+	// one process, so only instance 0 carries the nodePort publish; higher
+	// replicas keep just their loopback port (still Ingress-reachable). This
+	// is the single-node NodePort reality — one backing listener per port.
+	if i == 0 {
+		pod = s.withNodePortPublish(pod)
+	}
+	return pod
+}
+
+// withNodePortPublish appends, for each NodePort Service targeting pod, an
+// extra container port entry that publishes containerPort on 0.0.0.0:nodePort
+// (empty HostIP = all interfaces). The loopback replica-port entry for the
+// same containerPort is left intact, so a pod can be both an Ingress backend
+// (loopback) and a NodePort listener (LAN) at once. Returns pod unchanged
+// when no NodePort targets it.
+func (s *Server) withNodePortPublish(pod *corev1.Pod) *corev1.Pod {
+	bindings := s.nodePortHostPorts(pod)
+	if len(bindings) == 0 || len(pod.Spec.Containers) == 0 {
+		return pod
+	}
+	for target, np := range bindings {
+		pod.Spec.Containers[0].Ports = append(pod.Spec.Containers[0].Ports, corev1.ContainerPort{
+			ContainerPort: target,
+			HostPort:      np,
+			HostIP:        "", // all interfaces
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
 	return pod
 }
 
@@ -2868,6 +2935,104 @@ func (s *Server) podHostPortConflict(pod *corev1.Pod) (int32, bool) {
 		}
 	}
 	return 0, false
+}
+
+// assignNodePorts fills in and validates spec.ports[].nodePort for a
+// type: NodePort Service. Each port with nodePort==0 gets one allocated from
+// the NodePort range; an explicit nodePort must be in range and free. It
+// mutates svc in place and returns an error describing the first problem.
+//
+// A NodePort in q8s is a direct 0.0.0.0 publish on the single backing pod
+// (PublishPort=nodePort:targetPort) — dumb L4, protocol-blind, the same
+// mechanism as a pod hostPort. Multi-replica load balancing is intentionally
+// NOT provided here; use an Ingress (Traefik) for that.
+func (s *Server) assignNodePorts(svc *corev1.Service) error {
+	if svc.Spec.Type != corev1.ServiceTypeNodePort {
+		return nil
+	}
+	key := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
+	for i := range svc.Spec.Ports {
+		p := &svc.Spec.Ports[i]
+		if p.NodePort != 0 {
+			if !s.config.Store.NodePortAvailable(p.NodePort, key) {
+				return fmt.Errorf("nodePort %d is out of range (%d-%d) or already allocated",
+					p.NodePort, store.NodePortMin, store.NodePortMax)
+			}
+			continue
+		}
+		alloc := s.config.Store.AllocateNodePort(key)
+		if alloc == 0 {
+			return fmt.Errorf("no free nodePort in range %d-%d", store.NodePortMin, store.NodePortMax)
+		}
+		p.NodePort = alloc
+	}
+	return nil
+}
+
+// nodePortBackingPods returns the pods a NodePort Service selects. A NodePort
+// publishes a single host port on 0.0.0.0, which only one process can bind —
+// so the Service must resolve to exactly one backing pod. More than one is
+// rejected (use an Ingress for multi-replica exposure).
+func (s *Server) nodePortBackingPods(svc *corev1.Service) []*corev1.Pod {
+	var pods []*corev1.Pod
+	for _, pod := range s.config.Store.Pods(svc.Namespace) {
+		if matchesEqualitySelector(pod.Labels, svc.Spec.Selector) {
+			pods = append(pods, pod)
+		}
+	}
+	return pods
+}
+
+// reconcileNodePort assigns node ports to a type: NodePort Service and
+// republishes its single backing pod with those ports bound on 0.0.0.0.
+// It is a no-op for non-NodePort Services. Returns an error (surfaced as a
+// 409) if node ports can't be assigned or the selector matches more than one
+// pod — a single host port can only be bound by one process on one node.
+func (s *Server) reconcileNodePort(svc *corev1.Service) error {
+	if svc.Spec.Type != corev1.ServiceTypeNodePort {
+		return nil
+	}
+	if err := s.assignNodePorts(svc); err != nil {
+		return err
+	}
+	pods := s.nodePortBackingPods(svc)
+	if len(pods) > 1 {
+		return fmt.Errorf("NodePort service selector matches %d pods; only one backing pod is supported (use an Ingress for multi-replica exposure)", len(pods))
+	}
+	// No backing pod yet is fine — the port is reserved on the Service and
+	// applied when a matching pod appears (see nodePortHostPorts, consulted
+	// during pod quadlet generation).
+	for _, pod := range pods {
+		s.redeployPodQuadlet(pod)
+	}
+	return nil
+}
+
+// nodePortHostPorts returns, for a pod, the set of {containerPort -> nodePort}
+// bindings any NodePort Service in the namespace targets at it. The pod's
+// quadlet generation publishes these on 0.0.0.0, giving the Service a real
+// LAN listener without a proxy.
+func (s *Server) nodePortHostPorts(pod *corev1.Pod) map[int32]int32 {
+	out := map[int32]int32{}
+	for _, svc := range s.config.Store.Services(pod.Namespace) {
+		if svc.Spec.Type != corev1.ServiceTypeNodePort {
+			continue
+		}
+		if !matchesEqualitySelector(pod.Labels, svc.Spec.Selector) {
+			continue
+		}
+		for _, sp := range svc.Spec.Ports {
+			if sp.NodePort == 0 {
+				continue
+			}
+			target := sp.TargetPort.IntVal
+			if target == 0 {
+				target = sp.Port
+			}
+			out[target] = sp.NodePort
+		}
+	}
+	return out
 }
 
 func (s *Server) writeConfigMapFiles(cm *corev1.ConfigMap) {
