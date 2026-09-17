@@ -2795,6 +2795,7 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 		fmt.Printf("write %s-%s.container: %v\n", dep.Namespace, instanceName, err)
 		return
 	}
+	fmt.Printf("deployment: wrote %s-%s.container\n", dep.Namespace, instanceName)
 	// Ensure the pod exists in the store immediately so it shows up in
 	// `kubectl get pods` even before the container starts (or if it fails).
 	if _, err := s.config.Store.GetPod(dep.Namespace, instanceName); err != nil {
