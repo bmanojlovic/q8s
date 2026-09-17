@@ -12,6 +12,40 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
+// writeImageAndPull emits the Image= line plus a Pull= line derived from the
+// container's imagePullPolicy, translating Kubernetes pull semantics to
+// podman quadlet's Pull= key. Before this, q8s emitted no Pull= at all, so
+// the unit inherited quadlet's implicit "missing" — indistinguishable from
+// what we now emit for an unset policy, but the explicit line means a user
+// who sets imagePullPolicy: Always actually gets Pull=always and their image
+// refreshes on restart/rollout (the tic-864b bug: it was being dropped
+// entirely). We honor whatever imagePullPolicy the user set and impose no
+// default of our own beyond the neutral "missing". Callers have already
+// validated the image string. See tic-864b.
+func writeImageAndPull(b *strings.Builder, c corev1.Container) {
+	b.WriteString(fmt.Sprintf("Image=%s\n", c.Image))
+	b.WriteString(fmt.Sprintf("Pull=%s\n", pullPolicyToQuadlet(c.ImagePullPolicy)))
+}
+
+// pullPolicyToQuadlet maps a Kubernetes imagePullPolicy to a podman quadlet
+// Pull= value. An explicit policy is honored verbatim; an unset policy maps
+// to missing (pull only if the image isn't present locally) — the same
+// neutral default podman quadlet uses, so q8s imposes nothing beyond what the
+// user asked for. To get an image refresh on every restart, set
+// imagePullPolicy: Always explicitly.
+func pullPolicyToQuadlet(policy corev1.PullPolicy) string {
+	switch policy {
+	case corev1.PullNever:
+		return "never"
+	case corev1.PullAlways:
+		return "always"
+	case corev1.PullIfNotPresent:
+		return "missing"
+	default: // unset
+		return "missing"
+	}
+}
+
 // writeResourceLimits translates a Pod's resource limits into podman run
 // flags via PodmanArgs=. All three (memory, swap, cpu) go through PodmanArgs
 // rather than the native quadlet Memory= key: older podman quadlet
@@ -154,7 +188,7 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 	if err := validateImage(pod.Spec.Containers[0].Image); err != nil {
 		return nil, err
 	}
-	b.WriteString(fmt.Sprintf("Image=%s\n", pod.Spec.Containers[0].Image))
+	writeImageAndPull(&b, pod.Spec.Containers[0])
 
 	containerName := fmt.Sprintf("%s-%s", pod.Namespace, name)
 	b.WriteString(fmt.Sprintf("ContainerName=%s\n", containerName))
@@ -381,7 +415,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 	if err := validateImage(spec.Containers[0].Image); err != nil {
 		return nil, err
 	}
-	b.WriteString(fmt.Sprintf("Image=%s\n", spec.Containers[0].Image))
+	writeImageAndPull(&b, spec.Containers[0])
 	b.WriteString(fmt.Sprintf("ContainerName=%s-%s-job\n", ns, name))
 
 	if cmd := append(spec.Containers[0].Command, spec.Containers[0].Args...); len(cmd) > 0 {
@@ -512,7 +546,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 	if err := validateImage(spec.Containers[0].Image); err != nil {
 		return nil, err
 	}
-	b.WriteString(fmt.Sprintf("Image=%s\n", spec.Containers[0].Image))
+	writeImageAndPull(&b, spec.Containers[0])
 	b.WriteString(fmt.Sprintf("ContainerName=%s-%s-cron\n", ns, name))
 
 	if cmd := append(spec.Containers[0].Command, spec.Containers[0].Args...); len(cmd) > 0 {

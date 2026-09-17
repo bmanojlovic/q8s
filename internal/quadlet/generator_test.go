@@ -68,6 +68,28 @@ func TestContainerBasic(t *testing.T) {
 	assertContains(t, out, "Restart=always")
 }
 
+// TestContainerPullPolicy pins tic-864b: q8s now emits a Pull= line derived
+// from imagePullPolicy so a user who asks for Always actually gets image
+// refresh on restart (previously no Pull= was emitted at all). An explicit
+// policy is honored verbatim; unset maps to the neutral "missing".
+func TestContainerPullPolicy(t *testing.T) {
+	cases := []struct {
+		policy corev1.PullPolicy
+		want   string
+	}{
+		{corev1.PullAlways, "Pull=always"},
+		{corev1.PullNever, "Pull=never"},
+		{corev1.PullIfNotPresent, "Pull=missing"},
+		{"", "Pull=missing"}, // unset → neutral default, no q8s-imposed policy
+	}
+	for _, tc := range cases {
+		pod := simplePod("default", "app", "myimage:latest")
+		pod.Spec.Containers[0].ImagePullPolicy = tc.policy
+		out := mustContainer(t, pod, "")
+		assertContains(t, out, tc.want)
+	}
+}
+
 func TestContainerEnvVars(t *testing.T) {
 	pod := simplePod("default", "app", "myimage:1.0")
 	pod.Spec.Containers[0].Env = []corev1.EnvVar{
