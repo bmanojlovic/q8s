@@ -661,10 +661,15 @@ WantedBy=multi-user.target
 		return err
 	}
 
-	// Reload systemd
+	// Reload systemd. A missing/unavailable systemd session (e.g. a CI
+	// runner or a container with no user manager) must not fail the whole
+	// install: the certs and unit files are already written by this point,
+	// and `q8s serve` runs fine standalone without the units being loaded.
+	// Warn like restartService does rather than aborting.
 	cmd := exec.Command("systemctl", append(systemctlArgs, "daemon-reload")...)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to reload systemd: %w", err)
+		fmt.Printf("Warning: systemctl daemon-reload failed: %v — units written but not loaded (run it manually, or ignore if not using the socket unit).\n", err)
+		return nil
 	}
 
 	fmt.Printf("Installed systemd units to %s\n", systemdDir)
