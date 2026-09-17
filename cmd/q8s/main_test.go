@@ -162,3 +162,43 @@ func TestRestoreSecretFilesWritesContent(t *testing.T) {
 		}
 	}
 }
+
+// TestRestoreLegacySecretSelfHealsOnLoad is the tic-c627 end-to-end check: a
+// secret persisted before the tic-b31a fix keeps its content only in
+// stringData. A bare restart (store.Load -> restoreSecretFiles) must write
+// real file content, not the empty placeholders that crash-looped the pod on
+// the mozakq8s VM. Load folds stringData into Data, so restore writes it out.
+func TestRestoreLegacySecretSelfHealsOnLoad(t *testing.T) {
+	tmp := t.TempDir()
+	storeFile := filepath.Join(tmp, "store.json")
+	legacy := `{
+	  "secrets": [
+	    {
+	      "apiVersion": "v1", "kind": "Secret",
+	      "metadata": {"name": "mozak-brain-tls", "namespace": "default"},
+	      "stringData": {"cert.pem": "PEMDATA", "key.pem": "KEYDATA"}
+	    }
+	  ]
+	}`
+	if err := os.WriteFile(storeFile, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Load(storeFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	secretDir := filepath.Join(tmp, "secrets")
+	restoreSecretFiles(secretDir, st)
+
+	for name, want := range map[string]string{"cert.pem": "PEMDATA", "key.pem": "KEYDATA"} {
+		got, err := os.ReadFile(filepath.Join(secretDir, "default", "mozak-brain-tls", name))
+		if err != nil {
+			t.Fatalf("reading restored %s: %v", name, err)
+		}
+		if string(got) != want {
+			t.Errorf("legacy secret %s = %q, want %q — restart did not self-heal", name, got, want)
+		}
+	}
+}

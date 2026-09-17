@@ -232,6 +232,12 @@ func Load(dataFile string) (*Store, error) {
 		s.configmaps[types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}] = cm
 	}
 	for _, sec := range snap.Secrets {
+		// Self-heal legacy secrets stored before the tic-b31a fix: fold any
+		// StringData into Data at load time so a bare restart's
+		// restoreSecretFiles (which writes only from Data) rewrites real
+		// content instead of empty placeholders. Idempotent — a
+		// normalized secret (StringData nil) is left untouched. See tic-c627.
+		normalizeSecret(sec)
 		s.secrets[types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}] = sec
 	}
 	for _, ns := range snap.Namespaces {
@@ -255,6 +261,27 @@ func Load(dataFile string) (*Store, error) {
 
 	s.ensureDefaultNamespace()
 	return s, nil
+}
+
+// normalizeSecret folds a Secret's StringData into Data so Data is the single
+// source of truth, mirroring what the API server (and handler.normalizeSecret
+// on POST/PATCH) does. Applied at load time to self-heal legacy secrets
+// persisted before the tic-b31a fix, which kept content only in StringData;
+// restoreSecretFiles writes files from Data alone, so an un-folded legacy
+// secret would empty its on-disk files on a bare restart. StringData wins on
+// key conflicts and is cleared afterward. Idempotent: a secret with no
+// StringData is left untouched. See tic-c627.
+func normalizeSecret(sec *corev1.Secret) {
+	if sec == nil || len(sec.StringData) == 0 {
+		return
+	}
+	if sec.Data == nil {
+		sec.Data = make(map[string][]byte, len(sec.StringData))
+	}
+	for k, v := range sec.StringData {
+		sec.Data[k] = []byte(v)
+	}
+	sec.StringData = nil
 }
 
 func (s *Store) ensureDefaultNamespace() {

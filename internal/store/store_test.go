@@ -761,6 +761,72 @@ func TestLoadCorruptedFile(t *testing.T) {
 	}
 }
 
+// TestLoadNormalizesLegacySecrets is the tic-c627 regression: a secret
+// persisted before the tic-b31a fix keeps its real content only in
+// stringData (or in a dual data+stringData map). store.Load must fold
+// stringData into Data at load time so a bare restart's restoreSecretFiles
+// (which writes from Data alone) rewrites real content, not empty files.
+func TestLoadNormalizesLegacySecrets(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "store.json")
+
+	// stringData-only legacy secret (content nowhere in data) + a dual-map
+	// secret where stringData must win on the conflicting key.
+	legacy := `{
+	  "secrets": [
+	    {
+	      "apiVersion": "v1", "kind": "Secret",
+	      "metadata": {"name": "tls-only", "namespace": "default"},
+	      "stringData": {"cert.pem": "PEMDATA", "key.pem": "KEYDATA"}
+	    },
+	    {
+	      "apiVersion": "v1", "kind": "Secret",
+	      "metadata": {"name": "dual", "namespace": "default"},
+	      "data": {"a": "b2xk", "b": "a2VwdA=="},
+	      "stringData": {"a": "new"}
+	    }
+	  ]
+	}`
+	if err := os.WriteFile(file, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Load(file)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	tlsOnly, err := st.GetSecret("default", "tls-only")
+	if err != nil {
+		t.Fatalf("GetSecret tls-only: %v", err)
+	}
+	if tlsOnly.StringData != nil {
+		t.Errorf("StringData should be cleared after load, got %v", tlsOnly.StringData)
+	}
+	if got := string(tlsOnly.Data["cert.pem"]); got != "PEMDATA" {
+		t.Errorf("cert.pem not folded into Data: got %q", got)
+	}
+	if got := string(tlsOnly.Data["key.pem"]); got != "KEYDATA" {
+		t.Errorf("key.pem not folded into Data: got %q", got)
+	}
+
+	dual, err := st.GetSecret("default", "dual")
+	if err != nil {
+		t.Fatalf("GetSecret dual: %v", err)
+	}
+	if dual.StringData != nil {
+		t.Errorf("StringData should be cleared after load, got %v", dual.StringData)
+	}
+	// stringData wins on the conflicting key "a"; the data-only key "b" (base64
+	// "kept") survives untouched.
+	if got := string(dual.Data["a"]); got != "new" {
+		t.Errorf("stringData should win on key a: got %q", got)
+	}
+	if got := string(dual.Data["b"]); got != "kept" {
+		t.Errorf("data-only key b should survive: got %q", got)
+	}
+}
+
 // --- replica port allocator ---
 
 func TestAllocateReplicaPortStableAndUnique(t *testing.T) {
