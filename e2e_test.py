@@ -53,8 +53,8 @@ def fail(desc, detail=""):
     print(msg)
     FAIL += 1
 
-def check(desc, cmd, expect=None, absent=None, rc=0):
-    out, code = run(cmd)
+def check(desc, cmd, expect=None, absent=None, rc=0, timeout=15):
+    out, code = run(cmd, timeout=timeout)
     if code != rc:
         fail(desc, f"exit {code}: {out}")
         return out
@@ -256,7 +256,10 @@ def test_deployment():
     else:
         fail("scaled-up container running", "timed out")
 
-    check("scale down to 1", f"kubectl -n {NS} scale deployment myapp --replicas=1")
+    # Scale-down and delete stop/remove systemd units and run `podman rm -f`
+    # (server-bounded at 30s per container); on a slow CI runner a single
+    # kubectl call can exceed the default 15s, so allow generous headroom.
+    check("scale down to 1", f"kubectl -n {NS} scale deployment myapp --replicas=1", timeout=60)
     time.sleep(2)
     file_absent("instance-1 quadlet removed", f"{QUADLETS}/{NS}-myapp-1.container")
     file_absent("instance-2 quadlet removed", f"{QUADLETS}/{NS}-myapp-2.container")
@@ -267,7 +270,7 @@ def test_deployment():
           f"kubectl -n {NS} get deployment myapp -o jsonpath='{{.spec.template.metadata.annotations}}'",
           expect="restartedAt")
 
-    check("delete deployment", f"kubectl -n {NS} delete deployment myapp")
+    check("delete deployment", f"kubectl -n {NS} delete deployment myapp", timeout=60)
     time.sleep(2)
     file_absent("all quadlets removed", f"{QUADLETS}/{NS}-myapp-0.container")
 
@@ -329,7 +332,7 @@ def test_patch_and_edit():
     else:
         fail("second replica container running in podman after edit", "timed out")
     os.unlink(sed_script.name)
-    check("delete edit-test deployment", f"kubectl -n {NS} delete deployment editapp")
+    check("delete edit-test deployment", f"kubectl -n {NS} delete deployment editapp", timeout=60)
 
     # --- secret: create, read back data, patch data ---
     check("create secret with multiple keys",
