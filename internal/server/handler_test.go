@@ -667,6 +667,34 @@ func TestReconcileQuadletsBindsExistingPVC(t *testing.T) {
 	}
 }
 
+// TestReconcileSweepsOrphanedSockets pins tic-845d: a stale legacy per-port
+// .socket file (which no current q8s writes) left in the quadlet dir is
+// swept at startup, even with no Service to trigger the reactive cleanup —
+// while unrelated quadlet files are left untouched.
+func TestReconcileSweepsOrphanedSockets(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+
+	orphan := filepath.Join(quadletDir, "mozak-brain-13131.socket")
+	if err := os.WriteFile(orphan, []byte("[Socket]\nListenStream=13131\n"), 0644); err != nil {
+		t.Fatalf("WriteFile socket: %v", err)
+	}
+	keep := filepath.Join(quadletDir, "default-web-0.container")
+	if err := os.WriteFile(keep, []byte("[Container]\n"), 0644); err != nil {
+		t.Fatalf("WriteFile container: %v", err)
+	}
+
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	srv.ReconcileQuadlets()
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("expected orphaned .socket to be swept, stat err=%v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("unrelated quadlet file should survive the sweep: %v", err)
+	}
+}
+
 // --- ConfigMap ---
 
 func TestConfigMapCRUD(t *testing.T) {

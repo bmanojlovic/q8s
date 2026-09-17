@@ -1559,6 +1559,37 @@ func (s *Server) removeLegacyServiceSockets(svc *corev1.Service) {
 	}
 }
 
+// sweepOrphanedSockets deletes every *.socket file in the quadlet dir at
+// startup. q8s no longer generates any .socket file (the legacy per-port
+// Service socket mechanism never worked — see removeLegacyServiceSockets),
+// and removeLegacyServiceSockets only fires reactively on a Service
+// delete/update, so a stale socket from an older q8s version can otherwise
+// sit in the quadlet dir indefinitely on an untouched Service — harmless
+// (systemd never loads .socket files from the quadlet-only dir) but
+// confusing to anyone debugging host-port reachability by hand. Returns
+// true if it removed anything, so the caller can fold a daemon-reload into
+// its existing one. See tic-845d.
+func (s *Server) sweepOrphanedSockets() bool {
+	if s.config.QuadletDir == "" {
+		return false
+	}
+	matches, err := filepath.Glob(filepath.Join(s.config.QuadletDir, "*.socket"))
+	if err != nil {
+		fmt.Printf("sweep sockets: glob: %v\n", err)
+		return false
+	}
+	removed := false
+	for _, path := range matches {
+		if err := os.Remove(path); err != nil {
+			fmt.Printf("sweep sockets: remove %s: %v\n", path, err)
+			continue
+		}
+		fmt.Printf("swept orphaned socket %s\n", filepath.Base(path))
+		removed = true
+	}
+	return removed
+}
+
 func (s *Server) handleNamespaceDelete(w http.ResponseWriter, r *http.Request, name string) {
 	if _, err := s.config.Store.GetNamespace(name); err != nil {
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -2115,6 +2146,12 @@ func (s *Server) ReconcileQuadlets() {
 
 	needReload := false
 	var startUnits []string
+
+	// Sweep stale legacy *.socket files left by old q8s versions before
+	// regenerating anything; fold the removal into the reload below.
+	if s.sweepOrphanedSockets() {
+		needReload = true
+	}
 
 	missing := func(path string) bool { _, err := os.Stat(path); return err != nil }
 
