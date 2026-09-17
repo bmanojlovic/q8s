@@ -2575,7 +2575,6 @@ func TestDeleteCollectionPodsAndDeployments(t *testing.T) {
 	}
 }
 
-
 // --- NodePort services ---
 
 // nodePortSvcBody builds a type: NodePort service body; nodePort 0 means
@@ -2658,7 +2657,6 @@ func TestNodePortDuplicateRejected(t *testing.T) {
 	assertStatus(t, resp, 409)
 	resp.Body.Close()
 }
-
 
 // TestSecretStringDataFoldedToData is the regression test for tic-b31a: a
 // Secret created with only stringData must be stored with its content in

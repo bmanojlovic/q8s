@@ -130,7 +130,6 @@ func TestUnitStateToPhase(t *testing.T) {
 	}
 }
 
-
 // --- restoreSecretFiles (tic-b31a) ---
 
 // TestRestoreSecretFilesWritesContent proves the restart path rewrites secret
