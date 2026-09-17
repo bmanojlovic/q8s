@@ -12,23 +12,27 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// writeResourceLimits emits Memory= (native quadlet key) and PodmanArgs=
-// --cpus=N (quadlet has no native CPU-limit key; PodmanArgs is the
-// documented escape hatch for podman run flags it doesn't model directly).
-// resource.Quantity fields are validated by k8s's own JSON decoding before
-// they ever reach here, so no extra input validation is needed.
+// writeResourceLimits translates a Pod's resource limits into podman run
+// flags via PodmanArgs=. All three (memory, swap, cpu) go through PodmanArgs
+// rather than the native quadlet Memory= key: older podman quadlet
+// generators (e.g. 5.4.2) reject the native Memory= key outright
+// ("unsupported key Memory") and then emit NO unit at all, silently
+// stranding the pod — whereas PodmanArgs is opaque passthrough every version
+// accepts (it's already how --cpus is emitted). Same runtime effect as
+// Memory= (both become `podman run --memory <bytes>`), but portable across
+// podman versions. See tic-ecac.
 //
-// Memory limits are only emitted when the cgroup memory controller is
-// available. On rootless systems where the memory controller isn't
-// delegated to the user session, setting a memory limit causes runc to
-// fail at container create. The limit is silently skipped in that case.
+// Limits are only emitted when the corresponding cgroup controller is
+// delegated to the current process; on a rootless host where it isn't,
+// setting the limit would make runc fail at container create, so it's
+// silently skipped. resource.Quantity fields are validated by k8s's own
+// JSON decoding before reaching here.
 func writeResourceLimits(b *strings.Builder, limits corev1.ResourceList) {
 	if mem, ok := limits[corev1.ResourceMemory]; ok && !mem.IsZero() && cgroupMemoryAvailable() {
-		b.WriteString(fmt.Sprintf("Memory=%d\n", mem.Value()))
-		// Disable the swap limit so runc doesn't try to write
-		// memory.swap.max — which doesn't exist on cgroup v2 hosts
-		// without the swap controller.
-		b.WriteString("PodmanArgs=--memory-swap=-1\n")
+		// --memory sets the limit; --memory-swap=-1 disables the swap
+		// limit so runc doesn't try to write memory.swap.max, which
+		// doesn't exist on cgroup v2 hosts without the swap controller.
+		b.WriteString(fmt.Sprintf("PodmanArgs=--memory=%d --memory-swap=-1\n", mem.Value()))
 	}
 	if cpu, ok := limits[corev1.ResourceCPU]; ok && !cpu.IsZero() && cgroupCPUAvailable() {
 		cores := float64(cpu.MilliValue()) / 1000.0

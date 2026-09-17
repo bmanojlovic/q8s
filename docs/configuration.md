@@ -146,7 +146,9 @@ A **NodePort** Service is a real host-level listener: q8s allocates a port in **
 
 ## Resource limits and cgroup delegation
 
-q8s emits `Memory=` and `PodmanArgs=--cpus=N` in quadlet files when `resources.limits` are set. On cgroup v2, this requires the memory and cpu controllers to be delegated to the user session.
+q8s emits `PodmanArgs=--memory=N --memory-swap=-1` and `PodmanArgs=--cpus=N` in quadlet files when `resources.limits` are set. On cgroup v2, this requires the memory and cpu controllers to be delegated to the user session.
+
+(Memory goes through `PodmanArgs` rather than the native quadlet `Memory=` key so it works on older podman whose quadlet generator rejects that key — same runtime effect, portable across versions.)
 
 q8s detects whether these controllers are available at startup. If not, resource limits are **silently skipped** — the pod starts without limits rather than crashing.
 

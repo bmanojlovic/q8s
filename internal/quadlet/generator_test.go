@@ -745,9 +745,11 @@ func TestContainerResourceLimits(t *testing.T) {
 		corev1.ResourceCPU:    resource.MustParse("500m"),
 	}
 	out := mustContainer(t, pod, "")
-	assertContains(t, out, "Memory=536870912")
-	assertContains(t, out, "PodmanArgs=--memory-swap=-1")
+	assertContains(t, out, "PodmanArgs=--memory=536870912 --memory-swap=-1")
 	assertContains(t, out, "PodmanArgs=--cpus=0.5")
+	// Memory must NOT use the native quadlet key — older podman rejects it.
+	assertNotContains(t, out, "Memory=536870912")
+	assertNotContains(t, out, "\nMemory=")
 }
 
 func TestContainerNoResourceLimits(t *testing.T) {
@@ -757,7 +759,7 @@ func TestContainerNoResourceLimits(t *testing.T) {
 	pod := simplePod("default", "app", "nginx:latest")
 	out := mustContainer(t, pod, "")
 	assertNotContains(t, out, "Memory=")
-	assertNotContains(t, out, "--memory-swap")
+	assertNotContains(t, out, "--memory")
 	assertNotContains(t, out, "--cpus")
 }
 
@@ -772,7 +774,7 @@ func TestContainerResourceLimitsSkippedWhenCgroupUnavailable(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 	assertNotContains(t, out, "Memory=")
-	assertNotContains(t, out, "--memory-swap")
+	assertNotContains(t, out, "--memory")
 	assertNotContains(t, out, "--cpus")
 }
 
