@@ -2630,3 +2630,64 @@ func TestNodePortDuplicateRejected(t *testing.T) {
 	assertStatus(t, resp, 409)
 	resp.Body.Close()
 }
+
+
+// TestSecretStringDataFoldedToData is the regression test for tic-b31a: a
+// Secret created with only stringData must be stored with its content in
+// Data (StringData cleared), so it survives a restart where restoreSecretFiles
+// rewrites the on-disk files from Data alone. Before the fix, content lived
+// only in StringData, the store persisted it, but restore wrote empty files.
+func TestSecretStringDataFoldedToData(t *testing.T) {
+	ts, st := newTestServer(t)
+	body := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "tls", "namespace": "default"},
+		"stringData": map[string]interface{}{"cert.pem": "PEMDATA", "key.pem": "KEYDATA"},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/secrets", body)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	sec, err := st.GetSecret("default", "tls")
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if len(sec.StringData) != 0 {
+		t.Errorf("StringData should be cleared after folding, got %v", sec.StringData)
+	}
+	if got := string(sec.Data["cert.pem"]); got != "PEMDATA" {
+		t.Errorf("cert.pem not folded into Data: got %q", got)
+	}
+	if got := string(sec.Data["key.pem"]); got != "KEYDATA" {
+		t.Errorf("key.pem not folded into Data: got %q", got)
+	}
+}
+
+// TestSecretStringDataWinsOnConflict: when both data and stringData carry the
+// same key, stringData wins — matching the Kubernetes API server.
+func TestSecretStringDataWinsOnConflict(t *testing.T) {
+	ts, st := newTestServer(t)
+	body := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "both", "namespace": "default"},
+		// data is base64("old"), stringData is raw "new" — stringData should win
+		"data":       map[string]interface{}{"k": "b2xk"},
+		"stringData": map[string]interface{}{"k": "new"},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/secrets", body)
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	sec, err := st.GetSecret("default", "both")
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if got := string(sec.Data["k"]); got != "new" {
+		t.Errorf("stringData should win on conflict: got %q want %q", got, "new")
+	}
+	if len(sec.StringData) != 0 {
+		t.Errorf("StringData should be cleared, got %v", sec.StringData)
+	}
+}

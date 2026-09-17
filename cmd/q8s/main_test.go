@@ -1,9 +1,13 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/store"
 	"q8s/internal/systemd"
 )
 
@@ -122,6 +126,39 @@ func TestUnitStateToPhase(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("unitStateToPhase({Active:%q, Result:%q}) = %q, want %q",
 				tc.active, tc.result, got, tc.want)
+		}
+	}
+}
+
+
+// --- restoreSecretFiles (tic-b31a) ---
+
+// TestRestoreSecretFilesWritesContent proves the restart path rewrites secret
+// file CONTENT from the stored Data, not just empty placeholders. This is the
+// second half of the tic-b31a fix: handler.normalizeSecret guarantees content
+// lives in Data, and restoreSecretFiles must actually write it out.
+func TestRestoreSecretFilesWritesContent(t *testing.T) {
+	dir := t.TempDir()
+	st := store.New()
+	if _, err := st.CreateSecret(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "tls", Namespace: "default"},
+		Data: map[string][]byte{
+			"cert.pem": []byte("PEMDATA"),
+			"key.pem":  []byte("KEYDATA"),
+		},
+	}); err != nil {
+		t.Fatalf("CreateSecret: %v", err)
+	}
+
+	restoreSecretFiles(dir, st)
+
+	for name, want := range map[string]string{"cert.pem": "PEMDATA", "key.pem": "KEYDATA"} {
+		got, err := os.ReadFile(filepath.Join(dir, "default", "tls", name))
+		if err != nil {
+			t.Fatalf("reading restored %s: %v", name, err)
+		}
+		if string(got) != want {
+			t.Errorf("restored %s = %q, want %q", name, got, want)
 		}
 	}
 }
