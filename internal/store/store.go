@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -30,6 +32,11 @@ type snapshot struct {
 	CronJobs    []*batchv1.CronJob              `json:"cronJobs,omitempty"`
 	Deployments []*appsv1.Deployment            `json:"deployments,omitempty"`
 	Ingresses   []*networkingv1.Ingress         `json:"ingresses,omitempty"`
+	// ReplicaPorts maps "{ns}/{deployment}/{instance}/{containerPort}" to
+	// the loopback host port allocated for that deployment replica — see
+	// Store.AllocateReplicaPort. Persisted so ports are stable across
+	// restarts (Traefik configs keep pointing at the same port after a reboot).
+	ReplicaPorts map[string]int32 `json:"replicaPorts,omitempty"`
 }
 
 // Store is an in-memory store for k8s resources.
@@ -47,7 +54,9 @@ type Store struct {
 	cronjobs    map[types.NamespacedName]*batchv1.CronJob
 	deployments map[types.NamespacedName]*appsv1.Deployment
 	ingresses   map[types.NamespacedName]*networkingv1.Ingress
-	resourceVer int
+	// replicaPorts is the per-replica host-port allocator state; guarded by mu.
+	replicaPorts map[string]int32
+	resourceVer  int
 
 	notifyMu sync.Mutex
 	notifyCh chan struct{}
@@ -147,17 +156,18 @@ func (s *Store) Events(ns string) []*corev1.Event {
 
 func newEmpty() *Store {
 	return &Store{
-		pods:        make(map[types.NamespacedName]*corev1.Pod),
-		services:    make(map[types.NamespacedName]*corev1.Service),
-		pvcs:        make(map[types.NamespacedName]*corev1.PersistentVolumeClaim),
-		configmaps:  make(map[types.NamespacedName]*corev1.ConfigMap),
-		secrets:     make(map[types.NamespacedName]*corev1.Secret),
-		namespaces:  make(map[types.NamespacedName]*corev1.Namespace),
-		jobs:        make(map[types.NamespacedName]*batchv1.Job),
-		cronjobs:    make(map[types.NamespacedName]*batchv1.CronJob),
-		deployments: make(map[types.NamespacedName]*appsv1.Deployment),
-		ingresses:   make(map[types.NamespacedName]*networkingv1.Ingress),
-		notifyCh:    make(chan struct{}),
+		pods:         make(map[types.NamespacedName]*corev1.Pod),
+		services:     make(map[types.NamespacedName]*corev1.Service),
+		pvcs:         make(map[types.NamespacedName]*corev1.PersistentVolumeClaim),
+		configmaps:   make(map[types.NamespacedName]*corev1.ConfigMap),
+		secrets:      make(map[types.NamespacedName]*corev1.Secret),
+		namespaces:   make(map[types.NamespacedName]*corev1.Namespace),
+		jobs:         make(map[types.NamespacedName]*batchv1.Job),
+		cronjobs:     make(map[types.NamespacedName]*batchv1.CronJob),
+		deployments:  make(map[types.NamespacedName]*appsv1.Deployment),
+		ingresses:    make(map[types.NamespacedName]*networkingv1.Ingress),
+		replicaPorts: make(map[string]int32),
+		notifyCh:     make(chan struct{}),
 	}
 }
 
@@ -238,6 +248,9 @@ func Load(dataFile string) (*Store, error) {
 	}
 	for _, ing := range snap.Ingresses {
 		s.ingresses[types.NamespacedName{Namespace: ing.Namespace, Name: ing.Name}] = ing
+	}
+	for k, v := range snap.ReplicaPorts {
+		s.replicaPorts[k] = v
 	}
 
 	s.ensureDefaultNamespace()
@@ -326,6 +339,10 @@ func (s *Store) snapshot() snapshot {
 	for _, ing := range s.ingresses {
 		snap.Ingresses = append(snap.Ingresses, ing.DeepCopy())
 	}
+	snap.ReplicaPorts = make(map[string]int32, len(s.replicaPorts))
+	for k, v := range s.replicaPorts {
+		snap.ReplicaPorts[k] = v
+	}
 	return snap
 }
 
@@ -393,6 +410,9 @@ func (s *Store) Namespaces() []*corev1.Namespace {
 		phantom(k.Namespace)
 	}
 	for k := range s.pvcs {
+		phantom(k.Namespace)
+	}
+	for k := range s.ingresses {
 		phantom(k.Namespace)
 	}
 	return result
@@ -486,6 +506,24 @@ func (s *Store) PurgeNamespace(name string) {
 	for key := range s.cronjobs {
 		if key.Namespace == name {
 			delete(s.cronjobs, key)
+		}
+	}
+	// Ingresses were missing from the original hand-enumerated purge list:
+	// after `kubectl delete namespace`, their objects survived in the store
+	// (still listed by `kubectl get ingresses -A`) and startup
+	// reconciliation kept regenerating Traefik routes pointing at the
+	// deleted namespace's backends. The lesson: any new resource kind added
+	// to the store must be added here and to Namespaces()'s phantom loops —
+	// consider a generic helper if a tenth kind appears.
+	for key := range s.ingresses {
+		if key.Namespace == name {
+			delete(s.ingresses, key)
+		}
+	}
+	// Replica-port allocations for this namespace go with its deployments.
+	for k := range s.replicaPorts {
+		if strings.HasPrefix(k, name+"/") {
+			delete(s.replicaPorts, k)
 		}
 	}
 	s.resourceVer++
@@ -1530,3 +1568,125 @@ const (
 	// ModeKey is the context key for rootful vs rootless mode.
 	ModeKey ContextKey = "mode"
 )
+
+// --- Replica port allocation ---
+//
+// Deployment replicas share one pod template, so they cannot declare
+// distinct hostPorts — yet a hostPort per replica is exactly what an on-host
+// reverse proxy (Traefik) needs as its per-pod backend address on rootless
+// podman, where container IPs are unreachable from the host. The allocator
+// hands each deployment instance its own loopback port (nodePort-style):
+// stable across restarts, unique across the whole system, and freed when the
+// instance goes away. Publishing on 127.0.0.1 only keeps the LAN surface at
+// exactly the proxy's :80/:443.
+
+const (
+	// ReplicaPortMin/Max bound the allocation range. Matches the k8s
+	// service-node-port range so the discipline is familiar: keep manual
+	// hostPorts out of this range to avoid collisions.
+	ReplicaPortMin = 20000
+	ReplicaPortMax = 32767
+)
+
+func replicaPortKey(ns, dep string, instance, containerPort int32) string {
+	return fmt.Sprintf("%s/%s/%d/%d", ns, dep, instance, containerPort)
+}
+
+// AllocateReplicaPort returns the host port assigned to a deployment
+// instance's container port, allocating one on first use. Idempotent: the
+// same (deployment, instance, containerPort) always gets the same port, on
+// every call and after every restart, until freed.
+func (s *Store) AllocateReplicaPort(ns, dep string, instance, containerPort int32) int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := replicaPortKey(ns, dep, instance, containerPort)
+	if p, ok := s.replicaPorts[key]; ok {
+		return p
+	}
+	used := make(map[int32]bool, len(s.replicaPorts)+8)
+	for _, p := range s.replicaPorts {
+		used[p] = true
+	}
+	// Also avoid manually-chosen hostPorts (standalone pods) that fall in
+	// the range, so a later allocation can't collide with a running
+	// container's published port.
+	for _, pod := range s.pods {
+		for _, c := range pod.Spec.Containers {
+			for _, cp := range c.Ports {
+				if cp.HostPort != 0 {
+					used[cp.HostPort] = true
+				}
+			}
+		}
+	}
+	for p := int32(ReplicaPortMin); p <= ReplicaPortMax; p++ {
+		if !used[p] {
+			s.replicaPorts[key] = p
+			s.resourceVer++
+			go s.save()
+			return p
+		}
+	}
+	// Range exhausted (~12.7k replicas): fall back to a collision-prone but
+	// functional deterministic hash so behavior degrades loudly at runtime
+	// (podman will fail the duplicate publish) instead of returning 0 here.
+	p := ReplicaPortMin + int32(fnv32(key)%uint32(ReplicaPortMax-ReplicaPortMin))
+	s.replicaPorts[key] = p
+	s.resourceVer++
+	go s.save()
+	return p
+}
+
+// FreeReplicaPorts releases allocations for a deployment's instances with
+// index >= fromInstance (scale-down). Freed ports re-enter the pool.
+func (s *Store) FreeReplicaPorts(ns, dep string, fromInstance int32) {
+	s.mu.Lock()
+	prefix := fmt.Sprintf("%s/%s/", ns, dep)
+	freed := false
+	for k := range s.replicaPorts {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(k, prefix)
+		// rest = "{instance}/{containerPort}"
+		if idx := strings.IndexByte(rest, '/'); idx > 0 {
+			if n, err := strconv.Atoi(rest[:idx]); err == nil && int32(n) >= fromInstance {
+				delete(s.replicaPorts, k)
+				freed = true
+			}
+		}
+	}
+	if freed {
+		s.resourceVer++
+		go s.save()
+	}
+	s.mu.Unlock()
+}
+
+// FreeNamespacePorts releases every replica-port allocation in a namespace.
+// Called from PurgeNamespace.
+func (s *Store) FreeNamespacePorts(ns string) {
+	s.mu.Lock()
+	prefix := ns + "/"
+	freed := false
+	for k := range s.replicaPorts {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.replicaPorts, k)
+			freed = true
+		}
+	}
+	if freed {
+		s.resourceVer++
+		go s.save()
+	}
+	s.mu.Unlock()
+}
+
+func fnv32(s string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}

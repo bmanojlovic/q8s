@@ -3,6 +3,7 @@ package quadlet
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -97,15 +98,91 @@ func validateLabelPair(key, value string) error {
 // lists, and steps.
 var cronFieldRE = regexp.MustCompile(`^[0-9*/,-]+$`)
 
+// cronFieldBounds holds the min/max value of each of the five cron fields
+// (minute, hour, day-of-month, month, day-of-week). Day-of-week allows both
+// 0 and 7 for Sunday, as cron does.
+var cronFieldBounds = [5][2]int{
+	{0, 59}, // minute
+	{0, 23}, // hour
+	{1, 31}, // day of month
+	{1, 12}, // month
+	{0, 7},  // day of week (0 and 7 = Sunday)
+}
+
 func validateCronSchedule(schedule string) error {
 	fields := strings.Fields(schedule)
 	if len(fields) != 5 {
 		return fmt.Errorf("schedule %q must have exactly 5 fields", schedule)
 	}
-	for _, f := range fields {
+	for i, f := range fields {
 		if !cronFieldRE.MatchString(f) {
 			return fmt.Errorf("schedule %q has an invalid field %q", schedule, f)
 		}
+		// Reject out-of-range values up front ("99 25 * * *" is not a valid
+		// cron schedule) instead of letting them surface later as an opaque
+		// systemd timer load error at daemon-reload time — after the
+		// CronJob has already been accepted and stored.
+		min, max := cronFieldBounds[i][0], cronFieldBounds[i][1]
+		if _, err := expandCronField(f, min, max); err != nil {
+			return fmt.Errorf("schedule %q: field %d: %v", schedule, i+1, err)
+		}
 	}
 	return nil
+}
+
+// expandCronField returns the set of integers a cron field matches, bounded
+// by min and max. Supports "*", single values ("5"), ranges ("1-5"), steps
+// ("*/2", "3/5" meaning 3,8,13…, "1-15/2"), and comma-separated lists of
+// those. Sortedness is not guaranteed, but every value is within [min,max]
+// and unique within its list element.
+func expandCronField(f string, min, max int) ([]int, error) {
+	if f == "" {
+		return nil, fmt.Errorf("empty field")
+	}
+	var out []int
+	for _, part := range strings.Split(f, ",") {
+		step := 1
+		hasStep := false
+		if i := strings.IndexByte(part, '/'); i >= 0 {
+			s, err := strconv.Atoi(part[i+1:])
+			if err != nil || s < 1 {
+				return nil, fmt.Errorf("invalid step %q", part)
+			}
+			step, hasStep = s, true
+			part = part[:i]
+		}
+		lo, hi := min, max
+		if part == "*" {
+			// full range as-is
+		} else if bounds := strings.SplitN(part, "-", 2); len(bounds) == 2 {
+			var err error
+			if lo, err = strconv.Atoi(bounds[0]); err != nil {
+				return nil, fmt.Errorf("invalid range %q", part)
+			}
+			if hi, err = strconv.Atoi(bounds[1]); err != nil {
+				return nil, fmt.Errorf("invalid range %q", part)
+			}
+		} else {
+			v, err := strconv.Atoi(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid value %q", part)
+			}
+			lo, hi = v, v
+			// A bare value with a step ("3/5") runs from that value to the
+			// end of the field's range in cron — not just the one value.
+			if hasStep {
+				hi = max
+			}
+		}
+		if lo < min || hi > max {
+			return nil, fmt.Errorf("value %q outside range %d-%d", part, min, max)
+		}
+		if lo > hi {
+			return nil, fmt.Errorf("descending range %q", part)
+		}
+		for v := lo; v <= hi; v += step {
+			out = append(out, v)
+		}
+	}
+	return out, nil
 }

@@ -7,7 +7,7 @@
 | `nodes` | get, list | Synthetic single node with real machine stats |
 | `namespaces` | get, list, create, delete | Creates a `q8s-{ns}.network` Podman network |
 | `pods` | get, list, create, patch, delete | Writes a `.container` Quadlet; patch rewrites and restarts |
-| `services` | get, list, create, patch, delete | Network aliases + socket units per port (mutually exclusive with hostPort) |
+| `services` | get, list, create, patch, delete | Selector + port map: DNS aliases (NetworkAlias) and ingress backend resolution; never binds a host port |
 | `persistentvolumeclaims` | get, list, create, patch, delete | Named Podman volume; storageClass selects mount mode |
 | `configmaps` | get, list, create, update, patch, delete | Files at `{configDir}/{ns}/{name}/` |
 | `secrets` | get, list, create, patch, delete | Files at `{secretDir}/{ns}/{name}/` (mode 0600) |
@@ -33,7 +33,7 @@
 
 | Resource | kubectl verbs | Notes |
 |---|---|---|
-| `ingresses` | get, list, create, patch, delete | Metadata-only, no proxy/port mapping |
+| `ingresses` | get, list, create, patch, delete | Traefik dynamic config per ingress; backends resolved from the Service selector (one server per matching pod's hostPort, like Endpoints) |
 
 ## metrics.k8s.io/v1beta1
 
@@ -106,7 +106,7 @@ spec:
 - **Label selectors**: `key=value`, `key==value`, `key!=value`, `key`, `!key` on all list endpoints
 - **Patch**: JSON merge patch and strategic merge patch (array-merge-by-name for containers/env/volumes); RFC 6902 JSON Patch (`application/json-patch+json`) on all resources — Terraform's provider patches Secret `data` keys and container/spec changes this way
 - **Resource limits**: `resources.limits.memory` → Quadlet `Memory=` + `--memory-swap=-1`, `resources.limits.cpu` → `--cpus=N` (skipped when cgroup controllers not delegated)
-- **Port semantics**: `containerPort` is internal-only (namespace network); `hostPort` publishes to host via `PublishPort=`; Service creates a systemd `.socket` unit. hostPort and Service are mutually exclusive on the same port.
+- **Port semantics**: `containerPort` is internal-only (namespace network); `hostPort` publishes to host via `PublishPort=`; Service never binds a port — it maps selector + `targetPort` to DNS aliases and ingress backends. Deployment replicas get auto-allocated loopback ports (20000-32767).
 - **CrashLoopBackOff**: detected from restart count + non-zero exit, shown in pod status
 - **StartLimitBurst=5**: systemd gives up after 5 failures within 60s
 - **Delete cascade**: deployment delete removes owned pods, stops units, removes quadlets

@@ -127,6 +127,19 @@ func detectCgroupControllers() {
 // can inspect storageClassName and annotations. A nil map is safe and falls
 // back to the default (named volume with :Z).
 func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
+	// Name/namespace are validated here even though the API boundary
+	// already checks them: the Podman-label import path (reconcilePodmanPods)
+	// constructs pods from container labels, which nothing else vets, and a
+	// newline or "../" in them would inject unit-file lines or traverse the
+	// output filename. validateRefName is the same RFC-1123 shape every
+	// other reference in this file goes through.
+	if err := validateRefName("pod name", name); err != nil {
+		return nil, err
+	}
+	if err := validateRefName("pod namespace", pod.Namespace); err != nil {
+		return nil, err
+	}
+
 	var b strings.Builder
 
 	b.WriteString("[Container]\n")
@@ -195,7 +208,16 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 		if port.Protocol == corev1.ProtocolUDP {
 			proto = "udp"
 		}
-		b.WriteString(fmt.Sprintf("PublishPort=%d:%d/%s\n", port.HostPort, port.ContainerPort, proto))
+		// An explicit HostIP binds the published port to one interface —
+		// the q8s replica-port allocator uses 127.0.0.1 so replica backends
+		// are reachable on-host (Traefik) but never exposed on the LAN.
+		// Without HostIP the publish binds all interfaces, matching k8s
+		// hostPort semantics for manually-declared ports.
+		if port.HostIP != "" {
+			b.WriteString(fmt.Sprintf("PublishPort=%s:%d:%d/%s\n", port.HostIP, port.HostPort, port.ContainerPort, proto))
+		} else {
+			b.WriteString(fmt.Sprintf("PublishPort=%d:%d/%s\n", port.HostPort, port.ContainerPort, proto))
+		}
 	}
 
 	// Volumes — resolve ConfigMap references to their on-disk directory.
@@ -299,12 +321,22 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 	b.WriteString("\n[Unit]\n")
 	b.WriteString(fmt.Sprintf("Description=Pod %s\n", pod.Name))
 
-	if pod.Spec.RestartPolicy == corev1.RestartPolicyAlways ||
-		pod.Spec.RestartPolicy == corev1.RestartPolicyOnFailure {
+	// Every policy maps to an explicit Restart= line. Emitting nothing for
+	// Never (as older code did) is not neutral: quadlet/.container units
+	// default to on-failure, so a "run once, never restart" pod restarted
+	// on failure anyway. Defaulting empty to Always matches real k8s pod
+	// defaulting — but that normalization happens at the API boundary
+	// (handler POST/PATCH); the generator treats empty defensively the same
+	// way.
+	switch pod.Spec.RestartPolicy {
+	case corev1.RestartPolicyNever:
+		b.WriteString("\n[Service]\n")
+		b.WriteString("Restart=no\n")
+	default: // Always, OnFailure, empty (API defaulting) — restart
 		b.WriteString("StartLimitBurst=5\n")
 		b.WriteString("StartLimitIntervalSec=60\n")
 		b.WriteString("\n[Service]\n")
-		if pod.Spec.RestartPolicy == corev1.RestartPolicyAlways {
+		if pod.Spec.RestartPolicy == corev1.RestartPolicyAlways || pod.Spec.RestartPolicy == "" {
 			// Always means restart regardless of exit code -- on-failure
 			// would silently strand the pod as "Succeeded" on a clean
 			// exit 0 (confirmed live 2026-08-29: a container that exited
@@ -328,6 +360,13 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
 	spec := job.Spec.Template.Spec
 	ns := job.Namespace
+
+	if err := validateRefName("job name", name); err != nil {
+		return nil, err
+	}
+	if err := validateRefName("job namespace", ns); err != nil {
+		return nil, err
+	}
 
 	var b strings.Builder
 	b.WriteString("[Container]\n")
@@ -452,6 +491,13 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
 	spec := cj.Spec.JobTemplate.Spec.Template.Spec
 	ns := cj.Namespace
+
+	if err := validateRefName("cronjob name", name); err != nil {
+		return nil, err
+	}
+	if err := validateRefName("cronjob namespace", ns); err != nil {
+		return nil, err
+	}
 
 	var b strings.Builder
 	b.WriteString("[Container]\n")
@@ -583,7 +629,9 @@ func CronTimer(name string, cj *batchv1.CronJob) ([]byte, error) {
 	b.WriteString(fmt.Sprintf("Description=Timer for CronJob %s/%s\n", cj.Namespace, name))
 
 	b.WriteString("\n[Timer]\n")
-	b.WriteString(fmt.Sprintf("OnCalendar=%s\n", cronToOnCalendar(cj.Spec.Schedule)))
+	for _, cal := range cronToCalendars(cj.Spec.Schedule) {
+		b.WriteString(fmt.Sprintf("OnCalendar=%s\n", cal))
+	}
 	b.WriteString("Persistent=true\n")
 
 	b.WriteString("\n[Install]\n")
@@ -592,30 +640,99 @@ func CronTimer(name string, cj *batchv1.CronJob) ([]byte, error) {
 	return []byte(b.String()), nil
 }
 
-// cronToOnCalendar converts a 5-field cron expression to systemd OnCalendar format.
-// minute hour dom month dow → *-{month}-{dom} {hour}:{minute}:00
-// Step expressions like */5 (every 5 minutes) become 0/5 (systemd notation).
-// */1 is simplified to * (every value).
-func cronToOnCalendar(cron string) string {
+// cronToCalendars converts a 5-field cron expression into one or two systemd
+// calendar expressions for OnCalendar=.
+//
+// The mapping is not a field-by-field rename; three systemd/cron differences
+// matter:
+//
+//   - Bases: minute/hour are 0-based in both, but systemd months and days
+//     start at 1. A blanket */N → 0/N rewrite (as an earlier version did)
+//     produces *-0/2-* for "every other month", which systemd rejects. Time
+//     fields keep the step shorthand (0/5); date fields are expanded into
+//     explicit comma lists, which every systemd version parses.
+//   - Day-of-week numbering: cron uses 0=Sunday…6=Saturday (7 also Sunday);
+//     systemd uses 1=Monday…7=Sunday. Values are remapped, and when every
+//     day is selected the DOW prefix is omitted.
+//   - Combination semantics: cron ORs day-of-month with day-of-week when
+//     both are restricted ("0 0 1 * 1" = the 1st of the month *or* every
+//     Monday), while a single OnCalendar ANDs them. Two expressions cover
+//     it: systemd timers fire on any of their OnCalendar= lines, and a
+//     timer with both lines is exactly the union cron computes.
+func cronToCalendars(cron string) []string {
 	fields := strings.Fields(cron)
 	if len(fields) != 5 {
-		return cron
+		return []string{cron}
 	}
-	minute, hour, dom, month := fields[0], fields[1], fields[2], fields[3]
+	minute, hour, dom, month, dow := fields[0], fields[1], fields[2], fields[3], fields[4]
 
-	toSys := func(f string) string {
+	// Time fields: keep cron step syntax, rebased to 0 ("0/5" = start at 0,
+	// every 5 — the documented systemd shorthand for time components).
+	step0 := func(f string) string {
 		if f == "*" || f == "*/1" {
 			return "*"
 		}
-		// Convert */N → 0/N (systemd step syntax)
 		if strings.HasPrefix(f, "*/") {
 			return "0/" + f[2:]
 		}
 		return f
 	}
+	timeSpec := fmt.Sprintf("%s:%s:00", step0(hour), step0(minute))
 
-	return fmt.Sprintf("*-%s-%s %s:%s:00",
-		toSys(month), toSys(dom), toSys(hour), toSys(minute))
+	// Date fields: expand to explicit lists (unambiguous on every systemd;
+	// no per-field step-base to get wrong).
+	list := func(f string, min, max int) string {
+		if f == "*" {
+			return "*"
+		}
+		vals, err := expandCronField(f, min, max)
+		if err != nil {
+			return f // unreachable: validateCronSchedule rejects it first
+		}
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			parts[i] = strconv.Itoa(v)
+		}
+		return strings.Join(parts, ",")
+	}
+	dateSpec := fmt.Sprintf("*-%s-%s", list(month, 1, 12), list(dom, 1, 31))
+
+	// Day-of-week: expand, remap cron Sunday (0) to systemd 7, drop the
+	// prefix when all seven days are selected.
+	dowSpec := ""
+	if days, err := expandCronField(dow, 0, 7); err == nil {
+		set := make(map[int]bool, len(days))
+		for _, d := range days {
+			if d == 0 {
+				d = 7
+			}
+			set[d] = true
+		}
+		if len(set) < 7 {
+			parts := make([]string, 0, len(set))
+			for d := 1; d <= 7; d++ {
+				if set[d] {
+					parts = append(parts, strconv.Itoa(d))
+				}
+			}
+			dowSpec = strings.Join(parts, ",")
+		}
+	}
+
+	switch {
+	case dowSpec == "":
+		// No (or every) day-of-week: date alone.
+		return []string{dateSpec + " " + timeSpec}
+	case dom != "*" && dow != "*":
+		// Cron ORs the two restricted day fields; two OnCalendar lines
+		// produce the same union in systemd.
+		return []string{
+			dowSpec + " *-*-* " + timeSpec,
+			dateSpec + " " + timeSpec,
+		}
+	default:
+		return []string{dowSpec + " " + dateSpec + " " + timeSpec}
+	}
 }
 
 // Storage class constants recognised by q8s.

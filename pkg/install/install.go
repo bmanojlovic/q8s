@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -129,15 +130,63 @@ func installBinary(dst string) error {
 }
 
 // certsNeedRegen decides whether TLS certs must be regenerated: always when
-// they don't exist or --regenerate-certs was passed; otherwise only when the
-// merged SAN list differs from what was previously persisted. Unchanged SANs
-// on re-run must not mint a fresh identity.
-func certsNeedRegen(certsExist, force bool, merged, existing PersistentConfig) bool {
+// they don't exist or --regenerate-certs was passed; when the merged SAN
+// list differs from what was previously persisted; when any existing cert
+// fails to parse (truncated or corrupt file); or when the server cert
+// expires within certRenewWindow. Unchanged SANs on re-run must not mint a
+// fresh identity — but neither may `q8s install` keep saying "skipping
+// generation" while every client gets opaque TLS errors on an expired cert.
+func certsNeedRegen(dataDir string, certsExist, force bool, merged, existing PersistentConfig) bool {
 	if !certsExist || force {
 		return true
 	}
-	return !sameStrings(merged.ExtraSANIPs, existing.ExtraSANIPs) ||
-		!sameStrings(merged.ExtraSANDNS, existing.ExtraSANDNS)
+	if !sameStrings(merged.ExtraSANIPs, existing.ExtraSANIPs) ||
+		!sameStrings(merged.ExtraSANDNS, existing.ExtraSANDNS) {
+		return true
+	}
+	notAfter, err := certExpiry(filepath.Join(dataDir, "certs", "server.crt"))
+	if err != nil {
+		return true // unreadable/unparseable cert: safest is to regenerate
+	}
+	if remaining := time.Until(notAfter); remaining < certRenewWindow {
+		fmt.Printf("Server certificate expires in %s — regenerating.\n", remaining.Round(time.Hour))
+		return true
+	}
+	return false
+}
+
+// certRenewWindow is how close to expiry a certificate must be before
+// `q8s install` regenerates it.
+const certRenewWindow = 30 * 24 * time.Hour
+
+// certExpiry parses a PEM certificate file and returns its NotAfter.
+func certExpiry(path string) (time.Time, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return time.Time{}, fmt.Errorf("%s: no PEM block", path)
+	}
+	c, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return c.NotAfter, nil
+}
+
+// allCertsPresent reports whether every file q8s needs is on disk. Checking
+// only ca.crt would let a partial set (ca.crt present, server.crt missing
+// after a failed write) count as "certs exist", skip regeneration, and then
+// die at `q8s serve` reading the missing file.
+func allCertsPresent(dataDir string) bool {
+	for _, name := range []string{"ca.crt", "ca.key", "server.crt", "server.key", "client.crt", "client.key"} {
+		if _, err := os.Stat(filepath.Join(dataDir, "certs", name)); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // sameStrings reports whether two string slices contain the same set.
@@ -300,30 +349,24 @@ func Install(cfg InstallConfig) error {
 		addDNS(name)
 	}
 
-	// Persist config before anything else so SANs survive partial failures.
-	if err := SaveConfig(dataDir, pcfg); err != nil {
-		return fmt.Errorf("failed to write config.json: %w", err)
-	}
-
-	// Install binary to a well-known PATH location
-	binPath := binInstallPath(cfg.Rootful, cfg.Home)
-	if err := installBinary(binPath); err != nil {
-		return fmt.Errorf("failed to install binary to %s: %w", binPath, err)
-	}
-	fmt.Printf("Binary installed to %s\n", binPath)
-
 	// Generate TLS certs if they don't exist or regeneration is requested.
 	// Re-running install with an unchanged SAN list must not mint a fresh
 	// CA/client identity — callers that merge repeated kubeconfig fetches
 	// would otherwise accumulate stale, unusable entries under one context.
-	certsExist := false
-	if _, err := os.Stat(filepath.Join(dataDir, "certs", "ca.crt")); err == nil {
-		certsExist = true
-	}
+	//
+	// Certs are written BEFORE config.json is persisted: config.json records
+	// the SAN list that certsNeedRegen compares against, so saving it first
+	// would make a failed cert write (disk full, permissions) permanently
+	// suppress regeneration — every later run would see "SANs unchanged"
+	// and skip, leaving the new SAN missing from the server cert forever.
+	certsExist := allCertsPresent(dataDir)
 	certsRegenerated := false
-	if certsNeedRegen(certsExist, cfg.RegenerateCerts, pcfg, existing) {
-		certs := generateCerts(sanIPs, pcfg.ExtraSANDNS)
-		if err := writeCerts(dataDir, certs); err != nil {
+	if certsNeedRegen(dataDir, certsExist, cfg.RegenerateCerts, pcfg, existing) {
+		c, err := generateCerts(sanIPs, pcfg.ExtraSANDNS)
+		if err != nil {
+			return fmt.Errorf("failed to generate certs: %w", err)
+		}
+		if err := writeCerts(dataDir, c); err != nil {
 			return fmt.Errorf("failed to write certs: %w", err)
 		}
 		if certsExist {
@@ -336,9 +379,28 @@ func Install(cfg InstallConfig) error {
 		fmt.Println("TLS certificates already exist, skipping generation.")
 	}
 
+	// Persist config after certs succeeded (see above). A partial failure
+	// past this point loses nothing that the next `q8s install` won't redo.
+	if err := SaveConfig(dataDir, pcfg); err != nil {
+		return fmt.Errorf("failed to write config.json: %w", err)
+	}
+
+	// Install binary to a well-known PATH location
+	binPath := binInstallPath(cfg.Rootful, cfg.Home)
+	if err := installBinary(binPath); err != nil {
+		return fmt.Errorf("failed to install binary to %s: %w", binPath, err)
+	}
+	fmt.Printf("Binary installed to %s\n", binPath)
+
 	// Install systemd units
 	if err := installSystemdUnits(cfg); err != nil {
 		return fmt.Errorf("failed to install systemd units: %w", err)
+	}
+
+	// Rootless units live in the user manager, which stops at last logout
+	// unless lingering is enabled — that would take every workload down.
+	if !cfg.Rootful {
+		enableLinger()
 	}
 
 	// Restart service if certs were regenerated (so it picks up the new cert)
@@ -378,64 +440,105 @@ func Install(cfg InstallConfig) error {
 }
 
 type certs struct {
-	caCert    []byte
-	caKey     []byte
+	caCert     []byte
+	caKey      []byte
 	serverCert []byte
 	serverKey  []byte
 	clientCert []byte
 	clientKey  []byte
 }
 
-func generateCerts(extraIPs []net.IP, extraDNS []string) certs {
+func generateCerts(extraIPs []net.IP, extraDNS []string) (certs, error) {
+	return generateCertsValid(extraIPs, extraDNS, 365*24*time.Hour)
+}
+
+// generateCertsValid is generateCerts with an explicit validity (tests use
+// near-expiry certificates to exercise the renewal window).
+func generateCertsValid(extraIPs []net.IP, extraDNS []string, validity time.Duration) (certs, error) {
+	var c certs
+	// Random serials and checked errors: a failed keygen must fail the
+	// install (nil-deref panics otherwise), and per-RFC 5280 serials from
+	// a CA should be unpredictable.
+	newSerial := func() *big.Int {
+		limit := new(big.Int).Lsh(big.NewInt(1), 128)
+		n, err := rand.Int(rand.Reader, limit)
+		if err != nil {
+			return big.NewInt(1)
+		}
+		return n
+	}
+	// NotBefore backdated 5 minutes so a slightly-ahead server clock
+	// doesn't reject the cert as "not yet valid" in the very first seconds.
+	notBefore := time.Now().Add(-5 * time.Minute)
+	notAfter := time.Now().Add(validity)
+
 	// Generate CA
-	caPriv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	caPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return c, fmt.Errorf("generate CA key: %w", err)
+	}
 	caTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: newSerial(),
 		Subject: pkix.Name{
 			Organization: []string{"q8s"},
 			CommonName:   "q8s CA",
 		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 	}
-	caCertDER, _ := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caPriv.PublicKey, caPriv)
+	caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caPriv.PublicKey, caPriv)
+	if err != nil {
+		return c, fmt.Errorf("create CA cert: %w", err)
+	}
 
 	// Generate server cert
-	serverPriv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	serverPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return c, fmt.Errorf("generate server key: %w", err)
+	}
 	serverTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(2),
+		SerialNumber: newSerial(),
 		Subject: pkix.Name{
 			Organization: []string{"q8s"},
 			CommonName:   "q8s-server",
 		},
-		NotBefore:   time.Now(),
-		NotAfter:    time.Now().Add(365 * 24 * time.Hour),
+		NotBefore:   notBefore,
+		NotAfter:    notAfter,
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		IPAddresses: appendIPs(localIPs(), extraIPs),
 		DNSNames:    appendStrings(localDNSNames(), extraDNS),
 	}
-	serverCertDER, _ := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverPriv.PublicKey, caPriv)
+	serverCertDER, err := x509.CreateCertificate(rand.Reader, &serverTemplate, &caTemplate, &serverPriv.PublicKey, caPriv)
+	if err != nil {
+		return c, fmt.Errorf("create server cert: %w", err)
+	}
 
 	// Generate client cert
-	clientPriv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	clientPriv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return c, fmt.Errorf("generate client key: %w", err)
+	}
 	clientTemplate := x509.Certificate{
-		SerialNumber: big.NewInt(3),
+		SerialNumber: newSerial(),
 		Subject: pkix.Name{
 			Organization: []string{"q8s-user"},
 			CommonName:   "q8s-user",
 		},
-		NotBefore:   time.Now(),
-		NotAfter:    time.Now().Add(365 * 24 * time.Hour),
+		NotBefore:   notBefore,
+		NotAfter:    notAfter,
 		KeyUsage:    x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
-	clientCertDER, _ := x509.CreateCertificate(rand.Reader, &clientTemplate, &caTemplate, &clientPriv.PublicKey, caPriv)
+	clientCertDER, err := x509.CreateCertificate(rand.Reader, &clientTemplate, &caTemplate, &clientPriv.PublicKey, caPriv)
+	if err != nil {
+		return c, fmt.Errorf("create client cert: %w", err)
+	}
 
-	return certs{
+	c = certs{
 		caCert:     toPEMBlock("CERTIFICATE", caCertDER),
 		caKey:      marshalECDSA(caPriv),
 		serverCert: toPEMBlock("CERTIFICATE", serverCertDER),
@@ -443,6 +546,7 @@ func generateCerts(extraIPs []net.IP, extraDNS []string) certs {
 		clientCert: toPEMBlock("CERTIFICATE", clientCertDER),
 		clientKey:  marshalECDSA(clientPriv),
 	}
+	return c, nil
 }
 
 func toPEMBlock(typeStr string, derBytes []byte) []byte {
@@ -456,6 +560,10 @@ func marshalECDSA(priv *ecdsa.PrivateKey) []byte {
 
 func writeCerts(dataDir string, c certs) error {
 	certDir := filepath.Join(dataDir, "certs")
+	// 0700: this directory holds the CA and client private keys.
+	if err := os.MkdirAll(certDir, 0700); err != nil {
+		return err
+	}
 
 	files := map[string][]byte{
 		"ca.crt":     c.caCert,
@@ -563,7 +671,6 @@ WantedBy=multi-user.target
 	return nil
 }
 
-
 // localIPs returns the IPs for the server certificate SAN:
 // loopback (127.0.0.1, ::1) plus the default-route source IP.
 func localIPs() []net.IP {
@@ -589,7 +696,6 @@ func localDNSNames() []string {
 	}
 	return names
 }
-
 
 func appendIPs(base, extra []net.IP) []net.IP {
 	seen := make(map[string]bool, len(base))
@@ -617,17 +723,60 @@ func appendStrings(base, extra []string) []string {
 	return base
 }
 
-// normalizeServerURL ensures the server URL has an https:// scheme and a port.
+// normalizeServerURL ensures the server URL has an https:// scheme and a
+// port. Parses with net/url rather than string surgery: any colon (a URL
+// path, a query, an IPv6 literal) used to trip the "has a port" heuristic
+// and produce https://myhost/path:6443.
 func normalizeServerURL(raw string, port int) string {
 	if !strings.HasPrefix(raw, "https://") && !strings.HasPrefix(raw, "http://") {
 		raw = "https://" + raw
 	}
-	// If no port in the URL, append the configured port.
-	// A bare hostname like "https://myhost" has no colon after the host.
-	u := strings.TrimPrefix(raw, "https://")
-	u = strings.TrimPrefix(u, "http://")
-	if !strings.Contains(u, ":") {
-		raw = fmt.Sprintf("%s:%d", raw, port)
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw // unparseable input: leave it untouched, kubeconfig shows it verbatim
 	}
-	return raw
+	if u.Port() == "" {
+		u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(port))
+	}
+	return u.String()
+}
+
+// --- Linger (rootless unattended operation) ---
+//
+// In rootless mode everything q8s manages — the API socket, the service,
+// every quadlet container, every cron timer — is a systemd *user* unit.
+// systemd kills the whole user instance (KillUserProcesses semantics vary,
+// but the manager itself stops) when its last login session ends, unless
+// lingering is enabled for that user. Without linger, logging out of the
+// machine takes every workload down. Enabling it is therefore part of a
+// correct rootless install, not an optional nicety.
+
+// LingerEnabled reports whether lingering is enabled for the current user.
+// Returns an error when loginctl is unavailable or the state can't be read
+// (e.g. no systemd); callers treat that as "unknown" and say so.
+func LingerEnabled() (bool, error) {
+	uid := strconv.Itoa(os.Getuid())
+	out, err := exec.Command("loginctl", "show-user", uid, "-p", "Linger", "--value").Output()
+	if err != nil {
+		return false, fmt.Errorf("loginctl show-user: %w", err)
+	}
+	return strings.TrimSpace(string(out)) == "yes", nil
+}
+
+// enableLinger turns on lingering for the current user so rootless q8s keeps
+// running after logout. Modern systemd allows users to enable linger for
+// themselves via polkit; when that is denied, print the exact sudo command
+// instead of failing the install.
+func enableLinger() {
+	uid := strconv.Itoa(os.Getuid())
+	if on, err := LingerEnabled(); err == nil && on {
+		return // already enabled; idempotent
+	}
+	if err := exec.Command("loginctl", "enable-linger", uid).Run(); err != nil {
+		fmt.Printf("Warning: could not enable lingering (loginctl enable-linger: %v).\n", err)
+		fmt.Printf("Without lingering, logging out stops the rootless q8s server and all its containers.\n")
+		fmt.Printf("Enable it manually: sudo loginctl enable-linger %s\n", uid)
+		return
+	}
+	fmt.Println("Enabled lingering (user services keep running after logout).")
 }

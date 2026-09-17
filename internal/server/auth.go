@@ -13,21 +13,24 @@ type AuthMiddleware struct {
 }
 
 // NewAuthMiddleware creates an auth middleware with the given CA cert PEM data.
-// If caCert is nil or empty, auth is disabled (development mode).
-func NewAuthMiddleware(caCert []byte) *AuthMiddleware {
+// If caCert is nil or empty, auth is disabled (development mode). A non-empty
+// caCert that does not parse as a certificate is an error: silently disabling
+// client-cert verification because the CA file was truncated or corrupt would
+// fail open — the opposite of what an mTLS deployment expects.
+func NewAuthMiddleware(caCert []byte) (*AuthMiddleware, error) {
 	if len(caCert) == 0 {
-		return &AuthMiddleware{enabled: false}
+		return &AuthMiddleware{enabled: false}, nil
 	}
 
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caCert) {
-		return &AuthMiddleware{enabled: false}
+		return nil, fmt.Errorf("CA certificate is not parseable PEM")
 	}
 
 	return &AuthMiddleware{
 		caCertPool: pool,
 		enabled:    true,
-	}
+	}, nil
 }
 
 // Handler returns an HTTP middleware that validates client certificates.

@@ -6,6 +6,7 @@ Run: ./tests/smoke/runner.py [file.yaml ...]
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -14,6 +15,16 @@ import yaml
 
 CONTEXT = os.environ.get("Q8S_CONTEXT", "q8s")
 K = f"kubectl --context={CONTEXT}"
+
+# Portable assertion variables. The suite YAML uses ${Q8S_HOSTNAME} etc. so
+# it passes on any machine; each can be overridden via the environment.
+os.environ.setdefault("Q8S_HOSTNAME", socket.gethostname())
+os.environ.setdefault(
+    "Q8S_OS_IMAGE",
+    next((l.split("=", 1)[1].strip('"\'')
+          for l in open("/etc/os-release")
+          if l.startswith("PRETTY_NAME=")), "Linux").split()[0],
+)
 PASS = FAIL = SKIP = 0
 FAILURES = []
 GREEN = "\033[0;32m"
@@ -32,11 +43,14 @@ def kubectl(args, stdin=None, check=True):
 
 
 def curl(path, method="GET", data=None):
-    """Direct API call via curl with q8s certs."""
-    certs_dir = os.path.expanduser("~/.local/share/q8s/certs")
+    """Direct API call via curl with q8s certs (verified against the CA —
+    no -k, which would silently defeat the --cacert)."""
+    certs_dir = os.environ.get("Q8S_CERT_DIR",
+                               os.path.expanduser("~/.local/share/q8s/certs"))
+    port = os.environ.get("Q8S_PORT", "6443")
     cmd = [
-        "curl", "-sk",
-        f"https://localhost:6443{path}",
+        "curl", "-s",
+        f"https://localhost:{port}{path}",
         "-X", method,
         "--cert", f"{certs_dir}/client.crt",
         "--key", f"{certs_dir}/client.key",
@@ -74,7 +88,7 @@ def skip(name, reason):
 
 def run_kubectl(test):
     """Run a kubectl command, check exit code and optional assertions."""
-    args = test["kubectl"]
+    args = os.path.expandvars(test["kubectl"])
     stdin = None
     if "stdin" in test:
         stdin = test["stdin"]
@@ -92,14 +106,16 @@ def run_kubectl(test):
             ok = rc == 0
 
         if ok and "contains" in test:
-            ok = test["contains"] in out
+            want = os.path.expandvars(test["contains"])
+            ok = want in out
             if not ok:
-                return report(test["name"], False, f"missing '{test['contains']}' in output")
+                return report(test["name"], False, f"missing '{want}' in output")
 
         if ok and "not_contains" in test:
-            ok = test["not_contains"] not in out
+            avoid = os.path.expandvars(test["not_contains"])
+            ok = avoid not in out
             if not ok:
-                return report(test["name"], False, f"unexpected '{test['not_contains']}' in output")
+                return report(test["name"], False, f"unexpected '{avoid}' in output")
 
         report(test["name"], ok, err if not ok else "")
     except Exception as e:

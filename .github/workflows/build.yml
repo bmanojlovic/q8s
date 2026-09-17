@@ -16,13 +16,28 @@ jobs:
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # full history so `git describe` stamps real versions on tag builds
+          fetch-depth: 0
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
+      - name: fmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
       - name: vet
         run: go vet ./...
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@2026.2.1
+          staticcheck ./...
 
       - name: test
         run: go test ./...
@@ -40,6 +55,35 @@ jobs:
         with:
           name: q8s-linux-${{ matrix.goarch }}
           path: q8s-linux-${{ matrix.goarch }}
+
+  # End-to-end suite: real kubectl against a standalone `q8s serve` on an
+  # ephemeral port (Q8S_E2E_PORT default 16443 — never collides with an
+  # installed instance). The systemd socket-management section self-skips
+  # where no q8s is installed.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: install kubectl (checksum-verified)
+        run: |
+          KUBECTL_VERSION=v1.33.0
+          curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+          echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+      - name: build
+        run: go build -o /tmp/q8s-e2e ./cmd/q8s/
+
+      - name: run e2e
+        run: |
+          python3 -m pip install --user pexpect
+          python3 e2e_test.py
 
   release:
     if: startsWith(github.ref, 'refs/tags/')

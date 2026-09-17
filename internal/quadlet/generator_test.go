@@ -61,7 +61,11 @@ func TestContainerBasic(t *testing.T) {
 	assertContains(t, out, "Description=Pod nginx")
 	assertContains(t, out, "[Install]")
 	assertContains(t, out, "WantedBy=default.target")
-	assertNotContains(t, out, "[Service]")
+	// No explicit restartPolicy → k8s defaulting → Always → restarts.
+	// (The old assertion — no [Service] section at all — pinned the quadlet
+	// default on-failure fallback, which restarted "run once" pods.)
+	assertContains(t, out, "[Service]")
+	assertContains(t, out, "Restart=always")
 }
 
 func TestContainerEnvVars(t *testing.T) {
@@ -252,7 +256,20 @@ func TestContainerRestartPolicyNever(t *testing.T) {
 	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
 	out := mustContainer(t, pod, "")
 
+	// Never must be explicit: emitting nothing would fall back to the
+	// quadlet default on-failure, restarting a "run once" pod.
+	assertContains(t, out, "Restart=no")
 	assertNotContains(t, out, "Restart=on-failure")
+	assertNotContains(t, out, "Restart=always")
+}
+
+func TestContainerRestartPolicyEmptyIsAlways(t *testing.T) {
+	// Defensive: the API boundary defaults empty to Always, but the
+	// generator must not strand an empty policy as Never.
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.RestartPolicy = ""
+	out := mustContainer(t, pod, "")
+	assertContains(t, out, "Restart=always")
 }
 
 func TestContainerLivenessProbe(t *testing.T) {
@@ -413,6 +430,22 @@ func TestCronToOnCalendar(t *testing.T) {
 		{"0 0 1 * *", "OnCalendar=*-*-1 0:0:00"},
 		{"30 6 * * *", "OnCalendar=*-*-* 6:30:00"},
 		{"0 0 * 1 *", "OnCalendar=*-1-* 0:0:00"},
+
+		// day-of-week: cron 0-6 (0=Sun) maps to systemd 1-7 (1=Mon, 7=Sun)
+		{"30 2 * * 6", "OnCalendar=6 *-*-* 2:30:00"},         // Saturday
+		{"0 0 * * 1", "OnCalendar=1 *-*-* 0:0:00"},           // Monday
+		{"0 0 * * 0", "OnCalendar=7 *-*-* 0:0:00"},           // Sunday via 0
+		{"0 0 * * 7", "OnCalendar=7 *-*-* 0:0:00"},           // Sunday via 7
+		{"0 0 * * 1-5", "OnCalendar=1,2,3,4,5 *-*-* 0:0:00"}, // weekdays
+		{"0 0 * * */2", "OnCalendar=2,4,6,7 *-*-* 0:0:00"},   // 0,2,4,6 → Sun,Tue,Thu,Sat
+
+		// date fields expand to lists (1-based, so no 0/N steps)
+		{"0 0 */2 * *", "OnCalendar=*-*-1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31 0:0:00"},
+		{"0 0 * */2 *", "OnCalendar=*-1,3,5,7,9,11-* 0:0:00"},
+		{"0 0 1,15 * *", "OnCalendar=*-*-1,15 0:0:00"},
+
+		// dom+dow both restricted: cron ORs, so two OnCalendar lines
+		{"0 0 1 * 1", "OnCalendar=1 *-*-* 0:0:00\nOnCalendar=*-*-1 0:0:00"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.schedule, func(t *testing.T) {
@@ -753,4 +786,110 @@ func TestContainerAcceptsOrdinaryValues(t *testing.T) {
 	assertContains(t, out, "Image=docker.io/library/nginx:1.25-alpine")
 	assertContains(t, out, "WorkingDir=/usr/share/nginx/html")
 	assertContains(t, out, "Environment=APP_ENV=production")
+}
+
+// TestCronTimerRejectsOutOfRangeFields pins the up-front range validation:
+// "99 25 * * *" is not a valid cron schedule and must fail at API time, not
+// surface later as an opaque systemd timer load error at daemon-reload.
+func TestCronTimerRejectsOutOfRangeFields(t *testing.T) {
+	for _, schedule := range []string{
+		"60 * * * *",   // minute > 59
+		"* 24 * * *",   // hour > 23
+		"* * 32 * *",   // dom > 31
+		"* * * 13 *",   // month > 12
+		"* * * * 8",    // dow > 7
+		"5-70 * * * *", // range endpoint out of bounds
+		"10-5 * * * *", // descending range
+		"*/0 * * * *",  // zero step
+		"1,,2 * * * *", // empty list element
+	} {
+		cj := &batchv1.CronJob{
+			ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+			Spec:       batchv1.CronJobSpec{Schedule: schedule},
+		}
+		if _, err := quadlet.CronTimer(cj.Name, cj); err == nil {
+			t.Errorf("schedule %q: expected error, got none", schedule)
+		}
+	}
+}
+
+// TestContainerPublishPortHonorsHostIP: an explicit HostIP binds the
+// published port to one interface (the replica allocator uses 127.0.0.1);
+// without it the publish binds all interfaces, like k8s hostPort.
+func TestContainerPublishPortHonorsHostIP(t *testing.T) {
+	mkPod := func(hostIP string) *corev1.Pod {
+		pod := simplePod("default", "web", "nginx:latest")
+		pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{
+			ContainerPort: 8080,
+			HostPort:      20000,
+			HostIP:        hostIP,
+		}}
+		return pod
+	}
+
+	out, err := quadlet.Container("web", mkPod("127.0.0.1"), "", nil, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContains(t, string(out), "PublishPort=127.0.0.1:20000:8080/tcp")
+
+	out, err = quadlet.Container("web", mkPod(""), "", nil, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContains(t, string(out), "PublishPort=20000:8080/tcp")
+	if strings.Contains(string(out), "127.0.0.1:20000") {
+		t.Errorf("unexpected HostIP prefix without HostIP set:\n%s", out)
+	}
+}
+
+// --- generator name validation (import-path injection barrier) ---
+
+func TestContainerRejectsUnsafeNameAndNamespace(t *testing.T) {
+	// A newline in a label-derived pod name would open a new unit-file
+	// line/section; "../" traverses the output filename. The API boundary
+	// rejects these, but the Podman-label import path doesn't — the
+	// generator is the last line of defense.
+	for _, name := range []string{
+		"x\n[Service]\nExecStartPre=evil",
+		"../escape",
+		"-leading-dash",
+		"UpperCase",
+		"trailing-",
+	} {
+		pod := simplePod("default", name, "nginx:latest")
+		if _, err := quadlet.Container(name, pod, "", nil, nil, ""); err == nil {
+			t.Errorf("Container accepted unsafe name %q", name)
+		}
+	}
+	pod := simplePod("bad ns", "ok", "nginx:latest")
+	if _, err := quadlet.Container("ok", pod, "", nil, nil, ""); err == nil {
+		t.Error("Container accepted unsafe namespace")
+	}
+}
+
+func TestJobContainerRejectsUnsafeName(t *testing.T) {
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "x\nExecStart=evil", Namespace: "default"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
+		}}},
+	}
+	if _, err := quadlet.JobContainer(job.Name, job, "", nil, ""); err == nil {
+		t.Error("JobContainer accepted unsafe name")
+	}
+}
+
+func TestCronContainerRejectsUnsafeName(t *testing.T) {
+	cj := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "../../evil", Namespace: "default"},
+		Spec: batchv1.CronJobSpec{JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
+			}},
+		}}},
+	}
+	if _, err := quadlet.CronContainer(cj.Name, cj, "", nil, ""); err == nil {
+		t.Error("CronContainer accepted unsafe name")
+	}
 }

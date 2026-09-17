@@ -2,7 +2,7 @@ BINARY=q8s
 VERSION?=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: all build install test e2e vet clean
+.PHONY: all build install test e2e vet lint fmt clean
 
 all: vet build
 
@@ -25,6 +25,16 @@ e2e: build
 
 vet:
 	go vet ./...
+
+# Same checks CI runs: gofmt cleanliness + staticcheck. Falls back to a
+# warning if staticcheck is not installed locally.
+lint:
+	@unformatted=$$(gofmt -l .); if [ -n "$$unformatted" ]; then \
+		echo "these files need gofmt:"; echo "$$unformatted"; exit 1; fi
+	@if command -v staticcheck >/dev/null 2>&1; then \
+		staticcheck ./...; \
+	else \
+		echo "note: staticcheck not installed (go install honnef.co/go/tools/cmd/staticcheck@2026.2.1)"; fi
 
 fmt:
 	go fmt ./...

@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/server"
@@ -1676,7 +1678,6 @@ func TestUnknownResource(t *testing.T) {
 	resp.Body.Close()
 }
 
-
 // --- StorageClasses ---
 
 func TestStorageClassList(t *testing.T) {
@@ -1723,4 +1724,825 @@ func TestStorageClassGetNotFound(t *testing.T) {
 	resp := get(t, ts.URL+"/apis/storage.k8s.io/v1/storageclasses/nonexistent")
 	assertStatus(t, resp, 404)
 	resp.Body.Close()
+}
+
+// TestIngressRejectsBacktickAndQuoteInPath pins the charset fix: the path is
+// spliced into a Traefik PathPrefix(`...`) rule and a YAML double-quoted
+// scalar, so a backtick or quote breaks out of its enclosing context and
+// injects rule/config syntax.
+func TestIngressRejectsBacktickAndQuoteInPath(t *testing.T) {
+	for _, bad := range []string{"/x` || Host(`evil.example`)", `/x" && anything`} {
+		ts, _ := newTestServer(t)
+		body := ingressBody("default", "badpath", "example.com", "myservice", 80)
+		spec := body["spec"].(map[string]interface{})
+		rule := spec["rules"].([]interface{})[0].(map[string]interface{})
+		p := rule["http"].(map[string]interface{})["paths"].([]interface{})[0].(map[string]interface{})
+		p["path"] = bad
+
+		resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", body)
+		assertStatus(t, resp, 400)
+		resp.Body.Close()
+		ts.Close()
+	}
+}
+
+// TestIngressNilBackendSkippedInTraefikConfig pins the nil-backend guard: an
+// Ingress path without a Service backend used to panic inside
+// generateTraefikConfig after the object was stored, leaving the client with
+// a dropped connection and a half-created Ingress.
+func TestIngressNilBackendSkippedInTraefikConfig(t *testing.T) {
+	traefikDir := t.TempDir()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:      store.New(),
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		TraefikDir: traefikDir,
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	// One rule with a valid path and one with no backend at all.
+	body := map[string]interface{}{
+		"apiVersion": "networking.k8s.io/v1",
+		"kind":       "Ingress",
+		"metadata":   map[string]interface{}{"name": "mixed", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"rules": []interface{}{
+				map[string]interface{}{
+					"host": "example.com",
+					"http": map[string]interface{}{
+						"paths": []interface{}{
+							map[string]interface{}{
+								"path":     "/valid",
+								"pathType": "Prefix",
+								"backend":  map[string]interface{}{},
+							},
+							map[string]interface{}{
+								"path":     "/real",
+								"pathType": "Prefix",
+								"backend": map[string]interface{}{
+									"service": map[string]interface{}{
+										"name": "svc",
+										"port": map[string]interface{}{"number": 80},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg, err := os.ReadFile(filepath.Join(traefikDir, "default-mixed.yaml"))
+	if err != nil {
+		t.Fatalf("traefik config not written: %v", err)
+	}
+	if strings.Contains(string(cfg), "/valid") {
+		t.Errorf("nil-backend path leaked into traefik config:\n%s", cfg)
+	}
+	if !strings.Contains(string(cfg), "/real") {
+		t.Errorf("valid path missing from traefik config:\n%s", cfg)
+	}
+}
+
+// --- auth ---
+
+// TestServerRejectsUnparseableCA pins fail-closed auth: a corrupt CA PEM must
+// abort server startup, not silently disable client-cert verification.
+func TestServerRejectsUnparseableCA(t *testing.T) {
+	certPEM, keyPEM := genTestCert(t)
+	_, err := server.New(server.Config{
+		Store:   store.New(),
+		CACert:  []byte("this is not a certificate"),
+		CertPEM: certPEM,
+		KeyPEM:  keyPEM,
+	})
+	if err == nil {
+		t.Fatal("expected error for unparseable CA PEM, got none")
+	}
+	if !strings.Contains(err.Error(), "CA certificate") {
+		t.Errorf("error should mention the CA certificate, got: %v", err)
+	}
+}
+
+// TestPatchCannotRenameAcrossNamespace pins the PATCH identity check: a
+// merge patch that changes metadata.namespace (or name) must be rejected
+// instead of silently re-keying the stored object — or, when a same-named
+// object exists at the target identity, overwriting that other object.
+func TestPatchCannotRenameAcrossNamespace(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	// Create configmaps: default/steal-me and other/innocent.
+	for _, name := range []string{"steal-me", "innocent"} {
+		ns := "default"
+		if name == "innocent" {
+			ns = "other"
+		}
+		body := map[string]interface{}{
+			"apiVersion": "v1", "kind": "ConfigMap",
+			"metadata": map[string]interface{}{"name": name, "namespace": ns},
+			"data":     map[string]interface{}{"k": "v"},
+		}
+		resp := post(t, ts.URL+"/api/v1/namespaces/"+ns+"/configmaps", body)
+		assertStatus(t, resp, http.StatusCreated)
+		resp.Body.Close()
+	}
+
+	// PATCH default/steal-me to claim other/innocent's identity.
+	patch := []byte(`{"metadata":{"namespace":"other","name":"innocent"}}`)
+	req, _ := http.NewRequest(http.MethodPatch,
+		ts.URL+"/api/v1/namespaces/default/configmaps/steal-me", bytes.NewReader(patch))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+
+	// other/innocent must be untouched and default/steal-me must still exist.
+	for _, check := range []struct{ url, name string }{
+		{ts.URL + "/api/v1/namespaces/other/configmaps/innocent", "innocent"},
+		{ts.URL + "/api/v1/namespaces/default/configmaps/steal-me", "steal-me"},
+	} {
+		resp, err := http.Get(check.url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		assertStatus(t, resp, http.StatusOK)
+		var cm corev1.ConfigMap
+		if err := json.NewDecoder(resp.Body).Decode(&cm); err != nil {
+			t.Fatal(err)
+		}
+		if cm.Name != check.name {
+			t.Errorf("object at %s was renamed to %q", check.url, cm.Name)
+		}
+	}
+}
+
+// --- Ingress selector-based endpoints ---
+
+// ingressTestServer builds a server with a TraefikDir and returns its URL.
+func ingressTestServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	traefikDir := t.TempDir()
+	// QuadletDir must be set: deployment instance pods (which carry the
+	// allocated replica ports) are only materialized when quadlet
+	// generation runs.
+	quadletDir := t.TempDir()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:      store.New(),
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		TraefikDir: traefikDir,
+		QuadletDir: quadletDir,
+		ConfigDir:  filepath.Join(t.TempDir(), "configmaps"),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	return ts, traefikDir
+}
+
+func postPodWithPort(t *testing.T, url, ns, name string, labels map[string]string, containerPort, hostPort int32) {
+	t.Helper()
+	body := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Pod",
+		"metadata": map[string]interface{}{"name": name, "namespace": ns, "labels": labels},
+		"spec": map[string]interface{}{
+			"containers": []interface{}{map[string]interface{}{
+				"name":  "c",
+				"image": "nginx",
+				"ports": []interface{}{map[string]interface{}{
+					"containerPort": containerPort,
+					"hostPort":      hostPort,
+				}},
+			}},
+		},
+	}
+	resp := post(t, url+"/api/v1/namespaces/"+ns+"/pods", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+}
+
+func readTraefikConfig(t *testing.T, dir, ns, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, ns+"-"+name+".yaml"))
+	if err != nil {
+		t.Fatalf("read traefik config: %v", err)
+	}
+	return string(b)
+}
+
+// TestIngressEndpointsFromSelectorPods: a Service selector resolves to every
+// matching pod, each contributing its own hostPort — different ports per pod
+// are fine, exactly like k8s Endpoints.
+func TestIngressEndpointsFromSelectorPods(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+
+	// Three standalone pods, same labels, distinct hostPorts.
+	for i, hp := range []int32{20001, 20002, 20003} {
+		postPodWithPort(t, ts.URL, "default", fmt.Sprintf("web-%d", i),
+			map[string]string{"app": "web"}, 8080, hp)
+	}
+
+	// Service selecting them, with a targetPort.
+	svc := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": map[string]interface{}{"name": "web", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"selector": map[string]string{"app": "web"},
+			"ports":    []interface{}{map[string]interface{}{"port": 80, "targetPort": 8080}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", svc)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses",
+		ingressBody("default", "web", "example.com", "web", 80))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "web")
+	for _, want := range []string{
+		`- url: "http://127.0.0.1:20001"`,
+		`- url: "http://127.0.0.1:20002"`,
+		`- url: "http://127.0.0.1:20003"`,
+	} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("missing server %s in:\n%s", want, cfg)
+		}
+	}
+	if strings.Contains(cfg, "localhost") {
+		t.Errorf("fallback localhost URL leaked into selector-resolved config:\n%s", cfg)
+	}
+}
+
+// TestIngressSkipsPodsWithoutHostPort: pods that publish nothing are not
+// addressable by an on-host Traefik and must be left out of the server list.
+func TestIngressSkipsPodsWithoutHostPort(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+
+	postPodWithPort(t, ts.URL, "default", "pub", map[string]string{"app": "web"}, 8080, 20010)
+	// containerPort only — no hostPort.
+	body := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Pod",
+		"metadata": map[string]interface{}{"name": "dark", "namespace": "default", "labels": map[string]string{"app": "web"}},
+		"spec": map[string]interface{}{
+			"containers": []interface{}{map[string]interface{}{
+				"name": "c", "image": "nginx",
+				"ports": []interface{}{map[string]interface{}{"containerPort": 8080}},
+			}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	svc := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": map[string]interface{}{"name": "web", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"selector": map[string]string{"app": "web"},
+			"ports":    []interface{}{map[string]interface{}{"port": 80, "targetPort": 8080}},
+		},
+	}
+	resp = post(t, ts.URL+"/api/v1/namespaces/default/services", svc)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses",
+		ingressBody("default", "web", "example.com", "web", 80))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "web")
+	if !strings.Contains(cfg, `http://127.0.0.1:20010`) {
+		t.Errorf("published pod missing from config:\n%s", cfg)
+	}
+	if got := strings.Count(cfg, "- url:"); got != 1 {
+		t.Errorf("expected exactly 1 server, got %d:\n%s", got, cfg)
+	}
+}
+
+// TestIngressFallbackWithoutService: no Service (or none with reachable
+// pods) falls back to the ingress-declared port on localhost.
+func TestIngressFallbackWithoutService(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses",
+		ingressBody("default", "lonely", "example.com", "nosuch", 8080))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "lonely")
+	if !strings.Contains(cfg, `- url: "http://localhost:8080"`) {
+		t.Errorf("fallback URL missing:\n%s", cfg)
+	}
+}
+
+// TestIngressRegeneratesOnPodChurn: creating a selector-matching pod (or
+// deleting one) rewrites the Traefik config, so the servers list tracks
+// reality the way Endpoints do.
+func TestIngressRegeneratesOnPodChurn(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+
+	svc := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": map[string]interface{}{"name": "web", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"selector": map[string]string{"app": "web"},
+			"ports":    []interface{}{map[string]interface{}{"port": 80, "targetPort": 8080}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", svc)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses",
+		ingressBody("default", "web", "example.com", "web", 80))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	// Before any pod: fallback.
+	cfg := readTraefikConfig(t, traefikDir, "default", "web")
+	if !strings.Contains(cfg, "localhost:80") {
+		t.Errorf("expected fallback before pods exist:\n%s", cfg)
+	}
+
+	// Create a matching pod -> config picks up its hostPort.
+	postPodWithPort(t, ts.URL, "default", "web-0", map[string]string{"app": "web"}, 8080, 20077)
+	cfg = readTraefikConfig(t, traefikDir, "default", "web")
+	if !strings.Contains(cfg, "127.0.0.1:20077") {
+		t.Errorf("pod create did not regenerate config:\n%s", cfg)
+	}
+
+	// Delete it -> back to fallback.
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/namespaces/default/pods/web-0", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	cfg = readTraefikConfig(t, traefikDir, "default", "web")
+	if strings.Contains(cfg, "20077") {
+		t.Errorf("pod delete did not regenerate config:\n%s", cfg)
+	}
+}
+
+// TestIngressNamedTargetPort: a string targetPort resolves through the
+// container port name, not just numbers.
+func TestIngressNamedTargetPort(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+
+	body := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Pod",
+		"metadata": map[string]interface{}{"name": "named", "namespace": "default", "labels": map[string]string{"app": "web"}},
+		"spec": map[string]interface{}{
+			"containers": []interface{}{map[string]interface{}{
+				"name":  "c",
+				"image": "nginx",
+				"ports": []interface{}{map[string]interface{}{
+					"name": "http", "containerPort": 8080, "hostPort": 20090,
+				}},
+			}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	svc := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": map[string]interface{}{"name": "web", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"selector": map[string]string{"app": "web"},
+			"ports":    []interface{}{map[string]interface{}{"port": 80, "targetPort": "http"}},
+		},
+	}
+	resp = post(t, ts.URL+"/api/v1/namespaces/default/services", svc)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses",
+		ingressBody("default", "web", "example.com", "web", 80))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "web")
+	if !strings.Contains(cfg, "127.0.0.1:20090") {
+		t.Errorf("named targetPort not resolved:\n%s", cfg)
+	}
+}
+
+// --- Deployment replica ports through Traefik (kube-proxy emulation) ---
+
+func postDeployment(t *testing.T, url, ns, name string, replicas int, labels map[string]string) {
+	t.Helper()
+	n := int32(replicas)
+	body := map[string]interface{}{
+		"apiVersion": "apps/v1", "kind": "Deployment",
+		"metadata": map[string]interface{}{"name": name, "namespace": ns},
+		"spec": map[string]interface{}{
+			"replicas": n,
+			"selector": map[string]interface{}{"matchLabels": labels},
+			"template": map[string]interface{}{
+				"metadata": map[string]interface{}{"labels": labels},
+				"spec": map[string]interface{}{
+					"containers": []interface{}{map[string]interface{}{
+						"name": "c", "image": "nginx",
+						"ports": []interface{}{map[string]interface{}{"containerPort": 8080}},
+					}},
+				},
+			},
+		},
+	}
+	resp := post(t, url+"/apis/apps/v1/namespaces/"+ns+"/deployments", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+}
+
+func patchDeploymentScale(t *testing.T, url, ns, name string, replicas int) {
+	t.Helper()
+	body := []byte(fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas))
+	req, _ := http.NewRequest(http.MethodPatch,
+		url+"/apis/apps/v1/namespaces/"+ns+"/deployments/"+name+"/scale", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("scale patch: %s", resp.Status)
+	}
+}
+
+func countTraefikServers(t *testing.T, dir, ns, name string) (int, []string) {
+	t.Helper()
+	cfg := readTraefikConfig(t, dir, ns, name)
+	var urls []string
+	for _, line := range strings.Split(cfg, "\n") {
+		if strings.Contains(line, "- url:") {
+			urls = append(urls, strings.TrimSpace(line))
+		}
+	}
+	return len(urls), urls
+}
+
+// TestDeploymentReplicasLoadBalancedThroughTraefik is the full
+// kube-proxy-emulation scenario: one Deployment, N replicas, one Service,
+// one Ingress — and a Traefik servers list with one loopback URL per
+// replica, each on its own allocated port.
+func TestDeploymentReplicasLoadBalancedThroughTraefik(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+
+	postDeployment(t, ts.URL, "default", "web", 3, map[string]string{"app": "web"})
+
+	svc := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": map[string]interface{}{"name": "web", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"selector": map[string]string{"app": "web"},
+			"ports":    []interface{}{map[string]interface{}{"port": 80, "targetPort": 8080}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", svc)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses",
+		ingressBody("default", "web", "example.com", "web", 80))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	n, urls := countTraefikServers(t, traefikDir, "default", "web")
+	if n != 3 {
+		t.Fatalf("expected 3 servers (one per replica), got %d:\n%s", n, urls)
+	}
+	seen := map[string]bool{}
+	for _, u := range urls {
+		if seen[u] {
+			t.Errorf("duplicate server %s", u)
+		}
+		seen[u] = true
+		if !strings.Contains(u, "127.0.0.1:") {
+			t.Errorf("server not loopback-bound: %s", u)
+		}
+	}
+
+	// Scale down to 1: the servers list shrinks.
+	patchDeploymentScale(t, ts.URL, "default", "web", 1)
+	n, _ = countTraefikServers(t, traefikDir, "default", "web")
+	if n != 1 {
+		t.Fatalf("expected 1 server after scale-down, got %d", n)
+	}
+
+	// Scale back to 3: three distinct servers again (freed ports reused).
+	patchDeploymentScale(t, ts.URL, "default", "web", 3)
+	n, urls = countTraefikServers(t, traefikDir, "default", "web")
+	if n != 3 {
+		t.Fatalf("expected 3 servers after scale-up, got %d: %v", n, urls)
+	}
+
+	// Delete the deployment: back to the localhost fallback.
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/apis/apps/v1/namespaces/default/deployments/web", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "web")
+	if strings.Contains(cfg, "127.0.0.1:2") {
+		t.Errorf("allocated ports still present after deployment delete:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "localhost:80") {
+		t.Errorf("expected fallback after deployment delete:\n%s", cfg)
+	}
+}
+
+// TestServiceCRUDWritesNoUnitFiles pins the removal of the dead Service
+// ".socket" feature: Service ports are a port map (DNS aliases + ingress
+// backends), never a host binding. Creating, patching, or deleting a
+// Service must not leave any unit file behind.
+func TestServiceCRUDWritesNoUnitFiles(t *testing.T) {
+	quadletDir := t.TempDir()
+	st := store.New()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:      st,
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		QuadletDir: quadletDir,
+		ConfigDir:  filepath.Join(t.TempDir(), "configmaps"),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	svc := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": map[string]interface{}{"name": "web", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"selector": map[string]string{"app": "web"},
+			"ports":    []interface{}{map[string]interface{}{"port": 80, "targetPort": 8080}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", svc)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	patch := []byte(`{"spec":{"ports":[{"port":8081,"targetPort":8080}]}}`)
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/namespaces/default/services/web", bytes.NewReader(patch))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	entries, err := os.ReadDir(quadletDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		for _, e := range entries {
+			t.Errorf("Service CRUD wrote unexpected file: %s", e.Name())
+		}
+	}
+
+	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/namespaces/default/services/web", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+}
+
+// --- hardening: body limit + WS frame cap ---
+
+// TestRequestBodyLimitRejects413: a body over the cap must get a clean 413
+// Status, not an OOM or a hung connection.
+func TestRequestBodyLimitRejects413(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	// ~4MB of ConfigMap data.
+	big := strings.Repeat("x", (4<<20)+16)
+	body, _ := json.Marshal(map[string]interface{}{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]interface{}{"name": "big", "namespace": "default"},
+		"data":     map[string]string{"k": big},
+	})
+	resp, err := http.Post(ts.URL+"/api/v1/namespaces/default/configmaps", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %s", resp.Status)
+	}
+
+	// Same via PATCH (readBody path). First create a small configmap.
+	small, _ := json.Marshal(map[string]interface{}{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]interface{}{"name": "small", "namespace": "default"},
+		"data":     map[string]string{"a": "b"},
+	})
+	resp2, err := http.Post(ts.URL+"/api/v1/namespaces/default/configmaps", "application/json", bytes.NewReader(small))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+
+	patchBody := bytes.Repeat([]byte("x"), (4<<20)+16)
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/namespaces/default/configmaps/small", bytes.NewReader(patchBody))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp3, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp3.Body.Close()
+	if resp3.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("PATCH: expected 413, got %s", resp3.Status)
+	}
+}
+
+// --- pod PATCH dry-run + materialization events ---
+
+// TestPodPatchRejectsUnrenderableSpec: a patch that would corrupt the
+// generated unit file must 400, not 200-while-runtime-keeps-old-spec.
+func TestPodPatchRejectsUnrenderableSpec(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	// Valid pod.
+	body := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Pod",
+		"metadata": map[string]interface{}{"name": "p1", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"containers": []interface{}{map[string]interface{}{"name": "c", "image": "nginx:latest"}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	// Patch the image to one that breaks unit-file rendering.
+	patch := []byte(`{"spec":{"containers":[{"name":"c","image":"nginx\n[Service]\nExecStartPre=evil"}]}}`)
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/namespaces/default/pods/p1", bytes.NewReader(patch))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unrenderable patch, got %s", resp.Status)
+	}
+}
+
+// TestPodMaterializationFailureRecordsEvent: a pod whose env references a
+// missing secret is accepted (k8s allows creating pod before its secret),
+// but the failure to materialize it must surface as a Warning event —
+// visible via kubectl describe — instead of only the server log.
+func TestPodMaterializationFailureRecordsEvent(t *testing.T) {
+	quadletDir := t.TempDir()
+	st := store.New()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:      st,
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		QuadletDir: quadletDir,
+		ConfigDir:  filepath.Join(t.TempDir(), "configmaps"),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Pod",
+		"metadata": map[string]interface{}{"name": "needsec", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"containers": []interface{}{map[string]interface{}{
+				"name": "c", "image": "nginx:latest",
+				"env": []interface{}{map[string]interface{}{
+					"name": "PW",
+					"valueFrom": map[string]interface{}{
+						"secretKeyRef": map[string]interface{}{"name": "no-such", "key": "pw"},
+					},
+				}},
+			}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	// The Warning event must be in the events feed.
+	resp, err = http.Get(ts.URL + "/api/v1/namespaces/default/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "MaterializationFailed") {
+		t.Errorf("expected MaterializationFailed event, got:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "no-such") {
+		t.Errorf("event should mention the missing secret, got:\n%s", raw)
+	}
+}
+
+// --- deletecollection ---
+
+// TestDeleteCollectionPodsAndDeployments pins the deletecollection verb
+// discovery advertises: DELETE on the collection path removes every object
+// in the namespace (kubectl delete pods --all / deployments --all).
+func TestDeleteCollectionPodsAndDeployments(t *testing.T) {
+	quadletDir := t.TempDir()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:      store.New(),
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		QuadletDir: quadletDir,
+		ConfigDir:  filepath.Join(t.TempDir(), "configmaps"),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	// Two pods + two deployments.
+	for i := 0; i < 2; i++ {
+		body := map[string]interface{}{
+			"apiVersion": "v1", "kind": "Pod",
+			"metadata": map[string]interface{}{"name": fmt.Sprintf("p%d", i), "namespace": "default"},
+			"spec": map[string]interface{}{
+				"containers": []interface{}{map[string]interface{}{"name": "c", "image": "nginx:latest"}},
+			},
+		}
+		resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", body)
+		assertStatus(t, resp, http.StatusCreated)
+		resp.Body.Close()
+		postDeployment(t, ts.URL, "default", fmt.Sprintf("d%d", i), 1, map[string]string{"app": "d"})
+	}
+
+	// Collection-delete pods.
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/namespaces/default/pods", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp, _ = http.Get(ts.URL + "/api/v1/namespaces/default/pods")
+	var list corev1.PodList
+	json.NewDecoder(resp.Body).Decode(&list)
+	resp.Body.Close()
+	if len(list.Items) != 0 {
+		t.Errorf("expected 0 pods after collection delete, got %d", len(list.Items))
+	}
+
+	// Collection-delete deployments.
+	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/apis/apps/v1/namespaces/default/deployments", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp, _ = http.Get(ts.URL + "/apis/apps/v1/namespaces/default/deployments")
+	var deps appsv1.DeploymentList
+	json.NewDecoder(resp.Body).Decode(&deps)
+	resp.Body.Close()
+	if len(deps.Items) != 0 {
+		t.Errorf("expected 0 deployments after collection delete, got %d", len(deps.Items))
+	}
 }
