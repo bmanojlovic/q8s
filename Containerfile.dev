@@ -1,0 +1,7 @@
+# Minimal OCI wrapper to ship the q8s host binary as a container artifact
+# through the local zot registry. Not a runnable service image — it's a
+# transport for the static binary; extract it with:
+#   podman create --name x truenas.steki.org:30080/q8s:dev && \
+#   podman cp x:/q8s ./q8s && podman rm x
+FROM scratch
+COPY q8s /q8s
