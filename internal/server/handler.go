@@ -1054,6 +1054,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		normalizeSecret(&secret)
 		created, err := s.config.Store.CreateSecret(&secret)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -1109,6 +1110,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		normalizeSecret(&patched)
 		updated, err := s.config.Store.UpdateSecret(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -3073,6 +3075,27 @@ func (s *Server) secretBaseDir() string {
 	return filepath.Join(filepath.Dir(s.config.ConfigDir), "secrets")
 }
 
+// normalizeSecret folds StringData into Data the way the Kubernetes API
+// server does: each StringData entry is base64-less raw text that becomes a
+// Data ([]byte) entry, StringData wins on key conflicts, and StringData is
+// then cleared so Data is the single source of truth. Without this, a Secret
+// created with only stringData (e.g. Terraform's tls_self_signed_cert PEMs)
+// keeps its real content solely in StringData — which the store persists but
+// restoreSecretFiles (Data-only) can't rewrite after a restart, silently
+// emptying the on-disk files. See tic-b31a.
+func normalizeSecret(sec *corev1.Secret) {
+	if len(sec.StringData) == 0 {
+		return
+	}
+	if sec.Data == nil {
+		sec.Data = make(map[string][]byte, len(sec.StringData))
+	}
+	for k, v := range sec.StringData {
+		sec.Data[k] = []byte(v)
+	}
+	sec.StringData = nil
+}
+
 func (s *Server) writeSecretFiles(sec *corev1.Secret) {
 	secretDir := s.secretBaseDir()
 	if secretDir == "" {
@@ -3083,13 +3106,10 @@ func (s *Server) writeSecretFiles(sec *corev1.Secret) {
 		fmt.Printf("secret dir %s: %v\n", dir, err)
 		return
 	}
+	// Data is the single source of truth — StringData is folded into it by
+	// normalizeSecret before the object is ever stored.
 	for k, v := range sec.Data {
 		if err := os.WriteFile(filepath.Join(dir, k), v, 0600); err != nil {
-			fmt.Printf("write secret %s/%s/%s: %v\n", sec.Namespace, sec.Name, k, err)
-		}
-	}
-	for k, v := range sec.StringData {
-		if err := os.WriteFile(filepath.Join(dir, k), []byte(v), 0600); err != nil {
 			fmt.Printf("write secret %s/%s/%s: %v\n", sec.Namespace, sec.Name, k, err)
 		}
 	}
