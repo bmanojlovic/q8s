@@ -120,6 +120,50 @@ So `127/8` is the right primitive for host-originated traffic, but assuming the
 same address works transparently from inside a container is the trap: that hop
 still needs a translation, which is the heavier networking layer.
 
+## What aardvark already gives us rootless (verified)
+
+Tested live, rootless, netavark backend, podman 6.0.2 — because the
+pod→pod-by-name path is what most of "service endpoints" actually means and it
+changes what the machinery above is *for*:
+
+- q8s already puts each pod on a per-namespace bridge (`q8s-<ns>.network`) and
+  adds each matching Service name as a `NetworkAlias` on the backing
+  container. The `.network` quadlet sets nothing special; netavark enables
+  aardvark-dns by default (`DNSEnabled=true`).
+- **Verified:** a container with `--network-alias mysvc` is resolvable by name
+  from another container on the same bridge, rootless (`mysvc → 10.89.0.2` via
+  aardvark at `10.89.0.1:53`). So **pod → Service-by-name already works
+  rootless today, with none of the loopback/Traefik machinery.**
+- **Verified (multi-backend):** three containers all sharing one alias
+  `websvc` → `nslookup websvc` returns **all three** A records
+  (`10.89.0.2/.3/.4`). The full Endpoints set is represented in DNS.
+- **Verified (the catch):** the answer order is **stable, not rotated** —
+  four separate lookups all returned `10.89.0.2` first. aardvark is a service
+  *directory*, **not a load balancer**. A client that honors multiple A
+  records and picks/iterates spreads load; a first-record client (very common:
+  many DB drivers, naive TCP clients) **pins to one replica with no failover**.
+  This is exactly why real k8s does not use DNS for ClusterIP LB.
+
+Consequence for this design — three tiers, only the third needs new machinery:
+
+1. **Single-backend Service** — aardvark alias resolves the name to the one
+   pod. Solved, rootless, zero machinery. The majority case (pgvector, single
+   API pods).
+2. **Multi-backend, DNS-multi-record-aware client** — aardvark exposes all
+   endpoints; a client that uses them all gets best-effort spread. Free, but
+   client-dependent and not health-aware.
+3. **Multi-backend needing real, health-aware load balancing** — aardvark's
+   stable ordering pins first-record clients, so this genuinely needs a proxy
+   in the path (scope 2). This is the *only* case the proxy earns its keep for
+   in-cluster service traffic.
+
+So "use aardvark for service endpoints" is correct as **service discovery**
+(and fully solves the single-backend case), but it is **not** a load balancer.
+The loopback scheme (scope 1) and the Traefik proxy (scope 2) are therefore
+primarily for (a) host-originated access to a service *address*, and (b) real
+multi-replica load balancing — not for the everyday pod→service-by-name path,
+which already works.
+
 ## Traefik as the unprivileged kube-proxy (both modes)
 
 The intended model for load-balanced Services: **Traefik is the fake
