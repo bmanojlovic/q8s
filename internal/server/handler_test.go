@@ -695,6 +695,71 @@ func TestReconcileSweepsOrphanedSockets(t *testing.T) {
 	}
 }
 
+// TestRestoreEnvFilesRerendersAfterWipe pins tic-1507: the per-pod
+// Secret-derived _env/*.env files live on tmpfs and are wiped on a q8s-api
+// restart, but the quadlet units' ExecStart --env-file depends on them.
+// RestoreEnvFiles must re-render them on startup for stored workloads, even
+// though the .container files already exist (so ReconcileQuadlets skips them).
+func TestRestoreEnvFilesRerendersAfterWipe(t *testing.T) {
+	certPEM, keyPEM := genTestCert(t)
+	base := t.TempDir()
+	st := store.New()
+	srv, err := server.New(server.Config{
+		Store:      st,
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		QuadletDir: t.TempDir(),
+		ConfigDir:  filepath.Join(base, "configmaps"),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+
+	if _, err := st.CreateSecret(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "appsecret", Namespace: "default"},
+		Data:       map[string][]byte{"API_KEY": []byte("s3cr3t")},
+	}); err != nil {
+		t.Fatalf("CreateSecret: %v", err)
+	}
+	replicas := int32(1)
+	if _, err := st.CreateDeployment(&appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "envapp", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "envapp"}},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name:  "c",
+					Image: "busybox",
+					Env: []corev1.EnvVar{{
+						Name: "API_KEY",
+						ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "appsecret"},
+							Key:                  "API_KEY",
+						}},
+					}},
+				}}},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	envPath := filepath.Join(base, "secrets", "default", "_env", "envapp-0.env")
+	// Simulate the tmpfs wipe: ensure it's absent before restore.
+	os.RemoveAll(filepath.Join(base, "secrets", "default", "_env"))
+
+	srv.RestoreEnvFiles()
+
+	got, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("env file not re-rendered on restore: %v", err)
+	}
+	if want := "API_KEY=s3cr3t\n"; string(got) != want {
+		t.Errorf("env file = %q, want %q", got, want)
+	}
+}
+
 // --- ConfigMap ---
 
 func TestConfigMapCRUD(t *testing.T) {

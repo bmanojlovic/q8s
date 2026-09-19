@@ -59,6 +59,9 @@ func TestContainerBasic(t *testing.T) {
 	assertContains(t, out, "Label=io.kubernetes.pod.namespace=default")
 	assertContains(t, out, "[Unit]")
 	assertContains(t, out, "Description=Pod nginx")
+	// Ordered after q8s-api so a reboot doesn't race the --env-file target
+	// q8s re-renders on startup (tic-1507).
+	assertContains(t, out, "After=q8s-api.service")
 	assertContains(t, out, "[Install]")
 	assertContains(t, out, "WantedBy=default.target")
 	// No explicit restartPolicy → k8s defaulting → Always → restarts.
