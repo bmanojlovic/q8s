@@ -808,10 +808,42 @@ func (s *Store) CreateService(svc *corev1.Service) (*corev1.Service, error) {
 	if svc.Labels == nil {
 		svc.Labels = make(map[string]string)
 	}
+	defaultServiceFields(svc)
 	s.services[key] = svc
 	s.mu.Unlock()
 	go s.save()
 	return svc.DeepCopy(), nil
+}
+
+// defaultServiceFields fills in the standard fields a real Kubernetes API
+// server would populate on a Service so k8s-aware clients (kubectl's table
+// printer, age logic) render correctly. Without these, `kubectl get svc`
+// shows a blank CLUSTER-IP, AGE <unknown>, and a truncated PORT(S) column.
+// See tic-e014. All three are only defaulted when unset, so an explicit
+// value (e.g. clusterIP: None, or a chosen protocol) is preserved.
+func defaultServiceFields(svc *corev1.Service) {
+	if svc.CreationTimestamp.IsZero() {
+		svc.CreationTimestamp = metav1.Now()
+	}
+	// q8s has no ClusterIP virtual-IP routing: a ClusterIP Service is a DNS
+	// alias + port map on the namespace network (see docs/configuration.md),
+	// which is exactly headless-Service semantics. Report clusterIP: None —
+	// truthful, a legal value, and enough for clients to render the column —
+	// rather than fabricating an unroutable fake IP. An explicit value from
+	// the client is left untouched.
+	if svc.Spec.ClusterIP == "" {
+		svc.Spec.ClusterIP = corev1.ClusterIPNone
+	}
+	if len(svc.Spec.ClusterIPs) == 0 {
+		svc.Spec.ClusterIPs = []string{svc.Spec.ClusterIP}
+	}
+	// Real k8s admission defaults an unset port protocol to TCP; without it
+	// kubectl can't build the "port:nodePort/proto" PORT(S) string.
+	for i := range svc.Spec.Ports {
+		if svc.Spec.Ports[i].Protocol == "" {
+			svc.Spec.Ports[i].Protocol = corev1.ProtocolTCP
+		}
+	}
 }
 
 // GetService gets a service by namespace and name.
@@ -851,6 +883,13 @@ func (s *Store) UpdateService(svc *corev1.Service) (*corev1.Service, error) {
 	}
 	svc.UID = existing.UID
 	svc.ResourceVersion = s.incRV()
+	// Preserve the original creation time across updates (a full-object PUT
+	// or the post-create NodePort re-store would otherwise blank it), then
+	// re-default clusterIP/protocol so an update can't strip them either.
+	if svc.CreationTimestamp.IsZero() {
+		svc.CreationTimestamp = existing.CreationTimestamp
+	}
+	defaultServiceFields(svc)
 	s.services[key] = svc
 	s.mu.Unlock()
 	go s.save()

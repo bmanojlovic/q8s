@@ -351,6 +351,81 @@ func TestServiceCRUD(t *testing.T) {
 	}
 }
 
+// TestServiceDefaultFields pins tic-e014: CreateService must populate the
+// standard fields a real k8s API server would, so kubectl renders CLUSTER-IP,
+// AGE, and PORT(S) instead of blanks. creationTimestamp set, clusterIP
+// defaulted to None, port protocol defaulted to TCP. Explicit values are kept.
+func TestServiceDefaultFields(t *testing.T) {
+	st := newStore(t)
+	created, err := st.CreateService(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{{Port: 5432, NodePort: 30543}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateService: %v", err)
+	}
+	if created.CreationTimestamp.IsZero() {
+		t.Error("creationTimestamp not set")
+	}
+	if created.Spec.ClusterIP != corev1.ClusterIPNone {
+		t.Errorf("clusterIP = %q, want None", created.Spec.ClusterIP)
+	}
+	if len(created.Spec.Ports) != 1 || created.Spec.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("port protocol = %q, want TCP", created.Spec.Ports[0].Protocol)
+	}
+
+	// Explicit values must be preserved, not overwritten.
+	explicit, err := st.CreateService(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc2", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.0.0.5",
+			Ports:     []corev1.ServicePort{{Port: 53, Protocol: corev1.ProtocolUDP}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateService svc2: %v", err)
+	}
+	if explicit.Spec.ClusterIP != "10.0.0.5" {
+		t.Errorf("explicit clusterIP overwritten: %q", explicit.Spec.ClusterIP)
+	}
+	if explicit.Spec.Ports[0].Protocol != corev1.ProtocolUDP {
+		t.Errorf("explicit protocol overwritten: %q", explicit.Spec.Ports[0].Protocol)
+	}
+}
+
+// TestServiceUpdatePreservesCreationTimestamp pins that an update (e.g. the
+// post-create NodePort re-store, or kubectl apply) doesn't blank the
+// creationTimestamp — which would make AGE render <unknown> again. tic-e014.
+func TestServiceUpdatePreservesCreationTimestamp(t *testing.T) {
+	st := newStore(t)
+	created, err := st.CreateService(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 80}}},
+	})
+	if err != nil {
+		t.Fatalf("CreateService: %v", err)
+	}
+	orig := created.CreationTimestamp
+
+	// Simulate a full-object update that carries no creationTimestamp.
+	updated := created.DeepCopy()
+	updated.CreationTimestamp = metav1.Time{}
+	updated.Spec.Ports = append(updated.Spec.Ports, corev1.ServicePort{Port: 443})
+	got, err := st.UpdateService(updated)
+	if err != nil {
+		t.Fatalf("UpdateService: %v", err)
+	}
+	if got.CreationTimestamp.IsZero() || !got.CreationTimestamp.Equal(&orig) {
+		t.Errorf("creationTimestamp not preserved: got %v want %v", got.CreationTimestamp, orig)
+	}
+	if got.Spec.Ports[1].Protocol != corev1.ProtocolTCP {
+		t.Errorf("added port protocol not defaulted: %q", got.Spec.Ports[1].Protocol)
+	}
+}
+
 func TestServiceDuplicate(t *testing.T) {
 	st := newStore(t)
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "default"}}
