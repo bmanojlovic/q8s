@@ -139,30 +139,39 @@ changes what the machinery above is *for*:
   (`10.89.0.2/.3/.4`). The full Endpoints set is represented in DNS.
 - **Verified (the catch):** the answer order is **stable, not rotated** —
   four separate lookups all returned `10.89.0.2` first. aardvark is a service
-  *directory*, **not a load balancer**. A client that honors multiple A
-  records and picks/iterates spreads load; a first-record client (very common:
-  many DB drivers, naive TCP clients) **pins to one replica with no failover**.
-  This is exactly why real k8s does not use DNS for ClusterIP LB.
+  *directory*, **not a load balancer**. Real clients take the first A record
+  and connect there (they don't iterate/spread), so N replicas behind one
+  alias means **one pod serves and the rest sit idle** — not partial spread,
+  no spread. This is exactly why real k8s does not use DNS for ClusterIP LB.
 
-Consequence for this design — three tiers, only the third needs new machinery:
+Consequence for this design — aardvark is service discovery, and for anything
+past one replica it does **not** load-balance:
 
 1. **Single-backend Service** — aardvark alias resolves the name to the one
    pod. Solved, rootless, zero machinery. The majority case (pgvector, single
    API pods).
-2. **Multi-backend, DNS-multi-record-aware client** — aardvark exposes all
-   endpoints; a client that uses them all gets best-effort spread. Free, but
-   client-dependent and not health-aware.
-3. **Multi-backend needing real, health-aware load balancing** — aardvark's
-   stable ordering pins first-record clients, so this genuinely needs a proxy
-   in the path (scope 2). This is the *only* case the proxy earns its keep for
-   in-cluster service traffic.
+2. **Multi-backend Service** — aardvark returns all N records in **stable
+   order**, and real clients (a browser, curl, an app's HTTP library, nginx as
+   an upstream) take the **first** record and connect there. They do not
+   iterate or spread. So with e.g. 5 nginx replicas behind one alias, **all
+   traffic pins to one replica and the other four sit idle** — this is *no*
+   load balancing, not "best-effort". The extra A records only matter for
+   manual failover, and even that isn't guaranteed (many clients don't retry
+   the next record). DNS RR is not a substitute for a load balancer; this is
+   exactly why real k8s puts kube-proxy (not DNS) behind ClusterIP.
 
-So "use aardvark for service endpoints" is correct as **service discovery**
-(and fully solves the single-backend case), but it is **not** a load balancer.
-The loopback scheme (scope 1) and the Traefik proxy (scope 2) are therefore
-primarily for (a) host-originated access to a service *address*, and (b) real
-multi-replica load balancing — not for the everyday pod→service-by-name path,
-which already works.
+So any multi-replica Service that must actually share load **requires a proxy
+in the path** (scope 2) — there is no "DNS-aware client" middle tier worth
+relying on. Today the only thing giving real multi-replica fan-out in q8s is
+Ingress/Traefik (its servers list); a bare ClusterIP with N replicas serves
+from one pod. "Use aardvark for service endpoints" is correct as **service
+discovery** and fully solves the single-backend case, but it is **not** a load
+balancer.
+
+So the loopback scheme (scope 1) and the Traefik proxy (scope 2) are for
+(a) host-originated access to a service *address*, and (b) real multi-replica
+load balancing. Only the everyday single-backend pod→service-by-name path is
+already solved.
 
 ## Traefik as the unprivileged kube-proxy (both modes)
 
