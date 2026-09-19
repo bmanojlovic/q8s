@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // WebSocket constants.
@@ -19,7 +20,16 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 const (
 	wsOpBinary = byte(0x2)
 	wsOpClose  = byte(0x8)
+	wsOpPing   = byte(0x9)
+	wsOpPong   = byte(0xA)
 )
+
+// wsKeepaliveInterval is how often the server sends a WebSocket ping on an
+// exec/attach stream. Real k8s (kubelet) pings idle exec streams so an
+// otherwise-quiet command doesn't trip a client's or an intermediary's
+// (LB/proxy/NAT) idle-read timeout and tear the connection down. 20s is
+// comfortably under common 30–60s idle windows. See tic-c767.
+const wsKeepaliveInterval = 20 * time.Second
 
 // Channel numbers defined by v4/v5.channel.k8s.io.
 const (
@@ -65,6 +75,14 @@ func (c *wsConn) writeChan(ch byte, data []byte) {
 	copy(msg[1:], data)
 	c.writeFrame(wsOpBinary, msg)
 }
+
+// ping sends a WebSocket ping control frame (no application payload). Goes
+// through the same mutex as data frames, so it interleaves safely with
+// stdout/stderr output.
+func (c *wsConn) ping() { c.writeFrame(wsOpPing, nil) }
+
+// pong replies to a client ping, echoing its payload as RFC 6455 requires.
+func (c *wsConn) pong(payload []byte) { c.writeFrame(wsOpPong, payload) }
 
 // maxWSFrameBytes caps a single WebSocket frame. RFC 6455 lengths are 64-bit;
 // allocating straight from the header would let an authenticated client ask
@@ -225,6 +243,24 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 
 	var wg sync.WaitGroup
 
+	// Keepalive: ping the client on an interval so an idle command (no
+	// stdout/stderr for a while) doesn't let a client or intermediary idle-
+	// read timeout tear the stream down. Stopped when the command finishes.
+	// writeFrame is mutex-guarded, so pings interleave safely with output.
+	keepaliveDone := make(chan struct{})
+	go func() {
+		t := time.NewTicker(wsKeepaliveInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-keepaliveDone:
+				return
+			case <-t.C:
+				ws.ping()
+			}
+		}
+	}()
+
 	// stdout → channel 1
 	wg.Add(1)
 	go func() {
@@ -248,15 +284,25 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 				if err != nil || op == wsOpClose {
 					return
 				}
-				if op == wsOpBinary && len(payload) > 0 && payload[0] == chanStdin {
-					stdinW.Write(payload[1:])
+				switch op {
+				case wsOpBinary:
+					if len(payload) > 0 && payload[0] == chanStdin {
+						stdinW.Write(payload[1:])
+					}
+					// channel 4 = resize — ignored (no PTY)
+				case wsOpPing:
+					// Answer a client keepalive so bidirectional idle
+					// pings don't stall waiting for a pong.
+					ws.pong(payload)
+				case wsOpPong:
+					// Response to our own ping — nothing to do.
 				}
-				// channel 4 = resize — ignored (no PTY)
 			}
 		}()
 	}
 
 	wg.Wait()
+	close(keepaliveDone)
 	exitErr := cmd.Wait()
 
 	// Send exit status on channel 3 then close the WebSocket.
