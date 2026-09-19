@@ -155,7 +155,13 @@ func svcsToTable(svcs []*corev1.Service, rv string) *table {
 	for _, s := range svcs {
 		ports := make([]string, len(s.Spec.Ports))
 		for j, p := range s.Spec.Ports {
-			ports[j] = fmt.Sprintf("%d/%s", p.Port, p.Protocol)
+			// Match kubectl: a NodePort/LoadBalancer service renders each
+			// port as "port:nodePort/protocol"; ClusterIP as "port/protocol".
+			if p.NodePort != 0 && (s.Spec.Type == corev1.ServiceTypeNodePort || s.Spec.Type == corev1.ServiceTypeLoadBalancer) {
+				ports[j] = fmt.Sprintf("%d:%d/%s", p.Port, p.NodePort, p.Protocol)
+			} else {
+				ports[j] = fmt.Sprintf("%d/%s", p.Port, p.Protocol)
+			}
 		}
 		t.Rows = append(t.Rows, tableRow{
 			Cells: []interface{}{
