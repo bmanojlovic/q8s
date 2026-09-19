@@ -2136,6 +2136,55 @@ func (s *Server) removeTraefikConfig(ns, name string) {
 
 // --- Startup reconciliation ---
 
+// RestoreEnvFiles re-renders the per-pod Secret-derived EnvironmentFiles
+// ({secretDir}/{ns}/_env/*.env) for every stored workload. These live under
+// the tmpfs RuntimeDirectory (/run/q8s) and are wiped on every host reboot or
+// q8s-api restart, but the quadlet .container units persist on disk and their
+// ExecStart references `--env-file .../_env/<pod>.env`. Without this, podman
+// fails every restart with exit 125 (env-file missing) and systemd's
+// StartLimitBurst eventually gives up — every pod using envFrom/valueFrom on a
+// Secret CrashLoopBackOffs after a routine restart. ReconcileQuadlets only
+// regenerates *missing* .container files, so on a plain restart (files still
+// present) it never re-runs the env render; this closes that gap by rendering
+// the env-files unconditionally. Called on startup BEFORE sd_notify(READY), so
+// a pod unit ordered After=q8s-api.service finds its env-file already present.
+// Errors are logged, not fatal — one unresolvable workload must not block the
+// rest. See tic-1507.
+func (s *Server) RestoreEnvFiles() {
+	if s.secretBaseDir() == "" {
+		return
+	}
+	for _, dep := range s.config.Store.AllDeployments() {
+		for i := int32(0); i < deploymentReplicas(dep); i++ {
+			pod := s.materializeDeploymentInstance(dep, i)
+			if _, _, err := s.resolveEnvFrom(pod); err != nil {
+				fmt.Printf("restore env-file %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
+			}
+		}
+	}
+	for _, pod := range s.config.Store.Pods("") {
+		// Deployment-owned pods are rendered via their Deployment above;
+		// skip them here (ownership is by OwnerReference, set in
+		// materializeDeploymentInstance).
+		if isDeploymentOwned(pod) {
+			continue
+		}
+		if _, _, err := s.resolveEnvFrom(pod); err != nil {
+			fmt.Printf("restore env-file %s/%s: %v\n", pod.Namespace, pod.Name, err)
+		}
+	}
+	for _, job := range s.config.Store.AllJobs() {
+		if _, _, err := s.resolvedJobEnv(job); err != nil {
+			fmt.Printf("restore env-file %s/%s-job: %v\n", job.Namespace, job.Name, err)
+		}
+	}
+	for _, cj := range s.config.Store.AllCronJobs() {
+		if _, _, err := s.resolvedCronJobEnv(cj); err != nil {
+			fmt.Printf("restore env-file %s/%s-cron: %v\n", cj.Namespace, cj.Name, err)
+		}
+	}
+}
+
 // ReconcileQuadlets regenerates missing quadlet/timer files for resources in the store.
 // Called on startup so containers come back after an uninstall+reinstall.
 func (s *Server) ReconcileQuadlets() {
@@ -2735,6 +2784,18 @@ func (s *Server) generateDeploymentInstanceQuadlet(dep *appsv1.Deployment, i int
 
 func (s *Server) redeployDeploymentInstanceQuadlet(dep *appsv1.Deployment, i int32) {
 	s.deployDeploymentInstance(dep, i, true)
+}
+
+// isDeploymentOwned reports whether a stored Pod is a Deployment instance
+// (owned via an OwnerReference set by materializeDeploymentInstance), so
+// callers can avoid double-processing it when they already walk Deployments.
+func isDeploymentOwned(pod *corev1.Pod) bool {
+	for _, or := range pod.OwnerReferences {
+		if or.Kind == "Deployment" {
+			return true
+		}
+	}
+	return false
 }
 
 // materializeDeploymentInstance builds the Pod object for deployment

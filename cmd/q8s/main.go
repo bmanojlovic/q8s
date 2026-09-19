@@ -571,6 +571,10 @@ func cmdServe() {
 
 	restoreConfigMapFiles(d.configDir, st)
 	restoreSecretFiles(d.secretDir, st)
+	// Re-render per-pod Secret-derived env-files (tmpfs, wiped on restart)
+	// after their source secrets/configmaps are restored, so quadlet
+	// ExecStart --env-file targets exist. Before sd_notify(READY). tic-1507.
+	srv.RestoreEnvFiles()
 	ensureNamespaceNetworks(d.quadletDir, mgr, st)
 	srv.ReconcileQuadlets()
 	reconcilePodmanPods(st, mgr)

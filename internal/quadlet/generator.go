@@ -358,6 +358,13 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 
 	b.WriteString("\n[Unit]\n")
 	b.WriteString(fmt.Sprintf("Description=Pod %s\n", pod.Name))
+	// Order after q8s-api so a host reboot doesn't race the container's
+	// ExecStart --env-file against q8s-api re-rendering it (q8s renders the
+	// per-pod _env files before sd_notify READY). Wants, not Requires: a
+	// standalone `q8s serve` with no installed q8s-api.service must still
+	// work — a missing unit here is a harmless no-op. See tic-1507.
+	b.WriteString("Wants=q8s-api.service\n")
+	b.WriteString("After=q8s-api.service\n")
 
 	// Every policy maps to an explicit Restart= line. Emitting nothing for
 	// Never (as older code did) is not neutral: quadlet/.container units
@@ -514,6 +521,10 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 
 	b.WriteString("\n[Unit]\n")
 	b.WriteString(fmt.Sprintf("Description=Job %s/%s\n", ns, name))
+	// Order after q8s-api (see the Container generator) so a reboot doesn't
+	// race the --env-file target q8s re-renders before READY. tic-1507.
+	b.WriteString("Wants=q8s-api.service\n")
+	b.WriteString("After=q8s-api.service\n")
 
 	// Jobs don't restart; Type=oneshot is handled by the container exiting cleanly.
 	b.WriteString("\n[Service]\n")
@@ -645,6 +656,10 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 
 	b.WriteString("\n[Unit]\n")
 	b.WriteString(fmt.Sprintf("Description=CronJob %s/%s\n", ns, name))
+	// Order after q8s-api (see the Container generator) so a reboot doesn't
+	// race the --env-file target q8s re-renders before READY. tic-1507.
+	b.WriteString("Wants=q8s-api.service\n")
+	b.WriteString("After=q8s-api.service\n")
 
 	b.WriteString("\n[Service]\n")
 	b.WriteString("Restart=no\n")
