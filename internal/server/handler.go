@@ -1991,6 +1991,38 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		}
 		s.generateTraefikConfig(created)
 		encode(w, created, http.StatusCreated)
+	case http.MethodPut:
+		var ing networkingv1.Ingress
+		if !s.decodeOrRespond(w, r, &ing) {
+			return
+		}
+		ing.APIVersion = "networking.k8s.io/v1"
+		ing.Kind = "Ingress"
+		if ing.Namespace == "" {
+			ing.Namespace = ns
+		}
+		if ing.Name == "" {
+			ing.Name = name
+		}
+		if err := validateName("namespace", ing.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", ing.Name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateIngress(&ing); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		updated, err := s.config.Store.UpdateIngress(&ing)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		s.generateTraefikConfig(updated)
+		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
 		ing, err := s.config.Store.GetIngress(ns, name)
 		if err != nil {
