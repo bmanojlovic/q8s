@@ -1308,6 +1308,40 @@ func TestIngressCRUD(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestIngressUpdate(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", ingressBody("default", "upd", "old.example.com", "myservice", 80))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	resp = do(t, http.MethodPut, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses/upd", ingressBody("default", "upd", "new.example.com", "myservice", 80))
+	assertStatus(t, resp, 200)
+	m := decodeBody(t, resp)
+	spec, _ := m["spec"].(map[string]interface{})
+	rules, _ := spec["rules"].([]interface{})
+	rule, _ := rules[0].(map[string]interface{})
+	if rule["host"] != "new.example.com" {
+		t.Fatalf("expected host=new.example.com, got %v", rule["host"])
+	}
+
+	resp = get(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses/upd")
+	assertStatus(t, resp, 200)
+	m = decodeBody(t, resp)
+	spec, _ = m["spec"].(map[string]interface{})
+	rules, _ = spec["rules"].([]interface{})
+	rule, _ = rules[0].(map[string]interface{})
+	if rule["host"] != "new.example.com" {
+		t.Fatalf("expected persisted host=new.example.com, got %v", rule["host"])
+	}
+}
+
+func TestIngressUpdateNotFound(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := do(t, http.MethodPut, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses/missing", ingressBody("default", "missing", "example.com", "myservice", 80))
+	assertStatus(t, resp, 404)
+	resp.Body.Close()
+}
+
 func TestIngressDuplicate(t *testing.T) {
 	ts, _ := newTestServer(t)
 	body := ingressBody("default", "dup", "example.com", "myservice", 80)
