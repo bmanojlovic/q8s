@@ -1449,6 +1449,17 @@ func TestDeploymentCRUD(t *testing.T) {
 	resp.Body.Close()
 }
 
+func deploymentImage(t *testing.T, m map[string]interface{}) string {
+	t.Helper()
+	spec, _ := m["spec"].(map[string]interface{})
+	tmpl, _ := spec["template"].(map[string]interface{})
+	podSpec, _ := tmpl["spec"].(map[string]interface{})
+	containers, _ := podSpec["containers"].([]interface{})
+	c, _ := containers[0].(map[string]interface{})
+	image, _ := c["image"].(string)
+	return image
+}
+
 func TestDeploymentUpdatePut(t *testing.T) {
 	ts, _ := newTestServer(t)
 
@@ -1459,7 +1470,18 @@ func TestDeploymentUpdatePut(t *testing.T) {
 	// Full-resource replace via PUT (client-go Update()).
 	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/upd", deployBody("default", "upd", "nginx:2.0"))
 	assertStatus(t, resp, 200)
-	assertKind(t, decodeBody(t, resp), "Deployment")
+	m := decodeBody(t, resp)
+	assertKind(t, m, "Deployment")
+	if img := deploymentImage(t, m); img != "nginx:2.0" {
+		t.Fatalf("expected image=nginx:2.0, got %v", img)
+	}
+
+	resp = get(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments/upd")
+	assertStatus(t, resp, 200)
+	m = decodeBody(t, resp)
+	if img := deploymentImage(t, m); img != "nginx:2.0" {
+		t.Fatalf("expected persisted image=nginx:2.0, got %v", img)
+	}
 }
 
 func TestDeploymentUpdatePutNotFound(t *testing.T) {
