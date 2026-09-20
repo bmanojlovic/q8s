@@ -1511,6 +1511,81 @@ func TestDeploymentReplicas(t *testing.T) {
 	}
 }
 
+// TestDeploymentStatusForRollout pins tic-773b: a Deployment GET must carry
+// metadata.generation and status.observedGeneration (>= generation) plus ready
+// counts derived from live pods, or `kubectl rollout status` hangs forever on
+// "Waiting for deployment spec update to be observed". Also: a spec-changing
+// patch must bump generation; a non-spec change must not.
+func TestDeploymentStatusForRollout(t *testing.T) {
+	ts, st := newTestServer(t)
+
+	body := deployBody("default", "roll", "nginx:latest")
+	body["spec"].(map[string]interface{})["replicas"] = 2
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", body)
+	assertStatus(t, resp, 201)
+	m := decodeBody(t, resp)
+	resp.Body.Close()
+	meta := m["metadata"].(map[string]interface{})
+	if meta["generation"] != float64(1) {
+		t.Fatalf("expected generation=1 on create, got %v", meta["generation"])
+	}
+
+	// Two matching pods, both Running, as reconcilePodmanPods would import.
+	for i := 0; i < 2; i++ {
+		name := fmt.Sprintf("roll-%d", i)
+		if _, err := st.CreatePod(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		}); err != nil {
+			t.Fatalf("CreatePod %s: %v", name, err)
+		}
+		st.UpdatePodPhase("default", name, corev1.PodRunning)
+	}
+
+	// GET must show observedGeneration == generation and ready == desired,
+	// which is exactly what lets rollout status terminate.
+	resp = get(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments/roll")
+	assertStatus(t, resp, 200)
+	m = decodeBody(t, resp)
+	resp.Body.Close()
+	status := m["status"].(map[string]interface{})
+	gen := m["metadata"].(map[string]interface{})["generation"]
+	if status["observedGeneration"] != gen {
+		t.Fatalf("observedGeneration %v != generation %v — rollout status would hang", status["observedGeneration"], gen)
+	}
+	if status["readyReplicas"] != float64(2) {
+		t.Fatalf("expected readyReplicas=2 from Running pods, got %v", status["readyReplicas"])
+	}
+
+	// A spec-changing patch (rollout restart-style annotation on the template)
+	// must bump generation.
+	patch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"annotations": map[string]interface{}{"kubectl.kubernetes.io/restartedAt": "2026-09-20T00:00:00Z"},
+				},
+			},
+		},
+	}
+	resp = do(t, http.MethodPatch, ts.URL+"/apis/apps/v1/namespaces/default/deployments/roll", patch)
+	assertStatus(t, resp, 200)
+	m = decodeBody(t, resp)
+	resp.Body.Close()
+	if g := m["metadata"].(map[string]interface{})["generation"]; g != float64(2) {
+		t.Fatalf("expected generation bumped to 2 after spec-changing patch, got %v", g)
+	}
+
+	// And the subsequent GET re-observes the new generation (no permanent lag).
+	resp = get(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments/roll")
+	assertStatus(t, resp, 200)
+	m = decodeBody(t, resp)
+	resp.Body.Close()
+	status = m["status"].(map[string]interface{})
+	if status["observedGeneration"] != float64(2) {
+		t.Fatalf("observedGeneration did not catch up to gen 2: %v", status["observedGeneration"])
+	}
+}
+
 func TestAppsDiscovery(t *testing.T) {
 	ts, _ := newTestServer(t)
 
