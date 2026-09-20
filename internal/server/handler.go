@@ -1312,6 +1312,57 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		s.generateDeploymentQuadlets(created)
 		s.regenerateIngressConfigs(ns)
 		encode(w, created, http.StatusCreated)
+	case http.MethodPut:
+		// Full-resource replace (kubectl replace / client-go Update()).
+		// Mirrors the Ingress and ConfigMap PUT handlers. Latent until a
+		// client uses PUT rather than PATCH for Deployment updates, but a
+		// real Kubernetes API server always accepts it, so implement it
+		// for spec-compliance.
+		var dep appsv1.Deployment
+		if !s.decodeOrRespond(w, r, &dep) {
+			return
+		}
+		dep.APIVersion = "apps/v1"
+		dep.Kind = "Deployment"
+		if dep.Namespace == "" {
+			dep.Namespace = ns
+		}
+		if dep.Name == "" {
+			dep.Name = name
+		}
+		if err := validateName("namespace", dep.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", dep.Name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePatchedIdentity("deployment", dep.Namespace, dep.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		existing, err := s.config.Store.GetDeployment(ns, name)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		oldR := deploymentReplicas(existing)
+		updated, err := s.config.Store.UpdateDeployment(&dep)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		newR := deploymentReplicas(updated)
+		if newR != oldR {
+			s.scaleDeployment(updated, oldR, newR)
+		} else {
+			for i := int32(0); i < newR; i++ {
+				s.redeployDeploymentInstanceQuadlet(updated, i)
+			}
+		}
+		s.regenerateIngressConfigs(ns)
+		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
 		dep, err := s.config.Store.GetDeployment(ns, name)
 		if err != nil {

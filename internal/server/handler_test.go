@@ -1449,6 +1449,26 @@ func TestDeploymentCRUD(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestDeploymentUpdatePut(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBody("default", "upd", "nginx:1.0"))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	// Full-resource replace via PUT (client-go Update()).
+	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/upd", deployBody("default", "upd", "nginx:2.0"))
+	assertStatus(t, resp, 200)
+	assertKind(t, decodeBody(t, resp), "Deployment")
+}
+
+func TestDeploymentUpdatePutNotFound(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/missing", deployBody("default", "missing", "nginx"))
+	assertStatus(t, resp, 404)
+	resp.Body.Close()
+}
+
 func TestDeploymentDuplicate(t *testing.T) {
 	ts, _ := newTestServer(t)
 	body := deployBody("default", "dup", "nginx")
