@@ -1223,6 +1223,31 @@ func (s *Server) handleAppsStub(w http.ResponseWriter, r *http.Request, resource
 	}
 }
 
+// withDeploymentStatus returns a copy of dep with its .status populated from
+// live pod state: ReadyReplicas is the number of matching Running pods, and
+// ObservedGeneration is set to the current Generation. Real Kubernetes has a
+// controller writing this; q8s derives it on read instead, which is what lets
+// `kubectl rollout status` (gated on observedGeneration >= generation, then on
+// replica readiness) actually terminate. See tic-773b.
+func (s *Server) withDeploymentStatus(dep *appsv1.Deployment) *appsv1.Deployment {
+	d := dep.DeepCopy()
+	desired := deploymentReplicas(d)
+	var ready int32
+	for i := int32(0); i < desired; i++ {
+		instanceName := fmt.Sprintf("%s-%d", d.Name, i)
+		pod, err := s.config.Store.GetPod(d.Namespace, instanceName)
+		if err == nil && pod.Status.Phase == corev1.PodRunning {
+			ready++
+		}
+	}
+	d.Status.ObservedGeneration = d.Generation
+	d.Status.Replicas = desired
+	d.Status.ReadyReplicas = ready
+	d.Status.AvailableReplicas = ready
+	d.Status.UpdatedReplicas = desired
+	return d
+}
+
 func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, name string) {
 	// Route subresources: deployments/{name}/scale
 	if i := strings.IndexByte(name, '/'); i >= 0 {
@@ -1238,7 +1263,13 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
-			respondList(w, r, s, func() []*appsv1.Deployment { return s.config.Store.Deployments(ns) }, deploymentsToTable,
+			respondList(w, r, s, func() []*appsv1.Deployment {
+				deps := s.config.Store.Deployments(ns)
+				for i, d := range deps {
+					deps[i] = s.withDeploymentStatus(d)
+				}
+				return deps
+			}, deploymentsToTable,
 				func(items []appsv1.Deployment) *appsv1.DeploymentList {
 					return &appsv1.DeploymentList{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DeploymentList"}, Items: items}
 				})
@@ -1248,6 +1279,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 				return
 			}
+			dep = s.withDeploymentStatus(dep)
 			if isTableRequest(r) {
 				encodeTable(w, deploymentsToTable([]*appsv1.Deployment{dep}, s.rv()))
 				return

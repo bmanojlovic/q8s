@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1534,6 +1535,11 @@ func (s *Store) CreateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, er
 	if dep.CreationTimestamp.IsZero() {
 		dep.CreationTimestamp = metav1.Now()
 	}
+	// A real API server stamps generation 1 on create and bumps it on every
+	// spec change (see UpdateDeployment). kubectl rollout status gates on
+	// status.observedGeneration >= metadata.generation before it looks at
+	// replicas, so this must be populated or rollout status hangs. tic-773b.
+	dep.Generation = 1
 	s.deployments[key] = dep
 	s.mu.Unlock()
 	go s.save()
@@ -1553,6 +1559,19 @@ func (s *Store) UpdateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, er
 	}
 	dep.UID = existing.UID
 	dep.ResourceVersion = s.incRV()
+	// Preserve creationTimestamp across updates (a full-object PUT may omit
+	// it), and manage metadata.generation like a real API server: bump it
+	// only when the spec actually changed, carry it forward otherwise. This
+	// is what status.observedGeneration is compared against, so getting it
+	// right is what lets `kubectl rollout status` terminate. tic-773b.
+	if dep.CreationTimestamp.IsZero() {
+		dep.CreationTimestamp = existing.CreationTimestamp
+	}
+	if reflect.DeepEqual(dep.Spec, existing.Spec) {
+		dep.Generation = existing.Generation
+	} else {
+		dep.Generation = existing.Generation + 1
+	}
 	s.deployments[key] = dep
 	s.mu.Unlock()
 	go s.save()
@@ -1601,12 +1620,17 @@ func (s *Store) UpdateDeploymentStatus(ns, name string, ready int32) {
 	if dep.Spec.Replicas != nil {
 		desired = *dep.Spec.Replicas
 	}
-	changed := dep.Status.ReadyReplicas != ready
+	// Update when the ready count changed OR when observedGeneration still
+	// lags the current generation (a spec change — e.g. rollout restart —
+	// with an unchanged replica count must still be "observed", or
+	// `kubectl rollout status` waits forever). tic-773b.
+	changed := dep.Status.ReadyReplicas != ready || dep.Status.ObservedGeneration != dep.Generation
 	if changed {
 		dep.Status.Replicas = desired
 		dep.Status.ReadyReplicas = ready
 		dep.Status.AvailableReplicas = ready
 		dep.Status.UpdatedReplicas = desired
+		dep.Status.ObservedGeneration = dep.Generation
 		dep.ResourceVersion = s.incRV()
 	}
 	uid := dep.UID

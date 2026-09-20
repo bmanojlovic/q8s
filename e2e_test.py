@@ -270,6 +270,13 @@ def test_deployment():
           f"kubectl -n {NS} get deployment myapp -o jsonpath='{{.spec.template.metadata.annotations}}'",
           expect="restartedAt")
 
+    # rollout status must terminate, not hang: it gates on
+    # status.observedGeneration >= metadata.generation, then on replica
+    # readiness. If q8s doesn't populate observedGeneration it waits forever
+    # ("Waiting for deployment spec update to be observed"). tic-773b.
+    check("rollout status completes", f"kubectl -n {NS} rollout status deployment myapp --timeout=30s",
+          expect="successfully rolled out", timeout=45)
+
     check("delete deployment", f"kubectl -n {NS} delete deployment myapp", timeout=60)
     time.sleep(2)
     file_absent("all quadlets removed", f"{QUADLETS}/{NS}-myapp-0.container")
