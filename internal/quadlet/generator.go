@@ -1,6 +1,7 @@
 package quadlet
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +11,34 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
+
+const (
+	// ManagedByLabel is the exact line q8s writes into the main section of
+	// every unit it generates. The server uses it to recognise its own files
+	// (and only those) when cleaning up stale units after a redeploy.
+	ManagedByLabel = "Label=app.kubernetes.io/managed-by=q8s"
+
+	// TemplateHashLabel is the key of the label carrying a hash of the
+	// rendered unit content. A repeated deploy of an unchanged spec can then
+	// leave the file and its service alone.
+	TemplateHashLabel = "q8s.io/template-hash"
+)
+
+// withTemplateHash appends the template-hash label to the main section of a
+// rendered unit. The hash is computed over the content before the label is
+// added, so rendering the same input twice always produces the same hash.
+// Only .container and .pod content is passed here: a .timer has no Label key.
+func withTemplateHash(content []byte) []byte {
+	sum := sha256.Sum256(content)
+	label := fmt.Sprintf("Label=%s=%x\n", TemplateHashLabel, sum[:6])
+	s := string(content)
+	if i := strings.Index(s, "\n\n["); i >= 0 {
+		return []byte(s[:i+1] + label + s[i+1:])
+	}
+	return []byte(s + label)
+}
 
 // writeImageAndPull emits the Image= line plus a Pull= line derived from the
 // container's imagePullPolicy, translating Kubernetes pull semantics to
@@ -72,6 +100,149 @@ func writeResourceLimits(b *strings.Builder, limits corev1.ResourceList) {
 		cores := float64(cpu.MilliValue()) / 1000.0
 		b.WriteString(fmt.Sprintf("PodmanArgs=--cpus=%s\n", strconv.FormatFloat(cores, 'f', -1, 64)))
 	}
+}
+
+// GPULimitResource is the extended resource name Kubernetes uses to request
+// an NVIDIA GPU. q8s does not allocate individual devices: any request of at
+// least one maps to the CDI device name nvidia.com/gpu=all, which podman
+// resolves to every GPU CDI exposes on the host.
+const GPULimitResource corev1.ResourceName = "nvidia.com/gpu"
+
+// writeGPUDevice emits AddDevice= when the container requests a GPU. A zero
+// or negative request emits nothing (Kubernetes only admits whole GPUs, but
+// a malformed spec should not accidentally expose the host devices).
+func writeGPUDevice(b *strings.Builder, limits corev1.ResourceList) {
+	gpu, ok := limits[GPULimitResource]
+	if !ok || gpu.CmpInt64(1) < 0 {
+		return
+	}
+	b.WriteString("AddDevice=nvidia.com/gpu=all\n")
+}
+
+// writeUlimits translates the q8s.io/ulimits annotation into one Ulimit=
+// line per comma separated item. Podman has no single key for setting
+// memlock and stacking in a GPU LLM server usually needs the same limit on
+// every replica, so the pod (or pod template) carries the list and each
+// generated unit repeats it. Every item is validated first: an item with a
+// newline would otherwise open a second quadlet line.
+func writeUlimits(b *strings.Builder, annotations map[string]string) error {
+	raw, ok := annotations[AnnotationUlimits]
+	if !ok || raw == "" {
+		return nil
+	}
+	for _, item := range strings.Split(raw, ",") {
+		if err := validateUlimitItem(item); err != nil {
+			return err
+		}
+		b.WriteString(fmt.Sprintf("Ulimit=%s\n", item))
+	}
+	return nil
+}
+
+// writeEmptyDirShm translates the Kubernetes idiom for a larger /dev/shm:
+// an emptyDir with medium: Memory mounted at /dev/shm. Podman always mounts
+// its own /dev/shm, so the size has to go through ShmSize= instead of a
+// Volume= line (a bind mount there would be rejected or shadow the tmpfs).
+// Returns true when the volume was handled, including the no-sizeLimit case
+// where the right translation is to emit nothing at all. Other emptyDir
+// volumes return false and keep the existing named-volume line.
+func writeEmptyDirShm(b *strings.Builder, vol corev1.Volume, mountPath string) bool {
+	if !isEmptyDirShm(vol, mountPath) {
+		return false
+	}
+	if vol.EmptyDir.SizeLimit != nil && vol.EmptyDir.SizeLimit.Sign() > 0 {
+		b.WriteString(fmt.Sprintf("ShmSize=%d\n", vol.EmptyDir.SizeLimit.Value()))
+	}
+	return true
+}
+
+// isEmptyDirShm reports whether the volume is a memory-backed emptyDir
+// mounted at /dev/shm, the Kubernetes idiom for a larger shared-memory
+// mount. Callers decide whether the size goes on the container or the pod.
+func isEmptyDirShm(vol corev1.Volume, mountPath string) bool {
+	return vol.EmptyDir != nil && vol.EmptyDir.Medium == corev1.StorageMediumMemory && mountPath == "/dev/shm"
+}
+
+// writeHealthCheck emits the single Podman health check a unit can have.
+// A livenessProbe owns it when present, exactly as before (only its exec
+// handler is translated). Otherwise a readinessProbe supplies one, which is
+// what an LLM server needs: it can report ready only after the model has
+// loaded, and until then podman keeps the container marked unhealthy rather
+// than restarting it (the readiness probe has no restart semantics in k8s
+// either).
+func writeHealthCheck(b *strings.Builder, c corev1.Container) error {
+	if probe := c.LivenessProbe; probe != nil {
+		if cmd := probe.Exec; cmd != nil && len(cmd.Command) > 0 {
+			for _, part := range cmd.Command {
+				if err := noControlChars("healthCheck command", part); err != nil {
+					return err
+				}
+			}
+			b.WriteString(fmt.Sprintf("HealthCmd=%s\n", strings.Join(cmd.Command, " ")))
+		}
+		if probe.InitialDelaySeconds > 0 {
+			b.WriteString(fmt.Sprintf("HealthStartPeriod=%ds\n", probe.InitialDelaySeconds))
+		}
+		return nil
+	}
+
+	probe := c.ReadinessProbe
+	if probe == nil {
+		return nil
+	}
+	if cmd := probe.Exec; cmd != nil && len(cmd.Command) > 0 {
+		for _, part := range cmd.Command {
+			if err := noControlChars("healthCheck command", part); err != nil {
+				return err
+			}
+		}
+		b.WriteString(fmt.Sprintf("HealthCmd=%s\n", strings.Join(cmd.Command, " ")))
+		if probe.InitialDelaySeconds > 0 {
+			b.WriteString(fmt.Sprintf("HealthStartPeriod=%ds\n", probe.InitialDelaySeconds))
+		}
+		return nil
+	}
+	if get := probe.HTTPGet; get != nil {
+		port, ok := resolveProbePort(c, get.Port)
+		if !ok {
+			// An unresolved named port must not turn into a health check
+			// against port 0: emitting nothing leaves the container without
+			// a probe, which is safer than a probe that can never pass and
+			// matches how the liveness branch silently skips non-exec probes.
+			return nil
+		}
+		path := get.Path
+		if path == "" {
+			path = "/"
+		}
+		if err := noControlChars("readinessProbe path", path); err != nil {
+			return err
+		}
+		b.WriteString(fmt.Sprintf("HealthCmd=curl -fsS http://127.0.0.1:%d%s\n", port, path))
+		if probe.PeriodSeconds > 0 {
+			b.WriteString(fmt.Sprintf("HealthInterval=%ds\n", probe.PeriodSeconds))
+		}
+		if probe.InitialDelaySeconds > 0 {
+			b.WriteString(fmt.Sprintf("HealthStartPeriod=%ds\n", probe.InitialDelaySeconds))
+		}
+	}
+	return nil
+}
+
+// resolveProbePort returns the numeric port an httpGet probe should hit. A
+// named port is looked up in the container's own port list; the second
+// result is false when the name matches nothing so the caller can skip the
+// health check instead of guessing.
+func resolveProbePort(c corev1.Container, port intstr.IntOrString) (int32, bool) {
+	if port.Type == intstr.Int {
+		return port.IntVal, true
+	}
+	for _, p := range c.Ports {
+		if p.Name == port.StrVal {
+			return p.ContainerPort, true
+		}
+	}
+	return 0, false
 }
 
 // cgroupMemoryAvailable reports whether the cgroup v2 memory controller is
@@ -164,6 +335,10 @@ func detectCgroupControllers() {
 // pvcMap maps PVC claim names to their full objects so that volume mounts
 // can inspect storageClassName and annotations. A nil map is safe and falls
 // back to the default (named volume with :Z).
+//
+// This is the single-container shape q8s has always produced. A pod with
+// more than one container is rendered by PodUnits instead, which keeps the
+// same per-container rendering but moves the pod-level settings into a .pod.
 func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
 	// Name/namespace are validated here even though the API boundary
 	// already checks them: the Podman-label import path (reconcilePodmanPods)
@@ -177,227 +352,23 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 	if err := validateRefName("pod namespace", pod.Namespace); err != nil {
 		return nil, err
 	}
-
-	var b strings.Builder
-
-	b.WriteString("[Container]\n")
-
 	if len(pod.Spec.Containers) == 0 {
 		return nil, fmt.Errorf("pod has no containers")
 	}
-	if err := validateImage(pod.Spec.Containers[0].Image); err != nil {
+	content, err := renderContainer(containerRender{
+		pod:            pod,
+		container:      pod.Spec.Containers[0],
+		containerName:  fmt.Sprintf("%s-%s", pod.Namespace, name),
+		configDir:      configDir,
+		serviceAliases: serviceAliases,
+		pvcMap:         pvcMap,
+		envFile:        envFile,
+		standalone:     true,
+	})
+	if err != nil {
 		return nil, err
 	}
-	writeImageAndPull(&b, pod.Spec.Containers[0])
-
-	containerName := fmt.Sprintf("%s-%s", pod.Namespace, name)
-	b.WriteString(fmt.Sprintf("ContainerName=%s\n", containerName))
-
-	// Exec: combine command (entrypoint override) and args
-	cmd := append(pod.Spec.Containers[0].Command, pod.Spec.Containers[0].Args...)
-	for _, part := range cmd {
-		if err := noControlChars("command", part); err != nil {
-			return nil, err
-		}
-	}
-	if len(cmd) > 0 {
-		b.WriteString(fmt.Sprintf("Exec=%s\n", shellJoin(cmd)))
-	}
-
-	if pod.Spec.Containers[0].WorkingDir != "" {
-		if err := validatePath("workingDir", pod.Spec.Containers[0].WorkingDir); err != nil {
-			return nil, err
-		}
-		b.WriteString(fmt.Sprintf("WorkingDir=%s\n", pod.Spec.Containers[0].WorkingDir))
-	}
-
-	if pod.Spec.Containers[0].SecurityContext != nil && pod.Spec.Containers[0].SecurityContext.RunAsUser != nil {
-		b.WriteString(fmt.Sprintf("User=%d\n", *pod.Spec.Containers[0].SecurityContext.RunAsUser))
-	}
-
-	writeResourceLimits(&b, pod.Spec.Containers[0].Resources.Limits)
-
-	if envFile != "" {
-		if err := validatePath("envFile", envFile); err != nil {
-			return nil, err
-		}
-		b.WriteString(fmt.Sprintf("EnvironmentFile=%s\n", envFile))
-	}
-
-	for _, env := range pod.Spec.Containers[0].Env {
-		if err := validateEnvName(env.Name); err != nil {
-			return nil, err
-		}
-		if err := noControlChars("environment variable value", env.Value); err != nil {
-			return nil, err
-		}
-		b.WriteString(fmt.Sprintf("Environment=%s=%s\n", env.Name, env.Value))
-	}
-
-	// Ports — only publish when hostPort is explicitly set.
-	// containerPort alone is informational (matches k8s semantics):
-	// the container listens on that port inside the namespace network,
-	// reachable via NetworkAlias from other pods.
-	for _, port := range pod.Spec.Containers[0].Ports {
-		if port.HostPort == 0 {
-			continue
-		}
-		proto := "tcp"
-		if port.Protocol == corev1.ProtocolUDP {
-			proto = "udp"
-		}
-		// An explicit HostIP binds the published port to one interface —
-		// the q8s replica-port allocator uses 127.0.0.1 so replica backends
-		// are reachable on-host (Traefik) but never exposed on the LAN.
-		// Without HostIP the publish binds all interfaces, matching k8s
-		// hostPort semantics for manually-declared ports.
-		if port.HostIP != "" {
-			b.WriteString(fmt.Sprintf("PublishPort=%s:%d:%d/%s\n", port.HostIP, port.HostPort, port.ContainerPort, proto))
-		} else {
-			b.WriteString(fmt.Sprintf("PublishPort=%d:%d/%s\n", port.HostPort, port.ContainerPort, proto))
-		}
-	}
-
-	// Volumes — resolve ConfigMap references to their on-disk directory.
-	for _, vol := range pod.Spec.Volumes {
-		for _, c := range pod.Spec.Containers {
-			for _, vm := range c.VolumeMounts {
-				if vm.Name != vol.Name {
-					continue
-				}
-				if err := validatePath("mountPath", vm.MountPath); err != nil {
-					return nil, err
-				}
-				switch {
-				case vol.PersistentVolumeClaim != nil:
-					if err := validateRefName("persistentVolumeClaim.claimName", vol.PersistentVolumeClaim.ClaimName); err != nil {
-						return nil, err
-					}
-					if pvc, ok := pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
-						line, err := pvcVolumeDirective(pod.Namespace, pvc, vm.MountPath)
-						if err != nil {
-							return nil, err
-						}
-						b.WriteString(line)
-					} else {
-						// PVC not found in map — fall back to named volume with :Z
-						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s:Z\n", pod.Namespace, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
-					}
-				case vol.ConfigMap != nil:
-					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
-						return nil, err
-					}
-					if configDir != "" {
-						cmPath := fmt.Sprintf("%s/%s/%s", configDir, pod.Namespace, vol.ConfigMap.Name)
-						b.WriteString(fmt.Sprintf("Volume=%s:%s:ro,z\n", cmPath, vm.MountPath))
-					}
-				case vol.Secret != nil:
-					if err := validateRefName("secret.secretName", vol.Secret.SecretName); err != nil {
-						return nil, err
-					}
-					if configDir != "" {
-						secretDir := filepath.Join(filepath.Dir(configDir), "secrets")
-						secPath := filepath.Join(secretDir, pod.Namespace, vol.Secret.SecretName)
-						b.WriteString(fmt.Sprintf("Volume=%s:%s:ro,z\n", secPath, vm.MountPath))
-					}
-				default:
-					if err := validateRefName("volume.name", vol.Name); err != nil {
-						return nil, err
-					}
-					b.WriteString(fmt.Sprintf("Volume=%s:%s\n", vol.Name, vm.MountPath))
-				}
-			}
-		}
-	}
-
-	// Network: use host networking when requested, otherwise use the namespace network.
-	// NetworkAlias only makes sense on the namespace bridge — host networking
-	// has no separate network namespace for aardvark-dns to resolve within.
-	if pod.Spec.HostNetwork {
-		b.WriteString("Network=host\n")
-	} else {
-		b.WriteString(fmt.Sprintf("Network=q8s-%s.network\n", pod.Namespace))
-		for _, alias := range serviceAliases {
-			if err := validateRefName("service alias", alias); err != nil {
-				return nil, err
-			}
-			b.WriteString(fmt.Sprintf("NetworkAlias=%s\n", alias))
-		}
-	}
-
-	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.name=%s\n", pod.Name))
-	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.namespace=%s\n", pod.Namespace))
-	for _, or := range pod.OwnerReferences {
-		if or.Kind == "Deployment" {
-			b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.deployment=%s\n", or.Name))
-		}
-	}
-	// Propagate the Pod's own labels onto the container so Service selector
-	// matching can be done with a plain `podman ps --filter label=k=v` built
-	// straight from Service.Spec.Selector, with no separate bookkeeping.
-	for k, v := range pod.Labels {
-		if err := validateLabelPair(k, v); err != nil {
-			return nil, err
-		}
-		b.WriteString(fmt.Sprintf("Label=%s=%s\n", k, v))
-	}
-
-	if pod.Spec.Containers[0].LivenessProbe != nil {
-		if cmd := pod.Spec.Containers[0].LivenessProbe.Exec; cmd != nil && len(cmd.Command) > 0 {
-			for _, part := range cmd.Command {
-				if err := noControlChars("healthCheck command", part); err != nil {
-					return nil, err
-				}
-			}
-			b.WriteString(fmt.Sprintf("HealthCmd=%s\n", strings.Join(cmd.Command, " ")))
-		}
-		if pod.Spec.Containers[0].LivenessProbe.InitialDelaySeconds > 0 {
-			b.WriteString(fmt.Sprintf("HealthStartPeriod=%ds\n", pod.Spec.Containers[0].LivenessProbe.InitialDelaySeconds))
-		}
-	}
-
-	b.WriteString("\n[Unit]\n")
-	b.WriteString(fmt.Sprintf("Description=Pod %s\n", pod.Name))
-	// Order after q8s-api so a host reboot doesn't race the container's
-	// ExecStart --env-file against q8s-api re-rendering it (q8s renders the
-	// per-pod _env files before sd_notify READY). Wants, not Requires: a
-	// standalone `q8s serve` with no installed q8s-api.service must still
-	// work — a missing unit here is a harmless no-op. See tic-1507.
-	b.WriteString("Wants=q8s-api.service\n")
-	b.WriteString("After=q8s-api.service\n")
-
-	// Every policy maps to an explicit Restart= line. Emitting nothing for
-	// Never (as older code did) is not neutral: quadlet/.container units
-	// default to on-failure, so a "run once, never restart" pod restarted
-	// on failure anyway. Defaulting empty to Always matches real k8s pod
-	// defaulting — but that normalization happens at the API boundary
-	// (handler POST/PATCH); the generator treats empty defensively the same
-	// way.
-	switch pod.Spec.RestartPolicy {
-	case corev1.RestartPolicyNever:
-		b.WriteString("\n[Service]\n")
-		b.WriteString("Restart=no\n")
-	default: // Always, OnFailure, empty (API defaulting) — restart
-		b.WriteString("StartLimitBurst=5\n")
-		b.WriteString("StartLimitIntervalSec=60\n")
-		b.WriteString("\n[Service]\n")
-		if pod.Spec.RestartPolicy == corev1.RestartPolicyAlways || pod.Spec.RestartPolicy == "" {
-			// Always means restart regardless of exit code -- on-failure
-			// would silently strand the pod as "Succeeded" on a clean
-			// exit 0 (confirmed live 2026-08-29: a container that exited
-			// 0 due to missing config never restarted, even though the
-			// Deployment's replicas stayed at 1).
-			b.WriteString("Restart=always\n")
-		} else {
-			b.WriteString("Restart=on-failure\n")
-		}
-		b.WriteString("RestartSec=5\n")
-	}
-
-	b.WriteString("\n[Install]\n")
-	b.WriteString("WantedBy=default.target\n")
-
-	return []byte(b.String()), nil
+	return withTemplateHash(content), nil
 }
 
 // JobContainer generates a .container quadlet for a Job's pod template.
@@ -454,10 +425,11 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 		if err := validateEnvName(env.Name); err != nil {
 			return nil, err
 		}
-		if err := noControlChars("environment variable value", env.Value); err != nil {
+		line, err := envLine(env.Name, env.Value)
+		if err != nil {
 			return nil, err
 		}
-		b.WriteString(fmt.Sprintf("Environment=%s=%s\n", env.Name, env.Value))
+		b.WriteString(line)
 	}
 
 	for _, vol := range spec.Volumes {
@@ -469,19 +441,23 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 				if err := validatePath("mountPath", vm.MountPath); err != nil {
 					return nil, err
 				}
+				if writeEmptyDirShm(&b, vol, vm.MountPath) {
+					continue
+				}
+				readOnly := volumeMountReadOnly(vm, vol)
 				switch {
 				case vol.PersistentVolumeClaim != nil:
 					if err := validateRefName("persistentVolumeClaim.claimName", vol.PersistentVolumeClaim.ClaimName); err != nil {
 						return nil, err
 					}
 					if pvc, ok := pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
-						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath)
+						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath, readOnly)
 						if err != nil {
 							return nil, err
 						}
 						b.WriteString(line)
 					} else {
-						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s:Z\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
+						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, mountOptions(readOnly, "Z")))
 					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
@@ -504,7 +480,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 					if err := validateRefName("volume.name", vol.Name); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s:%s\n", vol.Name, vm.MountPath))
+					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, mountOptions(readOnly, "")))
 				}
 			}
 		}
@@ -518,6 +494,15 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 
 	b.WriteString(fmt.Sprintf("Label=io.kubernetes.job.name=%s\n", job.Name))
 	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.namespace=%s\n", ns))
+	b.WriteString(ManagedByLabel + "\n")
+
+	writeGPUDevice(&b, spec.Containers[0].Resources.Limits)
+	if err := writeUlimits(&b, job.Spec.Template.Annotations); err != nil {
+		return nil, err
+	}
+	if err := writeHealthCheck(&b, spec.Containers[0]); err != nil {
+		return nil, err
+	}
 
 	b.WriteString("\n[Unit]\n")
 	b.WriteString(fmt.Sprintf("Description=Job %s/%s\n", ns, name))
@@ -532,7 +517,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 
 	// No [Install] — the job is started on demand, not by a target.
 
-	return []byte(b.String()), nil
+	return withTemplateHash([]byte(b.String())), nil
 }
 
 // CronContainer generates the .container quadlet for a CronJob's pod template.
@@ -589,10 +574,11 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 		if err := validateEnvName(env.Name); err != nil {
 			return nil, err
 		}
-		if err := noControlChars("environment variable value", env.Value); err != nil {
+		line, err := envLine(env.Name, env.Value)
+		if err != nil {
 			return nil, err
 		}
-		b.WriteString(fmt.Sprintf("Environment=%s=%s\n", env.Name, env.Value))
+		b.WriteString(line)
 	}
 
 	for _, vol := range spec.Volumes {
@@ -604,19 +590,23 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 				if err := validatePath("mountPath", vm.MountPath); err != nil {
 					return nil, err
 				}
+				if writeEmptyDirShm(&b, vol, vm.MountPath) {
+					continue
+				}
+				readOnly := volumeMountReadOnly(vm, vol)
 				switch {
 				case vol.PersistentVolumeClaim != nil:
 					if err := validateRefName("persistentVolumeClaim.claimName", vol.PersistentVolumeClaim.ClaimName); err != nil {
 						return nil, err
 					}
 					if pvc, ok := pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
-						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath)
+						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath, readOnly)
 						if err != nil {
 							return nil, err
 						}
 						b.WriteString(line)
 					} else {
-						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s:Z\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath))
+						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, mountOptions(readOnly, "Z")))
 					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
@@ -639,7 +629,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 					if err := validateRefName("volume.name", vol.Name); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s:%s\n", vol.Name, vm.MountPath))
+					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, mountOptions(readOnly, "")))
 				}
 			}
 		}
@@ -653,6 +643,15 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 
 	b.WriteString(fmt.Sprintf("Label=io.kubernetes.cronjob.name=%s\n", cj.Name))
 	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.namespace=%s\n", ns))
+	b.WriteString(ManagedByLabel + "\n")
+
+	writeGPUDevice(&b, spec.Containers[0].Resources.Limits)
+	if err := writeUlimits(&b, cj.Spec.JobTemplate.Spec.Template.Annotations); err != nil {
+		return nil, err
+	}
+	if err := writeHealthCheck(&b, spec.Containers[0]); err != nil {
+		return nil, err
+	}
 
 	b.WriteString("\n[Unit]\n")
 	b.WriteString(fmt.Sprintf("Description=CronJob %s/%s\n", ns, name))
@@ -666,7 +665,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 
 	// No [Install] — activated by the timer.
 
-	return []byte(b.String()), nil
+	return withTemplateHash([]byte(b.String())), nil
 }
 
 // CronTimer generates the .timer quadlet for a CronJob.
@@ -678,6 +677,7 @@ func CronTimer(name string, cj *batchv1.CronJob) ([]byte, error) {
 
 	var b strings.Builder
 
+	b.WriteString("# app.kubernetes.io/managed-by=q8s\n")
 	b.WriteString("[Unit]\n")
 	b.WriteString(fmt.Sprintf("Description=Timer for CronJob %s/%s\n", cj.Namespace, name))
 
@@ -806,6 +806,18 @@ const (
 	// AnnotationHostPath is the PVC annotation key that supplies the host
 	// directory for the "hostpath" storage class.
 	AnnotationHostPath = "q8s.io/host-path"
+
+	// AnnotationSELinuxLabel selects how a hostpath PVC is relabelled:
+	// "private" (the default, :Z) or "shared" (:z). A hostpath directory
+	// is potentially used by other containers or services on the host, so
+	// making :Z the default would relabel it for one pod and lock every
+	// other user out.
+	AnnotationSELinuxLabel = "q8s.io/selinux-label"
+
+	// AnnotationUlimits carries a comma separated list of podman Ulimit=
+	// items on a pod or pod template, for example
+	// "memlock=-1:-1,nofile=65536".
+	AnnotationUlimits = "q8s.io/ulimits"
 )
 
 // pvcStorageClass returns the effective storage class for a PVC, defaulting
@@ -838,20 +850,72 @@ func Volume(pvc *corev1.PersistentVolumeClaim) ([]byte, error) {
 
 	b.WriteString("[Volume]\n")
 	b.WriteString(fmt.Sprintf("VolumeName=%s\n", PVCVolumeName(pvc.Namespace, pvc.Name)))
+	b.WriteString(ManagedByLabel + "\n")
 
 	return []byte(b.String()), nil
 }
 
+// pvcSELinuxRelabel returns the SELinux relabel suffix for a hostpath PVC.
+// A missing annotation keeps the historical private label (:Z); "shared"
+// selects :z so a directory can be mounted by several containers without one
+// pod taking ownership of the host labels. Anything else is rejected rather
+// than interpolated, because this value becomes part of a quadlet line.
+func pvcSELinuxRelabel(pvc *corev1.PersistentVolumeClaim) (string, error) {
+	mode, ok := pvc.Annotations[AnnotationSELinuxLabel]
+	if !ok {
+		return "Z", nil
+	}
+	switch mode {
+	case "private":
+		return "Z", nil
+	case "shared":
+		return "z", nil
+	default:
+		return "", fmt.Errorf("PVC %s/%s has invalid %s annotation %q (must be private or shared)",
+			pvc.Namespace, pvc.Name, AnnotationSELinuxLabel, mode)
+	}
+}
+
+// volumeMountReadOnly reports whether a mount must be read-only. Kubernetes
+// forces read-only when either the volume mount or the PVC volume source asks
+// for it.
+func volumeMountReadOnly(vm corev1.VolumeMount, vol corev1.Volume) bool {
+	if vm.ReadOnly {
+		return true
+	}
+	return vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ReadOnly
+}
+
+// mountOptions returns the colon-prefixed mount option suffix for a Volume=
+// line. readOnly adds the podman ro option; relabel is the SELinux suffix
+// (Z or z) or empty when the directive carries no SELinux relabel. The empty
+// result keeps directives that had no options byte-identical.
+func mountOptions(readOnly bool, relabel string) string {
+	opts := relabel
+	if readOnly {
+		if opts == "" {
+			opts = "ro"
+		} else {
+			opts = "ro," + opts
+		}
+	}
+	if opts == "" {
+		return ""
+	}
+	return ":" + opts
+}
+
 // pvcVolumeDirective returns the Volume= value for a PVC-backed volume mount.
 // It inspects the PVC's storageClassName and annotations to decide between a
-// named-volume reference (with :Z or :z) and a hostpath bind mount.
-func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath string) (string, error) {
+// named-volume reference (with :Z or :z) and a hostpath bind mount, and adds
+// the ro option when readOnly is set.
+func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath string, readOnly bool) (string, error) {
 	class := pvcStorageClass(pvc)
 	switch class {
 	case StorageClassStandard:
-		return fmt.Sprintf("Volume=%s-%s.volume:%s:Z\n", ns, pvc.Name, mountPath), nil
+		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, mountOptions(readOnly, "Z")), nil
 	case StorageClassShared:
-		return fmt.Sprintf("Volume=%s-%s.volume:%s:z\n", ns, pvc.Name, mountPath), nil
+		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, mountOptions(readOnly, "z")), nil
 	case StorageClassHostPath:
 		hostPath, ok := pvc.Annotations[AnnotationHostPath]
 		if !ok || hostPath == "" {
@@ -861,11 +925,15 @@ func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath 
 		if err := validatePath("host-path annotation", hostPath); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Volume=%s:%s:Z\n", hostPath, mountPath), nil
+		relabel, err := pvcSELinuxRelabel(pvc)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Volume=%s:%s%s\n", hostPath, mountPath, mountOptions(readOnly, relabel)), nil
 	default:
 		// Unknown class — fall back to named volume without SELinux option
 		// for forward compatibility.
-		return fmt.Sprintf("Volume=%s-%s.volume:%s\n", ns, pvc.Name, mountPath), nil
+		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, mountOptions(readOnly, "")), nil
 	}
 }
 
@@ -876,6 +944,7 @@ func Network(name string) ([]byte, error) {
 
 	b.WriteString("[Network]\n")
 	b.WriteString(fmt.Sprintf("NetworkName=q8s-%s\n", name))
+	b.WriteString(ManagedByLabel + "\n")
 
 	return []byte(b.String()), nil
 }

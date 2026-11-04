@@ -1,5 +1,7 @@
 # Supported Resources
 
+Every pod spec q8s accepts must contain exactly one container; specs with additional containers, initContainers, or ephemeralContainers are rejected.
+
 ## core/v1
 
 | Resource | kubectl verbs | Notes |
@@ -76,7 +78,9 @@ claim colliding with a volume some unrelated non-q8s deployment created —
 never share one backing volume, and `podman volume ls` shows which
 namespace/claim owns each volume.
 
-The `hostpath` class requires a `q8s.io/host-path` annotation on the PVC specifying the absolute host directory:
+The `hostpath` class requires a `q8s.io/host-path` annotation on the PVC specifying the absolute host directory. It also honours an optional `q8s.io/selinux-label` annotation: `private` (the default, `:Z`) relabels the host directory for one container, while `shared` (`:z`) lets several containers mount it without locking each other out. Any other value is rejected.
+
+Mounts with `readOnly: true`, or PVC volume sources with `persistentVolumeClaim.readOnly: true`, get the Podman `ro` mount option (`:ro,Z`, `:ro,z`, or `:ro`).
 
 ```yaml
 apiVersion: v1
@@ -106,6 +110,10 @@ spec:
 - **Label selectors**: `key=value`, `key==value`, `key!=value`, `key`, `!key` on all list endpoints
 - **Patch**: JSON merge patch and strategic merge patch (array-merge-by-name for containers/env/volumes); RFC 6902 JSON Patch (`application/json-patch+json`) on all resources — Terraform's provider patches Secret `data` keys and container/spec changes this way
 - **Resource limits**: `resources.limits.memory` → `PodmanArgs=--memory=N --memory-swap=-1`, `resources.limits.cpu` → `PodmanArgs=--cpus=N` (via PodmanArgs for podman-version portability; skipped when cgroup controllers not delegated)
+- **GPU**: `resources.limits["nvidia.com/gpu"]` of at least 1 → `AddDevice=nvidia.com/gpu=all` (CDI; podman resolves the GPU devices). The count is not allocated, so any request of 1 or more exposes every CDI GPU on the host.
+- **Shared memory**: an `emptyDir` with `medium: Memory` mounted at `/dev/shm` → `ShmSize=<bytes>` from `sizeLimit`; no `Volume=` line is generated for it. Without a `sizeLimit`, nothing is emitted.
+- **Ulimits**: pod annotation `q8s.io/ulimits` (for example `memlock=-1:-1,nofile=65536`) → one `Ulimit=<item>` line per comma separated item. Items must match `name=soft[:hard]` and are rejected otherwise.
+- **Readiness**: `readinessProbe.exec` or `readinessProbe.httpGet` on the first container, when there is no `livenessProbe`, → `HealthCmd=`, `HealthInterval=` (httpGet only, from `periodSeconds`) and `HealthStartPeriod=` (from `initialDelaySeconds`). An httpGet probe becomes `HealthCmd=curl -fsS http://127.0.0.1:<port><path>`; a named port is resolved against the container's ports and an unknown name emits no health check.
 - **Port semantics**: `containerPort` is internal-only (namespace network); `hostPort` publishes to host via `PublishPort=`; Service never binds a port — it maps selector + `targetPort` to DNS aliases and ingress backends. Deployment replicas get auto-allocated loopback ports (20000-32767).
 - **CrashLoopBackOff**: detected from restart count + non-zero exit, shown in pod status
 - **StartLimitBurst=5**: systemd gives up after 5 failures within 60s

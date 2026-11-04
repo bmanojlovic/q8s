@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 )
 
@@ -172,6 +173,33 @@ func validateIngress(ing *networkingv1.Ingress) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// validateSingleContainer rejects pod specs q8s cannot faithfully run.
+// Pods and Deployments may carry any number of containers (they become a
+// Podman pod), but the Job/CronJob generators still build their one unit
+// from spec.containers[0], so sidecars there would be accepted and silently
+// never started. initContainers and ephemeralContainers are unsupported
+// everywhere. Rejecting them at the API boundary makes kubectl apply fail
+// loudly instead.
+func validateSingleContainer(kind string, spec *corev1.PodSpec, allowMultipleContainers bool) error {
+	n := 0
+	if spec != nil {
+		n = len(spec.Containers)
+	}
+	if n == 0 {
+		return fmt.Errorf("%s has no containers", kind)
+	}
+	if n > 1 && !allowMultipleContainers {
+		return fmt.Errorf("%s has %d containers: sidecars in Jobs/CronJobs are not supported yet", kind, n)
+	}
+	if len(spec.InitContainers) > 0 {
+		return fmt.Errorf("%s has %d initContainers: initContainers are not supported", kind, len(spec.InitContainers))
+	}
+	if len(spec.EphemeralContainers) > 0 {
+		return fmt.Errorf("%s has %d ephemeralContainers: ephemeralContainers are not supported", kind, len(spec.EphemeralContainers))
 	}
 	return nil
 }

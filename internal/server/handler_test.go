@@ -120,6 +120,26 @@ func do(t *testing.T, method, url string, body interface{}) *http.Response {
 	return resp
 }
 
+// strategicPatch sends body as a Kubernetes strategic merge patch, the way
+// kubectl apply does.
+func strategicPatch(t *testing.T, url string, body interface{}) *http.Response {
+	t.Helper()
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPatch, url, bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("PATCH %s: %v", url, err)
+	}
+	req.Header.Set("Content-Type", "application/strategic-merge-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PATCH %s: %v", url, err)
+	}
+	return resp
+}
+
 func decodeBody(t *testing.T, resp *http.Response) map[string]interface{} {
 	t.Helper()
 	defer resp.Body.Close()
@@ -442,7 +462,7 @@ func TestPodWatch(t *testing.T) {
 	resp.Body.Close()
 	time.Sleep(50 * time.Millisecond)
 
-	st.UpdatePodPhase("default", "watched", corev1.PodRunning)
+	st.UpdatePodPhase("default", "watched", corev1.PodRunning, "")
 	time.Sleep(50 * time.Millisecond)
 
 	resp = do(t, http.MethodDelete, ts.URL+"/api/v1/namespaces/default/pods/watched", nil)
@@ -605,7 +625,7 @@ func TestPVCCreateBindsAndWritesQuadlet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected quadlet volume file: %v", err)
 	}
-	if want := "[Volume]\nVolumeName=default-data\n"; string(content) != want {
+	if want := "[Volume]\nVolumeName=default-data\nLabel=app.kubernetes.io/managed-by=q8s\n"; string(content) != want {
 		t.Fatalf("unexpected volume file content:\n%s", content)
 	}
 
@@ -662,7 +682,7 @@ func TestReconcileQuadletsBindsExistingPVC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected reconcile to write volume file: %v", err)
 	}
-	if want := "[Volume]\nVolumeName=default-legacy\n"; string(content) != want {
+	if want := "[Volume]\nVolumeName=default-legacy\nLabel=app.kubernetes.io/managed-by=q8s\n"; string(content) != want {
 		t.Fatalf("expected reconcile to rewrite unscoped volume file, got:\n%s", content)
 	}
 }
@@ -1614,7 +1634,7 @@ func TestDeploymentStatusForRollout(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CreatePod %s: %v", name, err)
 		}
-		st.UpdatePodPhase("default", name, corev1.PodRunning)
+		st.UpdatePodPhase("default", name, corev1.PodRunning, "")
 	}
 
 	// GET must show observedGeneration == generation and ready == desired,
@@ -1850,7 +1870,7 @@ func TestEventGeneration(t *testing.T) {
 	assertStatus(t, resp, 201)
 	resp.Body.Close()
 
-	st.UpdatePodPhase("default", "evented", corev1.PodRunning)
+	st.UpdatePodPhase("default", "evented", corev1.PodRunning, "")
 
 	resp = do(t, http.MethodDelete, ts.URL+"/api/v1/namespaces/default/pods/evented", nil)
 	assertStatus(t, resp, 200)
@@ -2931,5 +2951,449 @@ func TestSecretStringDataWinsOnConflict(t *testing.T) {
 	}
 	if len(sec.StringData) != 0 {
 		t.Errorf("StringData should be cleared, got %v", sec.StringData)
+	}
+}
+
+// --- multi-container validation and materialization ---
+
+func appendContainer(spec map[string]interface{}, name string) {
+	spec["containers"] = append(spec["containers"].([]interface{}),
+		map[string]interface{}{"name": name, "image": "busybox"})
+}
+
+// Jobs and CronJobs still render exactly one unit from containers[0], so a
+// sidecar there must be refused before the object is stored or any unit file
+// is written.
+func TestCreateRejectsSidecarsInJobsAndCronJobs(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body func() map[string]interface{}
+		list func(*store.Store) int
+	}{
+		{
+			name: "job",
+			path: "/apis/batch/v1/namespaces/default/jobs",
+			body: func() map[string]interface{} {
+				b := jobBody("default", "sidecar-job")
+				tmpl := b["spec"].(map[string]interface{})["template"].(map[string]interface{})
+				appendContainer(tmpl["spec"].(map[string]interface{}), "sidecar")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Jobs("default")) },
+		},
+		{
+			name: "cronjob",
+			path: "/apis/batch/v1/namespaces/default/cronjobs",
+			body: func() map[string]interface{} {
+				b := cronJobBody("default", "sidecar-cron", "0 * * * *")
+				jt := b["spec"].(map[string]interface{})["jobTemplate"].(map[string]interface{})
+				tmpl := jt["spec"].(map[string]interface{})["template"].(map[string]interface{})
+				appendContainer(tmpl["spec"].(map[string]interface{}), "sidecar")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.CronJobs("default")) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := store.New()
+			quadletDir := t.TempDir()
+			srv := newTestServerWithQuadletDir(t, st, quadletDir)
+			ts := httptest.NewServer(srv)
+			t.Cleanup(ts.Close)
+
+			resp := post(t, ts.URL+tt.path, tt.body())
+			assertStatus(t, resp, http.StatusBadRequest)
+			m := decodeBody(t, resp)
+			msg, _ := m["message"].(string)
+			if !strings.Contains(msg, "sidecars in Jobs/CronJobs are not supported yet") {
+				t.Fatalf("expected sidecar error, got %q", msg)
+			}
+			if n := tt.list(st); n != 0 {
+				t.Fatalf("rejected object was stored: %d entries", n)
+			}
+			entries, err := os.ReadDir(quadletDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("rejected object wrote %d quadlet file(s)", len(entries))
+			}
+		})
+	}
+}
+
+func TestPodWithInitContainerRejected(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := podBody("default", "initpod", "nginx")
+	body["spec"].(map[string]interface{})["initContainers"] = []interface{}{
+		map[string]interface{}{"name": "init", "image": "busybox"},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", body)
+	assertStatus(t, resp, http.StatusBadRequest)
+	m := decodeBody(t, resp)
+	if msg, _ := m["message"].(string); !strings.Contains(msg, "initContainers are not supported") {
+		t.Fatalf("expected initContainers rejection, got %q", msg)
+	}
+	if n := len(st.Pods("default")); n != 0 {
+		t.Fatalf("rejected pod was stored: %d entries", n)
+	}
+	entries, err := os.ReadDir(quadletDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("rejected pod wrote %d quadlet file(s)", len(entries))
+	}
+}
+
+// multiContainerPodBody builds a two-container Pod. The app container
+// publishes a hostPort, which must move to the .pod file.
+func multiContainerPodBody(ns, name string) map[string]interface{} {
+	return map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata":   map[string]interface{}{"name": name, "namespace": ns, "labels": map[string]interface{}{"app": name}},
+		"spec": map[string]interface{}{
+			"containers": []interface{}{
+				map[string]interface{}{
+					"name":  "web",
+					"image": "nginx",
+					"ports": []interface{}{map[string]interface{}{"containerPort": 80, "hostPort": 8080}},
+					"env":   []interface{}{map[string]interface{}{"name": "ROLE", "value": "web"}},
+				},
+				map[string]interface{}{
+					"name":  "sidecar",
+					"image": "busybox",
+					"env":   []interface{}{map[string]interface{}{"name": "ROLE", "value": "sidecar"}},
+				},
+			},
+		},
+	}
+}
+
+func TestPodWithTwoContainersWritesPodFiles(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", multiContainerPodBody("default", "multi"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	podOut := readTestFile(t, filepath.Join(quadletDir, "default-multi.pod"))
+	for _, want := range []string{"[Pod]", "PodName=default-multi", "Network=q8s-default.network", "PublishPort=8080:80/tcp", "Label=io.kubernetes.pod.name=multi", "Label=app=multi"} {
+		if !strings.Contains(podOut, want) {
+			t.Fatalf("pod file missing %q:\n%s", want, podOut)
+		}
+	}
+
+	webOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-web.container"))
+	for _, want := range []string{"Image=nginx", "ContainerName=default-multi-web", "Pod=default-multi.pod", "Environment=ROLE=web", "Label=io.kubernetes.container.name=web"} {
+		if !strings.Contains(webOut, want) {
+			t.Fatalf("web container missing %q:\n%s", want, webOut)
+		}
+	}
+	for _, unwanted := range []string{"Network=", "NetworkAlias=", "PublishPort=", "ShmSize="} {
+		if strings.Contains(webOut, unwanted) {
+			t.Fatalf("web container must not carry pod-level key %q:\n%s", unwanted, webOut)
+		}
+	}
+
+	sidecarOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-sidecar.container"))
+	for _, want := range []string{"Image=busybox", "ContainerName=default-multi-sidecar", "Pod=default-multi.pod", "Environment=ROLE=sidecar", "Label=io.kubernetes.container.name=sidecar"} {
+		if !strings.Contains(sidecarOut, want) {
+			t.Fatalf("sidecar container missing %q:\n%s", want, sidecarOut)
+		}
+	}
+
+	resp = do(t, http.MethodDelete, ts.URL+"/api/v1/namespaces/default/pods/multi", nil)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	for _, name := range []string{"default-multi.pod", "default-multi-web.container", "default-multi-sidecar.container"} {
+		if _, err := os.Stat(filepath.Join(quadletDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed on delete, stat err=%v", name, err)
+		}
+	}
+}
+
+func TestDeploymentWithTwoContainersWritesPodFiles(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := deployBody("default", "multi-dep", "nginx")
+	tmpl := body["spec"].(map[string]interface{})["template"].(map[string]interface{})
+	tmplSpec := tmpl["spec"].(map[string]interface{})
+	tmplSpec["containers"].([]interface{})[0].(map[string]interface{})["name"] = "web"
+	tmplSpec["containers"].([]interface{})[0].(map[string]interface{})["ports"] = []interface{}{
+		map[string]interface{}{"containerPort": 80},
+	}
+	appendContainer(tmplSpec, "sidecar")
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	podOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-dep-0.pod"))
+	for _, want := range []string{"PodName=default-multi-dep-0", "Network=q8s-default.network", "Label=io.kubernetes.pod.deployment=multi-dep"} {
+		if !strings.Contains(podOut, want) {
+			t.Fatalf("deployment pod file missing %q:\n%s", want, podOut)
+		}
+	}
+	webOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-dep-0-web.container"))
+	if !strings.Contains(webOut, "Pod=default-multi-dep-0.pod") {
+		t.Fatalf("deployment web container missing Pod=:\n%s", webOut)
+	}
+	sidecarOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-dep-0-sidecar.container"))
+	if !strings.Contains(sidecarOut, "Image=busybox") {
+		t.Fatalf("deployment sidecar container missing image:\n%s", sidecarOut)
+	}
+
+	resp = do(t, http.MethodDelete, ts.URL+"/apis/apps/v1/namespaces/default/deployments/multi-dep", nil)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	for _, name := range []string{"default-multi-dep-0.pod", "default-multi-dep-0-web.container", "default-multi-dep-0-sidecar.container"} {
+		if _, err := os.Stat(filepath.Join(quadletDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed on delete, stat err=%v", name, err)
+		}
+	}
+}
+
+// TestDeploymentPatchAcceptsSecondContainer keeps patch coverage for the new
+// behavior: a PATCH that merges a sidecar into a Deployment is now accepted
+// and renders all three files.
+func TestDeploymentPatchAcceptsSecondContainer(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBody("default", "patched", "nginx:1.0"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	patch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"containers": []interface{}{
+						map[string]interface{}{"name": "patched", "image": "nginx:1.0"},
+						map[string]interface{}{"name": "sidecar", "image": "busybox"},
+					},
+				},
+			},
+		},
+	}
+	resp = do(t, http.MethodPatch, ts.URL+"/apis/apps/v1/namespaces/default/deployments/patched", patch)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	for _, name := range []string{"default-patched-0.pod", "default-patched-0-patched.container", "default-patched-0-sidecar.container"} {
+		if _, err := os.Stat(filepath.Join(quadletDir, name)); err != nil {
+			t.Fatalf("expected patched deployment to render %s: %v", name, err)
+		}
+	}
+}
+
+// TestDeploymentStrategicPatchRemovesSidecar: kubectl apply of a one-container
+// Deployment over a two-container one sends $patch/$setElementOrder directives;
+// the stored spec and the rendered quadlets must lose the sidecar.
+func TestDeploymentStrategicPatchRemovesSidecar(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBodyWithContainers("default", "duo", "web", "sidecar"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	for _, name := range []string{"default-duo-0.pod", "default-duo-0-web.container", "default-duo-0-sidecar.container"} {
+		if _, err := os.Stat(filepath.Join(quadletDir, name)); err != nil {
+			t.Fatalf("expected %s after create: %v", name, err)
+		}
+	}
+
+	// The exact body kubectl apply sends when removing the sidecar container.
+	patch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"$setElementOrder/containers": []interface{}{map[string]interface{}{"name": "web"}},
+					"containers":                  []interface{}{map[string]interface{}{"$patch": "delete", "name": "sidecar"}},
+				},
+			},
+		},
+	}
+	resp = strategicPatch(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments/duo", patch)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	body := decodeBody(t, get(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments/duo"))
+	spec := body["spec"].(map[string]interface{})
+	tmplSpec := spec["template"].(map[string]interface{})["spec"].(map[string]interface{})
+	containers := tmplSpec["containers"].([]interface{})
+	if len(containers) != 1 {
+		t.Fatalf("expected 1 container after patch, got %d: %v", len(containers), containers)
+	}
+	if name := containers[0].(map[string]interface{})["name"]; name != "web" {
+		t.Fatalf("expected remaining container web, got %v", name)
+	}
+
+	for _, name := range []string{"default-duo-0.pod", "default-duo-0-sidecar.container"} {
+		if _, err := os.Stat(filepath.Join(quadletDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("expected stale %s to be removed, stat err=%v", name, err)
+		}
+	}
+	single := readTestFile(t, filepath.Join(quadletDir, "default-duo-0.container"))
+	if !strings.Contains(single, "Image=nginx") || strings.Contains(single, "Pod=") {
+		t.Fatalf("expected a standalone single-container unit, got:\n%s", single)
+	}
+}
+
+// deployBodyWithContainers builds a Deployment with the given container names,
+// in that order, at one replica.
+func deployBodyWithContainers(ns, name string, containers ...string) map[string]interface{} {
+	body := deployBody(ns, name, "nginx")
+	spec := body["spec"].(map[string]interface{})["template"].(map[string]interface{})["spec"].(map[string]interface{})
+	list := make([]interface{}, 0, len(containers))
+	for _, c := range containers {
+		list = append(list, map[string]interface{}{"name": c, "image": "nginx"})
+	}
+	spec["containers"] = list
+	return body
+}
+
+// TestDeploymentShrinkRemovesStalePodUnits: 2 containers -> 1 must remove the
+// old .pod and both member .container files, while a hand-written quadlet in
+// the same directory survives.
+func TestDeploymentShrinkRemovesStalePodUnits(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBodyWithContainers("default", "duo", "web", "sidecar"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	for _, name := range []string{"default-duo-0.pod", "default-duo-0-web.container", "default-duo-0-sidecar.container"} {
+		if _, err := os.Stat(filepath.Join(quadletDir, name)); err != nil {
+			t.Fatalf("expected %s after create: %v", name, err)
+		}
+	}
+
+	// A hand-written unit for the same pod. It has the io.kubernetes labels
+	// but no managed-by marker, so q8s must never touch it.
+	handWritten := "[Container]\nImage=nginx\n" +
+		"Label=io.kubernetes.pod.namespace=default\n" +
+		"Label=io.kubernetes.pod.name=duo-0\n"
+	maya := filepath.Join(quadletDir, "maya.container")
+	if err := os.WriteFile(maya, []byte(handWritten), 0644); err != nil {
+		t.Fatalf("write hand-written unit: %v", err)
+	}
+
+	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/duo", deployBodyWithContainers("default", "duo", "web"))
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	for _, name := range []string{"default-duo-0.pod", "default-duo-0-web.container", "default-duo-0-sidecar.container"} {
+		if _, err := os.Stat(filepath.Join(quadletDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("expected stale %s to be removed, stat err=%v", name, err)
+		}
+	}
+	single := readTestFile(t, filepath.Join(quadletDir, "default-duo-0.container"))
+	if !strings.Contains(single, "Image=nginx") || strings.Contains(single, "Pod=") {
+		t.Fatalf("expected a standalone single-container unit, got:\n%s", single)
+	}
+	if got := readTestFile(t, maya); got != handWritten {
+		t.Fatalf("hand-written quadlet was modified:\ngot:\n%s\nwant:\n%s", got, handWritten)
+	}
+}
+
+// TestDeploymentGrowRemovesStaleSingleContainer: 1 -> 2 must remove the old
+// single .container now that the pod shape replaces it.
+func TestDeploymentGrowRemovesStaleSingleContainer(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBodyWithContainers("default", "uni", "web"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	old := filepath.Join(quadletDir, "default-uni-0.container")
+	if _, err := os.Stat(old); err != nil {
+		t.Fatalf("expected single-container unit after create: %v", err)
+	}
+
+	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/uni", deployBodyWithContainers("default", "uni", "web", "sidecar"))
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("expected old single-container unit to be removed, stat err=%v", err)
+	}
+	for _, name := range []string{"default-uni-0.pod", "default-uni-0-web.container", "default-uni-0-sidecar.container"} {
+		if _, err := os.Stat(filepath.Join(quadletDir, name)); err != nil {
+			t.Fatalf("expected %s after grow: %v", name, err)
+		}
+	}
+}
+
+// TestUnchangedDeploymentReapplyDoesNotRewrite checks that re-applying an
+// identical spec leaves the quadlet file (mtime) alone. Chtimes first so the
+// assertion cannot pass just because both writes landed in the same clock tick.
+func TestUnchangedDeploymentReapplyDoesNotRewrite(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := deployBodyWithContainers("default", "same", "web")
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	path := filepath.Join(quadletDir, "default-same-0.container")
+	before := readTestFile(t, path)
+	old := time.Unix(1000000, 0)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/same", body)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after re-apply: %v", err)
+	}
+	if !info.ModTime().Equal(old) {
+		t.Fatalf("unchanged re-apply rewrote the file (mtime %v, want %v)", info.ModTime(), old)
+	}
+	if got := readTestFile(t, path); got != before {
+		t.Fatalf("unchanged re-apply changed the content:\ngot:\n%s\nwant:\n%s", got, before)
 	}
 }

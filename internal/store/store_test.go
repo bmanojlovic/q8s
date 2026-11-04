@@ -216,13 +216,13 @@ func TestUpdatePodPhase(t *testing.T) {
 	st := newStore(t)
 	st.CreatePod(makePod("default", "nginx", "nginx"))
 
-	st.UpdatePodPhase("default", "nginx", corev1.PodRunning)
+	st.UpdatePodPhase("default", "nginx", corev1.PodRunning, "")
 	got, _ := st.GetPod("default", "nginx")
 	if got.Status.Phase != corev1.PodRunning {
 		t.Fatalf("expected Running, got %s", got.Status.Phase)
 	}
 
-	st.UpdatePodPhase("default", "nginx", corev1.PodFailed)
+	st.UpdatePodPhase("default", "nginx", corev1.PodFailed, "")
 	got, _ = st.GetPod("default", "nginx")
 	if got.Status.Phase != corev1.PodFailed {
 		t.Fatalf("expected Failed, got %s", got.Status.Phase)
@@ -234,7 +234,7 @@ func TestUpdatePodPhaseContainerReady(t *testing.T) {
 	pod := makePod("default", "app", "img")
 	st.CreatePod(pod)
 
-	st.UpdatePodPhase("default", "app", corev1.PodRunning)
+	st.UpdatePodPhase("default", "app", corev1.PodRunning, "")
 	got, _ := st.GetPod("default", "app")
 	if len(got.Status.ContainerStatuses) == 0 {
 		t.Fatal("expected container statuses to be populated")
@@ -243,7 +243,7 @@ func TestUpdatePodPhaseContainerReady(t *testing.T) {
 		t.Fatal("expected container to be ready when Running")
 	}
 
-	st.UpdatePodPhase("default", "app", corev1.PodFailed)
+	st.UpdatePodPhase("default", "app", corev1.PodFailed, "")
 	got, _ = st.GetPod("default", "app")
 	if got.Status.ContainerStatuses[0].Ready {
 		t.Fatal("expected container NOT to be ready when Failed")
@@ -253,7 +253,95 @@ func TestUpdatePodPhaseContainerReady(t *testing.T) {
 func TestUpdatePodPhaseMissing(t *testing.T) {
 	st := newStore(t)
 	// Should not panic on missing pod
-	st.UpdatePodPhase("default", "ghost", corev1.PodRunning)
+	st.UpdatePodPhase("default", "ghost", corev1.PodRunning, "")
+}
+
+func TestUpdatePodPhaseHealth(t *testing.T) {
+	tests := []struct {
+		health string
+		ready  bool
+	}{
+		{"", true},
+		{"starting", false},
+		{"unhealthy", false},
+		{"healthy", true},
+	}
+	for _, tt := range tests {
+		st := newStore(t)
+		st.CreatePod(makePod("default", "app", "img"))
+
+		st.UpdatePodPhase("default", "app", corev1.PodRunning, tt.health)
+		got, _ := st.GetPod("default", "app")
+		if len(got.Status.ContainerStatuses) == 0 {
+			t.Fatal("expected container statuses to be populated")
+		}
+		if got.Status.ContainerStatuses[0].Ready != tt.ready {
+			t.Errorf("health %q: Ready = %v, want %v", tt.health, got.Status.ContainerStatuses[0].Ready, tt.ready)
+		}
+	}
+}
+
+func TestUpdatePodContainerPhases(t *testing.T) {
+	st := newStore(t)
+	_, err := st.CreatePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "multi", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "healthy", Image: "img-a"},
+			{Name: "starting", Image: "img-b"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	st.UpdatePodContainerPhases("default", "multi", corev1.PodRunning, map[string]store.ContainerSyncState{
+		"healthy":  {Phase: corev1.PodRunning, Health: "healthy"},
+		"starting": {Phase: corev1.PodRunning, Health: "starting"},
+	})
+
+	got, err := st.GetPod("default", "multi")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	if got.Status.Phase != corev1.PodRunning {
+		t.Fatalf("expected phase Running, got %q", got.Status.Phase)
+	}
+	if len(got.Status.ContainerStatuses) != 2 {
+		t.Fatalf("expected 2 container statuses, got %d", len(got.Status.ContainerStatuses))
+	}
+	ready := map[string]bool{}
+	for _, cs := range got.Status.ContainerStatuses {
+		ready[cs.Name] = cs.Ready
+	}
+	if !ready["healthy"] {
+		t.Errorf("expected healthy container Ready=true")
+	}
+	if ready["starting"] {
+		t.Errorf("expected starting container Ready=false")
+	}
+}
+
+func TestUpdatePodPhaseHealthBumpsResourceVersion(t *testing.T) {
+	st := newStore(t)
+	st.CreatePod(makePod("default", "app", "img"))
+
+	st.UpdatePodPhase("default", "app", corev1.PodRunning, "starting")
+	shown, _ := st.GetPod("default", "app")
+	if shown.Status.ContainerStatuses[0].Ready {
+		t.Fatal("expected container NOT to be ready while health is starting")
+	}
+
+	st.UpdatePodPhase("default", "app", corev1.PodRunning, "healthy")
+	got, _ := st.GetPod("default", "app")
+	if !got.Status.ContainerStatuses[0].Ready {
+		t.Fatal("expected container to be ready when health is healthy")
+	}
+	if got.Status.Phase != shown.Status.Phase {
+		t.Fatalf("expected phase to stay Running, got %s", got.Status.Phase)
+	}
+	if got.ResourceVersion == shown.ResourceVersion {
+		t.Fatalf("expected ResourceVersion to change on Ready transition, still %s", got.ResourceVersion)
+	}
 }
 
 func TestUpdatePodRestartInfo(t *testing.T) {
