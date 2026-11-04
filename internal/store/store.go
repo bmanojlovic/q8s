@@ -657,8 +657,11 @@ func (s *Store) UpdatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 }
 
 // UpdatePodPhase updates a pod's phase and syncs container ready state.
-// Ignores missing pods silently (race between delete and sync is fine).
-func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase) {
+// health is the Podman health of the container ("healthy", "unhealthy",
+// "starting") or "" when there is no health check, in which case readiness
+// is unaffected. Ignores missing pods silently (race between delete and sync
+// is fine).
+func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase, health string) {
 	s.mu.Lock()
 	key := types.NamespacedName{Namespace: ns, Name: name}
 	pod, ok := s.pods[key]
@@ -666,10 +669,10 @@ func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase) {
 		s.mu.Unlock()
 		return
 	}
-	changed := pod.Status.Phase != phase
-	if changed {
+	phaseChanged := pod.Status.Phase != phase
+	changed := phaseChanged
+	if phaseChanged {
 		pod.Status.Phase = phase
-		pod.ResourceVersion = s.incRV()
 	}
 	running := phase == corev1.PodRunning
 	if len(pod.Status.ContainerStatuses) == 0 && len(pod.Spec.Containers) > 0 {
@@ -686,14 +689,104 @@ func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase) {
 		// Not ready if crash-looping (has restarts with non-zero exit)
 		crashLooping := cs.RestartCount > 0 && cs.LastTerminationState.Terminated != nil &&
 			cs.LastTerminationState.Terminated.ExitCode != 0
-		cs.Ready = running && !crashLooping
+		// A health check exists when health is non-empty: Ready then needs
+		// Podman to report it healthy, not just running.
+		ready := running && !crashLooping && (health == "" || health == "healthy")
+		if cs.Ready != ready {
+			cs.Ready = ready
+			changed = true
+		}
+	}
+	if changed {
+		pod.ResourceVersion = s.incRV()
 	}
 	uid := pod.UID
 	s.mu.Unlock()
 	if changed {
 		go s.save()
-		if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
-			s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
+		if phaseChanged {
+			if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
+				s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
+			}
+		}
+	}
+}
+
+// ContainerSyncState is the phase and Podman health observed for one
+// container of a pod by the reconcile loop.
+type ContainerSyncState struct {
+	Phase  corev1.PodPhase
+	Health string
+}
+
+// UpdatePodContainerPhases updates a pod's phase and syncs each container's
+// ready state from per-container state. states is keyed by container name
+// (the reconcile loop matches Podman's io.kubernetes.container.name label to
+// it). A missing entry means the container is not observable yet and counts
+// as pending/not ready. Ready follows the same rules as UpdatePodPhase:
+// running, not crash-looping, and healthy (or no health check).
+func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase, states map[string]ContainerSyncState) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: ns, Name: name}
+	pod, ok := s.pods[key]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	phaseChanged := pod.Status.Phase != phase
+	changed := phaseChanged
+	if phaseChanged {
+		pod.Status.Phase = phase
+	}
+
+	old := make(map[string]corev1.ContainerStatus, len(pod.Status.ContainerStatuses))
+	for _, cs := range pod.Status.ContainerStatuses {
+		old[cs.Name] = cs
+	}
+	statuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
+	for _, c := range pod.Spec.Containers {
+		cs, ok := old[c.Name]
+		if !ok {
+			cs = corev1.ContainerStatus{Name: c.Name, Image: c.Image}
+			changed = true
+		}
+		if cs.Image == "" {
+			cs.Image = c.Image
+		}
+		state := states[c.Name]
+		running := state.Phase == corev1.PodRunning
+		crashLooping := cs.RestartCount > 0 && cs.LastTerminationState.Terminated != nil &&
+			cs.LastTerminationState.Terminated.ExitCode != 0
+		ready := running && !crashLooping && (state.Health == "" || state.Health == "healthy")
+		if cs.Ready != ready {
+			cs.Ready = ready
+			changed = true
+		}
+		statuses = append(statuses, cs)
+	}
+	if len(statuses) != len(pod.Status.ContainerStatuses) {
+		changed = true
+	} else {
+		for i := range statuses {
+			if statuses[i].Name != pod.Status.ContainerStatuses[i].Name {
+				changed = true
+				break
+			}
+		}
+	}
+	pod.Status.ContainerStatuses = statuses
+
+	if changed {
+		pod.ResourceVersion = s.incRV()
+	}
+	uid := pod.UID
+	s.mu.Unlock()
+	if changed {
+		go s.save()
+		if phaseChanged {
+			if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
+				s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
+			}
 		}
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -274,23 +276,252 @@ func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Req
 
 // deployUnit writes a quadlet file, daemon-reloads, then starts unitName (if non-empty).
 func (s *Server) deployUnit(dir, filename string, content []byte, unitName string) {
-	if err := writeQuadletFile(dir, filename, content); err != nil {
-		fmt.Printf("write %s: %v\n", filename, err)
+	var units []string
+	if unitName != "" {
+		units = []string{unitName}
+	}
+	s.deployFiles(dir, map[string][]byte{filename: content}, units)
+}
+
+// deployFiles writes every file of one workload (a pod may need a .pod plus
+// one .container per container), daemon-reloads once, then starts each unit.
+func (s *Server) deployFiles(dir string, files map[string][]byte, units []string) {
+	changed, err := writeQuadletFilesTracked(dir, files)
+	if err != nil {
+		fmt.Printf("%v\n", err)
 		return
 	}
+	s.reloadAndRun(units, false, false, changed)
+}
+
+// deployPodFiles is deployFiles for a pod or Deployment instance. In addition
+// to writing the files, it removes units q8s generated for that same pod
+// earlier and no longer renders (a container was renamed or removed, or the
+// pod changed between the standalone and Podman-pod shapes). With restart set
+// it restarts only the services whose unit content actually changed.
+func (s *Server) deployPodFiles(dir, ns, podName string, files map[string][]byte, units []string, restart bool) {
+	changed, err := writeQuadletFilesTracked(dir, files)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+		return
+	}
+	removed := s.removeStaleOwnedUnits(dir, ns, podName, filenameSet(files))
+	if restart && len(changed) == 0 && !removed {
+		return
+	}
+	s.reloadAndRun(units, restart, removed, changed)
+}
+
+// reloadAndRun daemon-reloads and then starts (or restarts) units. skipReload
+// is set when removeStaleOwnedUnits already reloaded after removing files.
+func (s *Server) reloadAndRun(units []string, restart, skipReload bool, changed map[string]bool) {
 	mgr := s.config.Manager
 	if mgr == nil {
 		return
 	}
-	if err := mgr.DaemonReload(); err != nil {
-		fmt.Printf("daemon-reload: %v\n", err)
-		return
-	}
-	if unitName != "" {
-		if err := mgr.StartUnit(unitName); err != nil {
-			fmt.Printf("start %s: %v\n", unitName, err)
+	if !skipReload {
+		if err := mgr.DaemonReload(); err != nil {
+			fmt.Printf("daemon-reload: %v\n", err)
+			return
 		}
 	}
+	podChanged := false
+	for name := range changed {
+		if strings.HasSuffix(name, ".pod") {
+			podChanged = true
+			break
+		}
+	}
+	for _, unit := range units {
+		if unit == "" {
+			continue
+		}
+		if restart {
+			base := strings.TrimSuffix(unit, ".service")
+			if !podChanged && !changed[base+".container"] {
+				continue
+			}
+			if err := mgr.RestartUnit(unit); err != nil {
+				fmt.Printf("restart %s: %v\n", unit, err)
+			}
+			continue
+		}
+		if err := mgr.StartUnit(unit); err != nil {
+			fmt.Printf("start %s: %v\n", unit, err)
+		}
+	}
+}
+
+// writeQuadletFilesTracked writes files into dir in a stable (sorted) order
+// and returns the set of filenames it actually wrote. A file whose on-disk template hash already equals the hash
+// of the rendered content is left untouched, so an unchanged re-apply does not
+// rewrite it. Files without a template hash (network, timer, volume) are
+// always written, as before.
+func writeQuadletFilesTracked(dir string, files map[string][]byte) (map[string]bool, error) {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	changed := make(map[string]bool, len(files))
+	for _, name := range names {
+		if sameTemplateHash(filepath.Join(dir, name), files[name]) {
+			continue
+		}
+		if err := writeQuadletFile(dir, name, files[name]); err != nil {
+			return changed, fmt.Errorf("write %s: %w", name, err)
+		}
+		changed[name] = true
+	}
+	return changed, nil
+}
+
+// templateHashFromContent returns the value of the template-hash label line,
+// or empty when the file has none (an older q8s file, or a unit kind that
+// never carries one).
+func templateHashFromContent(content []byte) string {
+	prefix := "Label=" + quadlet.TemplateHashLabel + "="
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
+		}
+	}
+	return ""
+}
+
+// sameTemplateHash reports whether path already holds content with the same
+// template hash. A missing or unhashed file never matches.
+func sameTemplateHash(path string, content []byte) bool {
+	want := templateHashFromContent(content)
+	if want == "" {
+		return false
+	}
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return templateHashFromContent(existing) == want
+}
+
+// filenameSet turns a rendered file map into the keep set for stale cleanup.
+func filenameSet(files map[string][]byte) map[string]bool {
+	keep := make(map[string]bool, len(files))
+	for name := range files {
+		keep[name] = true
+	}
+	return keep
+}
+
+// removeStaleOwnedUnits removes quadlet files in dir that q8s generated for
+// the same pod but that this render no longer produces, and stops their units.
+// A file is only a candidate when it contains ALL THREE exact label lines
+// below: the managed-by marker, the namespace and the pod name. Files without
+// the managed-by label (hand-written quadlets, or files written by an older
+// q8s) are never touched. Matching is by exact line, never by filename prefix
+// or substring, because pod "duo" container "web" and pod "duo-web" share the
+// same <ns>-duo-web.container filename shape.
+//
+// Returns true when it removed something; in that case it has already run the
+// usual daemon-reload.
+func (s *Server) removeStaleOwnedUnits(dir, ns, podName string, keep map[string]bool) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	removed := false
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if keep[name] {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if !ownedByExactLabels(content, ns, podName) {
+			continue
+		}
+		if mgr := s.config.Manager; mgr != nil {
+			mgr.StopUnit(strings.TrimSuffix(name, filepath.Ext(name)) + ".service")
+		}
+		if err := os.Remove(path); err != nil {
+			continue
+		}
+		removed = true
+	}
+	if removed {
+		if mgr := s.config.Manager; mgr != nil {
+			if err := mgr.DaemonReload(); err != nil {
+				fmt.Printf("daemon-reload after stale unit cleanup: %v\n", err)
+			}
+		}
+	}
+	return removed
+}
+
+// ownedByExactLabels reports whether content carries q8s's managed-by marker
+// and the exact namespace and pod-name label lines for this pod.
+func ownedByExactLabels(content []byte, ns, podName string) bool {
+	return hasExactLine(content, quadlet.ManagedByLabel) &&
+		hasExactLine(content, "Label=io.kubernetes.pod.namespace="+ns) &&
+		hasExactLine(content, "Label=io.kubernetes.pod.name="+podName)
+}
+
+// hasExactLine matches a whole line, not a substring: pod.name=duo must not
+// match pod.name=duo-0.
+func hasExactLine(content []byte, want string) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+// podQuadletFiles renders every quadlet file for one pod object. A
+// single-container pod keeps today's single .container; a multi-container
+// pod becomes a Podman pod (.pod plus one .container per container).
+func podQuadletFiles(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) (map[string][]byte, error) {
+	if len(pod.Spec.Containers) > 1 {
+		return quadlet.PodUnits(name, pod, configDir, serviceAliases, pvcMap, envFile)
+	}
+	content, err := quadlet.Container(name, pod, configDir, serviceAliases, pvcMap, envFile)
+	if err != nil {
+		return nil, err
+	}
+	return map[string][]byte{
+		fmt.Sprintf("%s-%s.container", pod.Namespace, name): content,
+	}, nil
+}
+
+// podUnitNames returns the systemd services that make a pod object run. For
+// a Podman pod each member container service is started; Quadlet's Pod= adds
+// the Requires=/After= that pulls the .pod service in.
+func podUnitNames(ns, name string, containers []corev1.Container) []string {
+	if len(containers) > 1 {
+		names := make([]string, 0, len(containers))
+		for _, c := range containers {
+			names = append(names, fmt.Sprintf("%s-%s-%s.service", ns, name, c.Name))
+		}
+		return names
+	}
+	return []string{fmt.Sprintf("%s-%s.service", ns, name)}
+}
+
+// podQuadletPaths returns every quadlet file q8s writes for a pod object.
+func podQuadletPaths(quadletDir, ns, name string, containers []corev1.Container) []string {
+	if len(containers) > 1 {
+		paths := []string{fmt.Sprintf("%s/%s-%s.pod", quadletDir, ns, name)}
+		for _, c := range containers {
+			paths = append(paths, fmt.Sprintf("%s/%s-%s-%s.container", quadletDir, ns, name, c.Name))
+		}
+		return paths
+	}
+	return []string{fmt.Sprintf("%s/%s-%s.container", quadletDir, ns, name)}
 }
 
 // reloadAfterRemove deletes paths then triggers a daemon-reload.
@@ -401,12 +632,16 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateSingleContainer("pod spec", &pod.Spec, true); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		// Fail fast with a proper 400 instead of storing the pod and only
 		// discovering at quadlet-generation time (after the fact, logged
 		// server-side only) that its spec can't be safely turned into a
 		// unit file — e.g. an image reference or env value containing
 		// characters that would corrupt the generated quadlet.
-		if _, err := quadlet.Container(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec), ""); err != nil {
+		if _, err := podQuadletFiles(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec), ""); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -477,11 +712,15 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateSingleContainer("pod spec", &patched.Spec, true); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		// Same fail-fast dry-run as create: a patch whose merged spec can't
 		// be rendered into a unit file must be rejected here, not stored and
 		// then silently left unapplied (200 OK while the running container
 		// keeps the old spec).
-		if _, err := quadlet.Container(patched.Name, &patched, s.config.ConfigDir, s.matchingServiceAliases(patched.Namespace, patched.Labels), s.podPVCMap(patched.Namespace, patched.Spec), ""); err != nil {
+		if _, err := podQuadletFiles(patched.Name, &patched, s.config.ConfigDir, s.matchingServiceAliases(patched.Namespace, patched.Labels), s.podPVCMap(patched.Namespace, patched.Spec), ""); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -521,9 +760,26 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 	}
 }
 
+// podContainerName resolves the container selector of a logs/exec request
+// to the Podman container name q8s gives that member. A single-container pod
+// keeps its historical <ns>-<pod> name (so -c changes nothing there); a
+// multi-container pod maps -c <container> to <ns>-<pod>-<container>, and
+// without -c to its first container, like kubectl's default-container
+// behaviour.
+func (s *Server) podContainerName(ns, podName, requested string) string {
+	pod, err := s.config.Store.GetPod(ns, podName)
+	if err != nil || len(pod.Spec.Containers) <= 1 {
+		return fmt.Sprintf("%s-%s", ns, podName)
+	}
+	if requested == "" {
+		requested = pod.Spec.Containers[0].Name
+	}
+	return fmt.Sprintf("%s-%s-%s", ns, podName, requested)
+}
+
 func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request, ns, name string) {
-	containerName := fmt.Sprintf("%s-%s", ns, name)
 	q := r.URL.Query()
+	containerName := s.podContainerName(ns, name, q.Get("container"))
 
 	args := []string{"logs"}
 	follow := q.Get("follow") == "true"
@@ -594,6 +850,9 @@ func (s *Server) matchingServiceAliases(ns string, labels map[string]string) []s
 			aliases = append(aliases, svc.Name)
 		}
 	}
+	// Stable order keeps the rendered unit (and its template hash) identical
+	// across deploys of an unchanged pod.
+	sort.Strings(aliases)
 	return aliases
 }
 
@@ -1304,6 +1563,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateSingleContainer("deployment spec.template.spec", &dep.Spec.Template.Spec, true); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateDeployment(&dep)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -1335,6 +1598,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			return
 		}
 		if err := validateName("name", dep.Name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateSingleContainer("deployment spec.template.spec", &dep.Spec.Template.Spec, true); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1407,6 +1674,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			return
 		}
 		if err := validatePatchedIdentity("deployment", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateSingleContainer("deployment spec.template.spec", &patched.Spec.Template.Spec, true); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1762,6 +2033,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateSingleContainer("job spec.template.spec", &job.Spec.Template.Spec, false); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateJob(&job)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -1810,6 +2085,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateSingleContainer("job spec.template.spec", &patched.Spec.Template.Spec, false); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		updated, err := s.config.Store.UpdateJob(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -1818,8 +2097,9 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		if s.config.QuadletDir != "" {
 			if resolved, envFile, err := s.resolvedJobEnv(updated); err == nil {
 				if content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile); err == nil {
-					writeQuadletFile(s.config.QuadletDir,
-						fmt.Sprintf("%s-%s-job.container", resolved.Namespace, resolved.Name), content)
+					writeQuadletFilesTracked(s.config.QuadletDir, map[string][]byte{
+						fmt.Sprintf("%s-%s-job.container", resolved.Namespace, resolved.Name): content,
+					})
 				}
 			}
 		}
@@ -1887,6 +2167,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateSingleContainer("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec, false); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateCronJob(&cj)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -1932,6 +2216,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			return
 		}
 		if err := validatePatchedIdentity("cronjob", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateSingleContainer("cronjob spec.jobTemplate.spec.template.spec", &patched.Spec.JobTemplate.Spec.Template.Spec, false); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2320,8 +2608,12 @@ func (s *Server) ReconcileQuadlets() {
 	missing := func(path string) bool { _, err := os.Stat(path); return err != nil }
 
 	write := func(dir, filename string, content []byte, unitName string) bool {
-		if err := writeQuadletFile(dir, filename, content); err != nil {
+		changed, err := writeQuadletFilesTracked(dir, map[string][]byte{filename: content})
+		if err != nil {
 			fmt.Printf("reconcile: write %s: %v\n", filename, err)
+			return false
+		}
+		if !changed[filename] {
 			return false
 		}
 		fmt.Printf("reconcile: regenerated %s\n", filename)
@@ -2336,6 +2628,9 @@ func (s *Server) ReconcileQuadlets() {
 		for i := int32(0); i < deploymentReplicas(dep); i++ {
 			instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
 			f := fmt.Sprintf("%s/%s-%s.container", quadletDir, dep.Namespace, instanceName)
+			if len(dep.Spec.Template.Spec.Containers) > 1 {
+				f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, dep.Namespace, instanceName)
+			}
 			if !missing(f) {
 				continue
 			}
@@ -2356,18 +2651,29 @@ func (s *Server) ReconcileQuadlets() {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
 			}
-			content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile)
+			files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile)
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
 			}
-			write(quadletDir, fmt.Sprintf("%s-%s.container", dep.Namespace, instanceName), content,
-				fmt.Sprintf("%s-%s.service", dep.Namespace, instanceName))
+			for filename, content := range files {
+				unit := ""
+				if strings.HasSuffix(filename, ".container") {
+					unit = strings.TrimSuffix(filename, ".container") + ".service"
+				}
+				write(quadletDir, filename, content, unit)
+			}
+			if s.removeStaleOwnedUnits(quadletDir, dep.Namespace, instanceName, filenameSet(files)) {
+				needReload = true
+			}
 		}
 	}
 
 	for _, pod := range s.config.Store.AllPods() {
 		f := fmt.Sprintf("%s/%s-%s.container", quadletDir, pod.Namespace, pod.Name)
+		if len(pod.Spec.Containers) > 1 {
+			f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, pod.Namespace, pod.Name)
+		}
 		if !missing(f) {
 			continue
 		}
@@ -2376,13 +2682,21 @@ func (s *Server) ReconcileQuadlets() {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
 		}
-		content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
+		files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
 		if err != nil {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
 		}
-		write(quadletDir, fmt.Sprintf("%s-%s.container", pod.Namespace, pod.Name), content,
-			fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name))
+		for filename, content := range files {
+			unit := ""
+			if strings.HasSuffix(filename, ".container") {
+				unit = strings.TrimSuffix(filename, ".container") + ".service"
+			}
+			write(quadletDir, filename, content, unit)
+		}
+		if s.removeStaleOwnedUnits(quadletDir, pod.Namespace, pod.Name, filenameSet(files)) {
+			needReload = true
+		}
 	}
 
 	for _, pvc := range s.config.Store.AllPVCs() {
@@ -2550,15 +2864,12 @@ func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
 		s.podMaterializeFailed(pod, "resolving env references", err)
 		return
 	}
-	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
+	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
 	if err != nil {
 		s.podMaterializeFailed(pod, "generating quadlet", err)
 		return
 	}
-	s.deployUnit(s.config.QuadletDir,
-		fmt.Sprintf("%s-%s.container", pod.Namespace, pod.Name),
-		content,
-		fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name))
+	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), false)
 }
 
 // applyNodePorts returns a copy of pod with any NodePort-Service-driven host
@@ -2572,11 +2883,13 @@ func (s *Server) applyNodePorts(pod *corev1.Pod) *corev1.Pod {
 		return pod
 	}
 	cp := pod.DeepCopy()
-	for i := range cp.Spec.Containers[0].Ports {
-		p := &cp.Spec.Containers[0].Ports[i]
-		if np, ok := bindings[p.ContainerPort]; ok {
-			p.HostPort = np
-			p.HostIP = "" // all interfaces — real LAN listener
+	for ci := range cp.Spec.Containers {
+		for i := range cp.Spec.Containers[ci].Ports {
+			p := &cp.Spec.Containers[ci].Ports[i]
+			if np, ok := bindings[p.ContainerPort]; ok {
+				p.HostPort = np
+				p.HostIP = "" // all interfaces - real LAN listener
+			}
 		}
 	}
 	return cp
@@ -2592,32 +2905,36 @@ func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
 		s.podMaterializeFailed(pod, "resolving env references", err)
 		return
 	}
-	content, err := quadlet.Container(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
+	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
 	if err != nil {
 		s.podMaterializeFailed(pod, "generating quadlet", err)
 		return
 	}
-	filename := fmt.Sprintf("%s-%s.container", pod.Namespace, pod.Name)
-	unitName := fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name)
-	if err := writeQuadletFile(s.config.QuadletDir, filename, content); err != nil {
-		s.podMaterializeFailed(pod, "writing "+filename, err)
-		return
-	}
-	mgr := s.config.Manager
-	if mgr == nil {
-		return
-	}
-	if err := mgr.DaemonReload(); err != nil {
-		fmt.Printf("daemon-reload: %v\n", err)
-		return
-	}
-	mgr.RestartUnit(unitName)
+	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), true)
 }
 
 func (s *Server) stopPodUnit(pod *corev1.Pod) {
-	unit := fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name)
-	containerName := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
-	s.stopAndRemoveUnit(unit, containerName)
+	s.stopPodByName(pod.Namespace, pod.Name, pod.Spec.Containers)
+}
+
+// stopPodByName stops a pod object's systemd units and force-removes its
+// containers. A Podman pod is torn down as a unit (podman pod rm -f), while
+// a single-container pod keeps the historical rm of its one container.
+func (s *Server) stopPodByName(ns, name string, containers []corev1.Container) {
+	unit := fmt.Sprintf("%s-%s.service", ns, name)
+	if len(containers) <= 1 {
+		s.stopAndRemoveUnit(unit, fmt.Sprintf("%s-%s", ns, name))
+		return
+	}
+	if mgr := s.config.Manager; mgr != nil {
+		for _, c := range containers {
+			mgr.StopUnit(fmt.Sprintf("%s-%s-%s.service", ns, name, c.Name))
+		}
+		mgr.StopUnit(unit)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	exec.CommandContext(ctx, "podman", "pod", "rm", "-f", fmt.Sprintf("%s-%s", ns, name)).Run()
 }
 
 // stopAndRemoveUnit stops a unit and force-removes its container.
@@ -2644,7 +2961,7 @@ func (s *Server) removePodQuadlet(pod *corev1.Pod) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	s.reloadAfterRemove(fmt.Sprintf("%s/%s-%s.container", s.config.QuadletDir, pod.Namespace, pod.Name))
+	s.reloadAfterRemove(podQuadletPaths(s.config.QuadletDir, pod.Namespace, pod.Name, pod.Spec.Containers)...)
 }
 
 func (s *Server) generatePVCVolume(pvc *corev1.PersistentVolumeClaim) {
@@ -2765,7 +3082,7 @@ func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
 		return
 	}
 	containerFile := fmt.Sprintf("%s-%s-cron.container", cj.Namespace, cj.Name)
-	if err := writeQuadletFile(quadletDir, containerFile, containerContent); err != nil {
+	if _, err := writeQuadletFilesTracked(quadletDir, map[string][]byte{containerFile: containerContent}); err != nil {
 		fmt.Printf("write %s: %v\n", containerFile, err)
 		return
 	}
@@ -2791,20 +3108,65 @@ func (s *Server) removeCronJobQuadlets(cj *batchv1.CronJob) {
 	)
 }
 
-// jsonMerge applies a JSON merge patch (RFC 7396) onto base in-place.
-// Arrays whose elements are objects with a "name" field are merged by name
-// rather than replaced, matching strategic-merge-patch semantics for containers/env/volumes.
-func jsonMerge(base, overlay map[string]interface{}) {
+// jsonMerge applies a strategic merge patch onto base in-place. Arrays whose
+// elements are objects with a "name" field are merged by name rather than
+// replaced, matching strategic-merge-patch semantics for containers/env/volumes.
+// It reports whether a "$patch": "delete" directive asks the caller to remove
+// the parent key holding this map.
+func jsonMerge(base, overlay map[string]interface{}) bool {
+	// Directives that apply to this map as a whole.
+	replacing := false
+	var retain []interface{}
+	elementOrder := make(map[string][]interface{})
+	primitiveDeletes := make(map[string][]interface{})
 	for k, v := range overlay {
+		switch {
+		case k == "$patch":
+			switch v {
+			case "delete":
+				return true
+			case "replace":
+				replacing = true
+			}
+		case k == "$retainKeys":
+			retain, _ = v.([]interface{})
+		case strings.HasPrefix(k, "$setElementOrder/"):
+			if list, ok := v.([]interface{}); ok {
+				elementOrder[strings.TrimPrefix(k, "$setElementOrder/")] = list
+			}
+		case strings.HasPrefix(k, "$deleteFromPrimitiveList/"):
+			if list, ok := v.([]interface{}); ok {
+				primitiveDeletes[strings.TrimPrefix(k, "$deleteFromPrimitiveList/")] = list
+			}
+		}
+	}
+	if replacing {
+		for k := range base {
+			delete(base, k)
+		}
+	}
+
+	for k, v := range overlay {
+		if strings.HasPrefix(k, "$") {
+			// Directives are handled above and never stored. Dropping every
+			// other "$" key keeps unknown directives out of stored objects.
+			continue
+		}
 		if v == nil {
 			delete(base, k)
 			continue
 		}
 		if om, ok := v.(map[string]interface{}); ok {
-			if bm, ok := base[k].(map[string]interface{}); ok {
-				jsonMerge(bm, om)
+			bm, ok := base[k].(map[string]interface{})
+			if !ok {
+				bm = make(map[string]interface{})
+			}
+			if jsonMerge(bm, om) {
+				delete(base, k)
 				continue
 			}
+			base[k] = bm
+			continue
 		}
 		if oa, ok := v.([]interface{}); ok {
 			if ba, ok := base[k].([]interface{}); ok {
@@ -2813,20 +3175,141 @@ func jsonMerge(base, overlay map[string]interface{}) {
 					continue
 				}
 			}
+			// Merge keys other than "name" (ports are keyed by containerPort,
+			// volumeMounts by mountPath, ...) are not modelled: replace the
+			// list, but never store "$patch" marker elements.
+			base[k] = listWithoutPatchMarkers(oa)
+			continue
 		}
 		base[k] = v
 	}
+
+	for field, values := range primitiveDeletes {
+		if list, ok := base[field].([]interface{}); ok {
+			base[field] = deletePrimitiveValues(list, values)
+		}
+	}
+	for field, order := range elementOrder {
+		if list, ok := base[field].([]interface{}); ok {
+			base[field] = orderElements(list, order)
+		}
+	}
+	if retain != nil {
+		keep := make(map[string]bool, len(retain))
+		for _, v := range retain {
+			if s, ok := v.(string); ok {
+				keep[s] = true
+			}
+		}
+		for k := range base {
+			if !keep[k] {
+				delete(base, k)
+			}
+		}
+	}
+	return false
+}
+
+// listWithoutPatchMarkers returns list with "$patch" directive elements removed.
+func listWithoutPatchMarkers(list []interface{}) []interface{} {
+	result := make([]interface{}, 0, len(list))
+	for _, el := range list {
+		if m, ok := el.(map[string]interface{}); ok {
+			if _, hasPatch := m["$patch"]; hasPatch {
+				continue
+			}
+		}
+		result = append(result, el)
+	}
+	return result
+}
+
+// elementKey identifies an element for $setElementOrder: named objects by
+// name, everything else by its JSON value.
+func elementKey(el interface{}) string {
+	if m, ok := el.(map[string]interface{}); ok {
+		if name, ok := m["name"].(string); ok {
+			return "name:" + name
+		}
+	}
+	b, _ := json.Marshal(el)
+	return "value:" + string(b)
+}
+
+// orderElements reorders list according to a $setElementOrder directive.
+// Elements the directive does not mention keep their relative order after the
+// listed ones.
+func orderElements(list, order []interface{}) []interface{} {
+	rank := make(map[string]int, len(order))
+	for i, el := range order {
+		rank[elementKey(el)] = i
+	}
+	result := make([]interface{}, len(list))
+	copy(result, list)
+	sort.SliceStable(result, func(i, j int) bool {
+		ri, iOK := rank[elementKey(result[i])]
+		rj, jOK := rank[elementKey(result[j])]
+		if !iOK {
+			ri = len(order)
+		}
+		if !jOK {
+			rj = len(order)
+		}
+		return ri < rj
+	})
+	return result
+}
+
+// deletePrimitiveValues removes the given primitive values from list.
+func deletePrimitiveValues(list, remove []interface{}) []interface{} {
+	result := make([]interface{}, 0, len(list))
+	for _, el := range list {
+		drop := false
+		for _, r := range remove {
+			if reflect.DeepEqual(el, r) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			result = append(result, el)
+		}
+	}
+	return result
 }
 
 // mergeNamedArray merges two JSON arrays by the "name" key (strategic merge patch semantics).
 // Returns nil when elements are not named objects, signalling the caller to use replace semantics.
 func mergeNamedArray(base, overlay []interface{}) []interface{} {
-	// Require all overlay elements to be objects with a "name" field.
+	// A "$patch": "replace" marker replaces the whole list.
+	for _, el := range overlay {
+		if m, ok := el.(map[string]interface{}); ok {
+			if p, _ := m["$patch"].(string); p == "replace" {
+				return listWithoutPatchMarkers(overlay)
+			}
+		}
+	}
+
+	// Collect deletions and the elements to merge. "$patch": "delete"
+	// markers remove the named element and are never stored.
+	deleted := make(map[string]bool)
+	var elements []map[string]interface{}
 	for _, el := range overlay {
 		m, ok := el.(map[string]interface{})
 		if !ok {
 			return nil
 		}
+		if p, _ := m["$patch"].(string); p == "delete" {
+			if name, ok := m["name"].(string); ok {
+				deleted[name] = true
+			}
+			continue
+		}
+		elements = append(elements, m)
+	}
+
+	// Require all remaining overlay elements to be objects with a "name" field.
+	for _, m := range elements {
 		if _, hasName := m["name"]; !hasName {
 			return nil
 		}
@@ -2844,18 +3327,28 @@ func mergeNamedArray(base, overlay []interface{}) []interface{} {
 		if !ok {
 			return nil
 		}
+		if deleted[name] {
+			continue
+		}
 		byName[name] = m
 		order = append(order, name)
 	}
 
 	// Merge or append overlay elements.
-	for _, el := range overlay {
-		m := el.(map[string]interface{})
+	removed := make(map[string]bool)
+	for _, m := range elements {
 		name := m["name"].(string)
+		if deleted[name] {
+			continue
+		}
 		if existing, ok := byName[name]; ok {
-			jsonMerge(existing, m)
+			if jsonMerge(existing, m) {
+				removed[name] = true
+			}
 		} else {
-			byName[name] = m
+			clean := make(map[string]interface{})
+			jsonMerge(clean, m)
+			byName[name] = clean
 			order = append(order, name)
 		}
 	}
@@ -2863,8 +3356,11 @@ func mergeNamedArray(base, overlay []interface{}) []interface{} {
 	result := make([]interface{}, 0, len(order))
 	seen := make(map[string]bool)
 	for _, name := range order {
-		if !seen[name] {
-			result = append(result, byName[name])
+		if seen[name] || removed[name] {
+			continue
+		}
+		if m, ok := byName[name]; ok {
+			result = append(result, m)
 			seen[name] = true
 		}
 	}
@@ -2927,6 +3423,10 @@ func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) 
 			Name:      instanceName,
 			Namespace: dep.Namespace,
 			Labels:    dep.Spec.Template.Labels,
+			// Pod-template annotations such as q8s.io/ulimits are pod-level
+			// in Kubernetes, so the instance has to carry them for the
+			// quadlet generator to translate them.
+			Annotations: dep.Spec.Template.Annotations,
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "apps/v1",
 				Kind:       "Deployment",
@@ -2942,14 +3442,16 @@ func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) 
 		Spec: *dep.Spec.Template.Spec.DeepCopy(),
 	}
 	pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
-	if !pod.Spec.HostNetwork && len(pod.Spec.Containers) > 0 {
-		for j := range pod.Spec.Containers[0].Ports {
-			cp := &pod.Spec.Containers[0].Ports[j]
-			if cp.ContainerPort == 0 {
-				continue
+	if !pod.Spec.HostNetwork {
+		for ci := range pod.Spec.Containers {
+			for j := range pod.Spec.Containers[ci].Ports {
+				cp := &pod.Spec.Containers[ci].Ports[j]
+				if cp.ContainerPort == 0 {
+					continue
+				}
+				cp.HostPort = s.config.Store.AllocateReplicaPort(dep.Namespace, dep.Name, i, cp.ContainerPort)
+				cp.HostIP = "127.0.0.1"
 			}
-			cp.HostPort = s.config.Store.AllocateReplicaPort(dep.Namespace, dep.Name, i, cp.ContainerPort)
-			cp.HostIP = "127.0.0.1"
 		}
 	}
 	// A NodePort Service targeting this pod publishes its port on 0.0.0.0 as
@@ -2975,10 +3477,15 @@ func (s *Server) withNodePortPublish(pod *corev1.Pod) *corev1.Pod {
 	if len(bindings) == 0 || len(pod.Spec.Containers) == 0 {
 		return pod
 	}
-	for target, np := range bindings {
+	targets := make([]int32, 0, len(bindings))
+	for target := range bindings {
+		targets = append(targets, target)
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i] < targets[j] })
+	for _, target := range targets {
 		pod.Spec.Containers[0].Ports = append(pod.Spec.Containers[0].Ports, corev1.ContainerPort{
 			ContainerPort: target,
-			HostPort:      np,
+			HostPort:      bindings[target],
 			HostIP:        "", // all interfaces
 			Protocol:      corev1.ProtocolTCP,
 		})
@@ -2997,43 +3504,34 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return
 	}
-	content, err := quadlet.Container(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile)
+	files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile)
 	if err != nil {
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return
 	}
-	unitName := fmt.Sprintf("%s-%s.service", dep.Namespace, instanceName)
-	if err := writeQuadletFile(s.config.QuadletDir,
-		fmt.Sprintf("%s-%s.container", dep.Namespace, instanceName), content); err != nil {
-		fmt.Printf("write %s-%s.container: %v\n", dep.Namespace, instanceName, err)
+	changed, err := writeQuadletFilesTracked(s.config.QuadletDir, files)
+	if err != nil {
+		fmt.Printf("write deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return
 	}
-	fmt.Printf("deployment: wrote %s-%s.container\n", dep.Namespace, instanceName)
+	removed := s.removeStaleOwnedUnits(s.config.QuadletDir, dep.Namespace, instanceName, filenameSet(files))
+	if len(changed) > 0 {
+		fmt.Printf("deployment: wrote %s/%s-%d quadlet files\n", dep.Namespace, dep.Name, i)
+	}
 	// Ensure the pod exists in the store immediately so it shows up in
 	// `kubectl get pods` even before the container starts (or if it fails).
 	if _, err := s.config.Store.GetPod(dep.Namespace, instanceName); err != nil {
 		s.config.Store.CreatePod(pod)
 	}
-	mgr := s.config.Manager
-	if mgr == nil {
+	if restart && len(changed) == 0 && !removed {
 		return
 	}
-	if err := mgr.DaemonReload(); err != nil {
-		fmt.Printf("daemon-reload: %v\n", err)
-		return
-	}
-	if restart {
-		mgr.RestartUnit(unitName)
-	} else {
-		mgr.StartUnit(unitName)
-	}
+	s.reloadAndRun(podUnitNames(dep.Namespace, instanceName, pod.Spec.Containers), restart, removed, changed)
 }
 
 func (s *Server) stopDeploymentUnits(dep *appsv1.Deployment) {
 	for i := int32(0); i < deploymentReplicas(dep); i++ {
-		s.stopAndRemoveUnit(
-			fmt.Sprintf("%s-%s-%d.service", dep.Namespace, dep.Name, i),
-			fmt.Sprintf("%s-%s-%d", dep.Namespace, dep.Name, i))
+		s.stopPodByName(dep.Namespace, fmt.Sprintf("%s-%d", dep.Name, i), dep.Spec.Template.Spec.Containers)
 	}
 }
 
@@ -3048,10 +3546,10 @@ func (s *Server) removeDeploymentQuadlets(dep *appsv1.Deployment) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	n := deploymentReplicas(dep)
-	paths := make([]string, n)
-	for i := int32(0); i < n; i++ {
-		paths[i] = fmt.Sprintf("%s/%s-%s-%d.container", s.config.QuadletDir, dep.Namespace, dep.Name, i)
+	var paths []string
+	for i := int32(0); i < deploymentReplicas(dep); i++ {
+		instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+		paths = append(paths, podQuadletPaths(s.config.QuadletDir, dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)...)
 	}
 	s.reloadAfterRemove(paths...)
 }
@@ -3065,10 +3563,8 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 	}
 	for i := newR; i < oldR; i++ {
 		instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
-		s.stopAndRemoveUnit(
-			fmt.Sprintf("%s-%s.service", dep.Namespace, instanceName),
-			fmt.Sprintf("%s-%s", dep.Namespace, instanceName))
-		s.reloadAfterRemove(fmt.Sprintf("%s/%s-%s.container", s.config.QuadletDir, dep.Namespace, instanceName))
+		s.stopPodByName(dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)
+		s.reloadAfterRemove(podQuadletPaths(s.config.QuadletDir, dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)...)
 		// Remove the store pod immediately too. The reconcile loop would
 		// eventually prune it once the container disappears, but until then
 		// ingress backends (selector-driven) would keep routing to a
@@ -3484,8 +3980,13 @@ func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) (
 					}
 					return nil, fmt.Errorf("envFrom: configMapRef %s/%s not found", ns, ef.ConfigMapRef.Name)
 				}
-				for k, v := range cm.Data {
-					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: v})
+				keys := make([]string, 0, len(cm.Data))
+				for k := range cm.Data {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: cm.Data[k]})
 				}
 			}
 			if ef.SecretRef != nil {
@@ -3496,12 +3997,22 @@ func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) (
 					}
 					return nil, fmt.Errorf("envFrom: secretRef %s/%s not found", ns, ef.SecretRef.Name)
 				}
-				for k, v := range sec.Data {
-					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: string(v)})
+				dataKeys := make([]string, 0, len(sec.Data))
+				for k := range sec.Data {
+					dataKeys = append(dataKeys, k)
+				}
+				sort.Strings(dataKeys)
+				for _, k := range dataKeys {
+					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: string(sec.Data[k])})
 					secretNames[prefix+k] = true
 				}
-				for k, v := range sec.StringData {
-					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: v})
+				stringKeys := make([]string, 0, len(sec.StringData))
+				for k := range sec.StringData {
+					stringKeys = append(stringKeys, k)
+				}
+				sort.Strings(stringKeys)
+				for _, k := range stringKeys {
+					c.Env = append(c.Env, corev1.EnvVar{Name: prefix + k, Value: sec.StringData[k]})
 					secretNames[prefix+k] = true
 				}
 			}
@@ -3512,34 +4023,38 @@ func (s *Server) resolveContainerEnv(ns string, containers []corev1.Container) (
 }
 
 // writeEnvFile splits any Secret-derived Env entries (per secretNames) out of
-// containers[0].Env and writes them as a 0600 systemd EnvironmentFile, next to
-// the per-secret files writeSecretFiles already writes at the same
+// every container's Env and writes them as a 0600 systemd EnvironmentFile,
+// next to the per-secret files writeSecretFiles already writes at the same
 // permissions -- unlike those, they don't otherwise land on disk anywhere, so
 // without this they'd only ever have been emitted as Environment= lines in
 // the quadlet .container file, which writeQuadletFile writes 0644 (confirmed
 // live 2026-08-29: MOZAK_VIEW_TOKEN and DEEPSEEK_API_KEY were both readable
-// in that file to any local user). Returns "" if there was nothing to split.
+// in that file to any local user). A single-container pod keeps exactly the
+// old single-container behaviour; all members of a pod share the one file.
+// Returns "" if there was nothing to split.
 func (s *Server) writeEnvFile(ns, name string, containers []corev1.Container, secretNames map[string]bool) (string, error) {
 	if len(containers) == 0 || len(secretNames) == 0 {
 		return "", nil
 	}
-	c := &containers[0]
 	var lines strings.Builder
-	kept := c.Env[:0]
-	for _, ev := range c.Env {
-		if !secretNames[ev.Name] {
-			kept = append(kept, ev)
-			continue
+	for ci := range containers {
+		c := &containers[ci]
+		kept := c.Env[:0]
+		for _, ev := range c.Env {
+			if !secretNames[ev.Name] {
+				kept = append(kept, ev)
+				continue
+			}
+			if strings.ContainsAny(ev.Value, "\n\r\x00") {
+				return "", fmt.Errorf("env %s: secret value must not contain control characters", ev.Name)
+			}
+			lines.WriteString(ev.Name)
+			lines.WriteByte('=')
+			lines.WriteString(ev.Value)
+			lines.WriteByte('\n')
 		}
-		if strings.ContainsAny(ev.Value, "\n\r\x00") {
-			return "", fmt.Errorf("env %s: secret value must not contain control characters", ev.Name)
-		}
-		lines.WriteString(ev.Name)
-		lines.WriteByte('=')
-		lines.WriteString(ev.Value)
-		lines.WriteByte('\n')
+		c.Env = kept
 	}
-	c.Env = kept
 	if lines.Len() == 0 {
 		return "", nil
 	}

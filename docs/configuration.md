@@ -128,7 +128,7 @@ PVCs can specify a `storageClassName` to control how volumes are mounted:
 | `standard-shared` | `ns-name.volume:/mount:z` | Shared relabel |
 | `hostpath` | `/host/path:/mount:Z` | Exclusive relabel |
 
-The `hostpath` class reads the host directory from the `q8s.io/host-path` annotation on the PVC. No `.volume` file is generated for hostpath PVCs.
+The `hostpath` class reads the host directory from the `q8s.io/host-path` annotation on the PVC. No `.volume` file is generated for hostpath PVCs. An optional `q8s.io/selinux-label` annotation selects the relabel mode for the host directory: `private` (default) emits `:Z`, `shared` emits `:z`, and any other value is rejected.
 
 ## Port semantics
 
@@ -163,6 +163,25 @@ CONF
 sudo systemctl daemon-reload
 # re-login for the delegation to take effect
 ```
+
+## GPU, shared memory and ulimits
+
+`resources.limits["nvidia.com/gpu"]` with any value >= 1 emits `AddDevice=nvidia.com/gpu=all` for the first container. q8s does not try to count or allocate individual GPUs: podman resolves the CDI device name to every GPU the host exposes.
+
+An `emptyDir` volume with `medium: Memory` mounted at `/dev/shm` emits `ShmSize=<sizeLimit in bytes>` and no `Volume=` line for that mount. Without a `sizeLimit` it emits nothing. Other `emptyDir` volumes keep the normal named `Volume=` line.
+
+A pod annotation, or a Deployment/Job/CronJob pod-template annotation, `q8s.io/ulimits` holds a comma separated list such as `memlock=-1:-1,nofile=65536`. Each item becomes one `Ulimit=` line. Items must look like `name=soft` or `name=soft:hard`, otherwise the resource is rejected.
+
+## Readiness probe
+
+When the first container has no `livenessProbe` (which keeps owning the single Podman health check), its `readinessProbe` is translated instead:
+
+| Probe handler | Quadlet output |
+|---|---|
+| `httpGet` | `HealthCmd=curl -fsS http://127.0.0.1:<port><path>`, then `HealthInterval=<periodSeconds>s` and `HealthStartPeriod=<initialDelaySeconds>s` when those are greater than 0 |
+| `exec` | `HealthCmd=<command>`, then `HealthStartPeriod=<initialDelaySeconds>s` when it is greater than 0 |
+
+A named `httpGet` port is resolved against the container's declared ports. If it does not match any port, no health check is emitted (this is not an error). An empty `path` defaults to `/`.
 
 ## CronJob timer translation
 

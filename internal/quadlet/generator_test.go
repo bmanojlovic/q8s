@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"q8s/internal/quadlet"
 )
 
@@ -34,6 +35,11 @@ func assertNotContains(t *testing.T, got, want string) {
 	if strings.Contains(got, want) {
 		t.Errorf("expected output NOT to contain %q\ngot:\n%s", want, got)
 	}
+}
+
+func quantityPtr(s string) *resource.Quantity {
+	q := resource.MustParse(s)
+	return &q
 }
 
 func simplePod(ns, name, image string) *corev1.Pod {
@@ -103,6 +109,18 @@ func TestContainerEnvVars(t *testing.T) {
 
 	assertContains(t, out, "Environment=FOO=bar")
 	assertContains(t, out, "Environment=DB_HOST=localhost")
+}
+
+func TestContainerEnvValueWithSpacesQuoted(t *testing.T) {
+	pod := simplePod("default", "app", "myimage:1.0")
+	pod.Spec.Containers[0].Env = []corev1.EnvVar{{
+		Name:  "STRATA_SET",
+		Value: "conversation-cache-mib=65536 conversation-cache-slots=24 prompt-cache=12",
+	}}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, `Environment="STRATA_SET=conversation-cache-mib=65536 conversation-cache-slots=24 prompt-cache=12"`)
+	assertNotContains(t, out, "Environment=STRATA_SET=conversation-cache-mib=65536 conversation-cache-slots=24 prompt-cache=12\n")
 }
 
 func TestContainerPorts(t *testing.T) {
@@ -309,6 +327,194 @@ func TestContainerLivenessProbe(t *testing.T) {
 	assertContains(t, out, "HealthStartPeriod=5")
 }
 
+func TestContainerReadinessHTTPGet(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}
+	pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path: "/healthz",
+			Port: intstr.FromInt32(8080),
+		}},
+		PeriodSeconds:       10,
+		InitialDelaySeconds: 30,
+	}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, "HealthCmd=curl -fsS http://127.0.0.1:8080/healthz")
+	assertContains(t, out, "HealthInterval=10s")
+	assertContains(t, out, "HealthStartPeriod=30s")
+}
+
+func TestContainerReadinessHTTPGetNamedPort(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}
+	pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path: "/ready",
+			Port: intstr.FromString("http"),
+		}},
+	}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, "HealthCmd=curl -fsS http://127.0.0.1:8080/ready")
+}
+
+func TestContainerReadinessHTTPGetUnresolvablePort(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path: "/ready",
+			Port: intstr.FromString("missing"),
+		}},
+		PeriodSeconds:       10,
+		InitialDelaySeconds: 30,
+	}
+	out := mustContainer(t, pod, "")
+
+	// An unknown named port must not error, and must not become a probe
+	// against port 0 either.
+	assertNotContains(t, out, "HealthCmd=")
+	assertNotContains(t, out, "HealthInterval=")
+	assertNotContains(t, out, "HealthStartPeriod=")
+}
+
+func TestContainerReadinessExec(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+		ProbeHandler:        corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"cat", "/tmp/ready"}}},
+		InitialDelaySeconds: 5,
+	}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, "HealthCmd=cat /tmp/ready")
+	assertContains(t, out, "HealthStartPeriod=5s")
+}
+
+func TestContainerLivenessProbeWinsOverReadiness(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"cat", "/tmp/live"}}},
+	}
+	pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path: "/ready",
+			Port: intstr.FromInt32(8080),
+		}},
+	}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, "HealthCmd=cat /tmp/live")
+	assertNotContains(t, out, "curl -fsS")
+}
+
+func TestContainerNoReadinessProbe(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Containers[0].ReadinessProbe = nil
+	out := mustContainer(t, pod, "")
+
+	assertNotContains(t, out, "HealthCmd=")
+}
+
+func TestContainerGPUDevice(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+		quadlet.GPULimitResource: resource.MustParse("2"),
+	}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, "AddDevice=nvidia.com/gpu=all")
+}
+
+func TestContainerNoGPUDevice(t *testing.T) {
+	for _, value := range []string{"", "0"} {
+		pod := simplePod("default", "llm", "llm:latest")
+		if value != "" {
+			pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+				quadlet.GPULimitResource: resource.MustParse(value),
+			}
+		}
+		out := mustContainer(t, pod, "")
+		assertNotContains(t, out, "AddDevice=")
+	}
+}
+
+func TestContainerShmEmptyDir(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name: "shm",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			Medium:    corev1.StorageMediumMemory,
+			SizeLimit: quantityPtr("1Gi"),
+		}},
+	}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "shm", MountPath: "/dev/shm"}}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, "ShmSize=1073741824")
+	// Podman owns /dev/shm; it must not also be a Volume= mount.
+	assertNotContains(t, out, "Volume=shm:/dev/shm")
+}
+
+func TestContainerShmEmptyDirNoSizeLimit(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name:         "shm",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
+	}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "shm", MountPath: "/dev/shm"}}
+	out := mustContainer(t, pod, "")
+
+	assertNotContains(t, out, "ShmSize=")
+	assertNotContains(t, out, "Volume=shm:/dev/shm")
+}
+
+func TestContainerOrdinaryEmptyDirKeepsVolumeLine(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name: "scratch",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: quantityPtr("1Gi"),
+		}},
+	}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch"}}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, "Volume=scratch:/scratch")
+	assertNotContains(t, out, "ShmSize=")
+}
+
+func TestContainerUlimits(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Annotations = map[string]string{
+		quadlet.AnnotationUlimits: "memlock=-1:-1,nofile=65536",
+	}
+	out := mustContainer(t, pod, "")
+
+	assertContains(t, out, "Ulimit=memlock=-1:-1")
+	assertContains(t, out, "Ulimit=nofile=65536")
+}
+
+func TestContainerNoUlimits(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	out := mustContainer(t, pod, "")
+
+	assertNotContains(t, out, "Ulimit=")
+}
+
+func TestContainerRejectsInvalidUlimits(t *testing.T) {
+	for _, value := range []string{
+		"memlock=abc",
+		"Memlock=-1:-1",
+		"memlock=-1:-1,nofile=1\n\n[Service]\nExecStartPre=/bin/evil",
+	} {
+		pod := simplePod("default", "llm", "llm:latest")
+		pod.Annotations = map[string]string{quadlet.AnnotationUlimits: value}
+		if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+			t.Errorf("expected error for q8s.io/ulimits %q", value)
+		}
+	}
+}
+
 func TestContainerNoContainersError(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "empty", Namespace: "default"},
@@ -366,6 +572,67 @@ func TestJobContainerEnvVars(t *testing.T) {
 	assertContains(t, string(b), "Environment=X=1")
 }
 
+func TestJobContainerPodTemplateAnnotations(t *testing.T) {
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "j", Namespace: "ns"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				quadlet.AnnotationUlimits: "memlock=-1:-1",
+			}},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name:  "c",
+				Image: "img",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{quadlet.GPULimitResource: resource.MustParse("1")},
+				},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}},
+				},
+			}}},
+		}},
+	}
+	b, err := quadlet.JobContainer(job.Name, job, "", nil, "")
+	if err != nil {
+		t.Fatalf("JobContainer: %v", err)
+	}
+	out := string(b)
+
+	assertContains(t, out, "Ulimit=memlock=-1:-1")
+	assertContains(t, out, "AddDevice=nvidia.com/gpu=all")
+	assertContains(t, out, "HealthCmd=true")
+}
+
+func TestJobContainerReadOnlyPVC(t *testing.T) {
+	sc := "standard"
+	pvcMap := map[string]*corev1.PersistentVolumeClaim{
+		"my-pvc": {
+			ObjectMeta: metav1.ObjectMeta{Name: "my-pvc", Namespace: "ns"},
+			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &sc},
+		},
+	}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "j", Namespace: "ns"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:         "c",
+					Image:        "img",
+					VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data", ReadOnly: true}},
+				}},
+				Volumes: []corev1.Volume{{
+					Name:         "data",
+					VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "my-pvc"}},
+				}},
+			},
+		}},
+	}
+	b, err := quadlet.JobContainer(job.Name, job, "", pvcMap, "")
+	if err != nil {
+		t.Fatalf("JobContainer: %v", err)
+	}
+	assertContains(t, string(b), "Volume=ns-my-pvc.volume:/data:ro,Z")
+}
+
 func TestJobContainerNoContainersError(t *testing.T) {
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: "j", Namespace: "ns"},
@@ -406,6 +673,33 @@ func TestCronContainerBasic(t *testing.T) {
 	assertContains(t, out, "Restart=no")
 	assertContains(t, out, "Description=CronJob default/mycron")
 	assertNotContains(t, out, "[Install]")
+}
+
+func TestCronContainerReadOnlyEmptyDir(t *testing.T) {
+	cj := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "* * * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:         "c",
+						Image:        "img",
+						VolumeMounts: []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch", ReadOnly: true}},
+					}},
+					Volumes: []corev1.Volume{{
+						Name:         "scratch",
+						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+					}},
+				}},
+			}},
+		},
+	}
+	b, err := quadlet.CronContainer(cj.Name, cj, "", nil, "")
+	if err != nil {
+		t.Fatalf("CronContainer: %v", err)
+	}
+	assertContains(t, string(b), "Volume=scratch:/scratch:ro")
 }
 
 func TestCronContainerNoContainersError(t *testing.T) {
@@ -599,6 +893,198 @@ func TestContainerPVCHostpathClass(t *testing.T) {
 	out := string(b)
 	assertContains(t, out, "Volume=/srv/data:/data:Z")
 	assertNotContains(t, out, ".volume")
+}
+
+func TestContainerPVCHostpathSharedSELinuxLabel(t *testing.T) {
+	sc := "hostpath"
+	pvcMap := map[string]*corev1.PersistentVolumeClaim{
+		"hp": {
+			ObjectMeta: metav1.ObjectMeta{Name: "hp", Namespace: "default",
+				Annotations: map[string]string{
+					"q8s.io/host-path":     "/srv/models",
+					"q8s.io/selinux-label": "shared",
+				}},
+			Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &sc},
+		},
+	}
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name:         "data",
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
+	}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/models", ReadOnly: true}}
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	assertContains(t, string(b), "Volume=/srv/models:/models:ro,z")
+}
+
+func TestContainerPVCHostpathReadOnly(t *testing.T) {
+	sc := "hostpath"
+	pvcMap := map[string]*corev1.PersistentVolumeClaim{
+		"hp": {
+			ObjectMeta: metav1.ObjectMeta{Name: "hp", Namespace: "default",
+				Annotations: map[string]string{
+					"q8s.io/host-path":     "/srv/models",
+					"q8s.io/selinux-label": "private",
+				}},
+			Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &sc},
+		},
+	}
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name:         "data",
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
+	}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/models", ReadOnly: true}}
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	assertContains(t, string(b), "Volume=/srv/models:/models:ro,Z")
+}
+
+func TestContainerPVCVolumeSourceReadOnly(t *testing.T) {
+	sc := "standard"
+	pvcMap := map[string]*corev1.PersistentVolumeClaim{
+		"my-pvc": {
+			ObjectMeta: metav1.ObjectMeta{Name: "my-pvc", Namespace: "default"},
+			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &sc},
+		},
+	}
+	for _, tc := range []struct {
+		name     string
+		readOnly bool
+		want     string
+	}{
+		{"read-only", true, "Volume=default-my-pvc.volume:/data:ro,Z"},
+		{"read-write", false, "Volume=default-my-pvc.volume:/data:Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := simplePod("default", "app", "myimage")
+			pod.Spec.Volumes = []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: "my-pvc",
+					ReadOnly:  tc.readOnly,
+				}},
+			}}
+			pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
+			b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+			if err != nil {
+				t.Fatalf("Container: %v", err)
+			}
+			assertContains(t, string(b), tc.want)
+		})
+	}
+}
+
+func TestContainerPVCFallbackReadOnly(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name: "data",
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: "my-pvc",
+			ReadOnly:  true,
+		}},
+	}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
+	out := mustContainer(t, pod, "")
+	assertContains(t, out, "Volume=default-my-pvc.volume:/data:ro,Z")
+}
+
+func TestContainerPVCUnknownClassReadOnly(t *testing.T) {
+	sc := "custom"
+	pvcMap := map[string]*corev1.PersistentVolumeClaim{
+		"odd-vol": {
+			ObjectMeta: metav1.ObjectMeta{Name: "odd-vol", Namespace: "default"},
+			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &sc},
+		},
+	}
+	for _, tc := range []struct {
+		name     string
+		readOnly bool
+		want     string
+	}{
+		{"read-only", true, "Volume=default-odd-vol.volume:/data:ro"},
+		{"read-write", false, "Volume=default-odd-vol.volume:/data\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := simplePod("default", "app", "myimage")
+			pod.Spec.Volumes = []corev1.Volume{{
+				Name:         "data",
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "odd-vol"}},
+			}}
+			pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data", ReadOnly: tc.readOnly}}
+			b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+			if err != nil {
+				t.Fatalf("Container: %v", err)
+			}
+			assertContains(t, string(b), tc.want)
+		})
+	}
+}
+
+func TestContainerEmptyDirReadOnly(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name:         "scratch",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch", ReadOnly: true}}
+	out := mustContainer(t, pod, "")
+	assertContains(t, out, "Volume=scratch:/scratch:ro")
+}
+
+func TestContainerPVCHostpathPrivateSELinuxLabel(t *testing.T) {
+	sc := "hostpath"
+	pvcMap := map[string]*corev1.PersistentVolumeClaim{
+		"hp": {
+			ObjectMeta: metav1.ObjectMeta{Name: "hp", Namespace: "default",
+				Annotations: map[string]string{
+					"q8s.io/host-path":     "/srv/models",
+					"q8s.io/selinux-label": "private",
+				}},
+			Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &sc},
+		},
+	}
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Volumes = []corev1.Volume{{
+		Name:         "data",
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
+	}}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/models"}}
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	assertContains(t, string(b), "Volume=/srv/models:/models:Z")
+}
+
+func TestContainerPVCHostpathInvalidSELinuxLabel(t *testing.T) {
+	for _, value := range []string{"world", "private\n[Service]\nExecStartPre=/bin/evil"} {
+		sc := "hostpath"
+		pvcMap := map[string]*corev1.PersistentVolumeClaim{
+			"hp": {
+				ObjectMeta: metav1.ObjectMeta{Name: "hp", Namespace: "default",
+					Annotations: map[string]string{
+						"q8s.io/host-path":     "/srv/models",
+						"q8s.io/selinux-label": value,
+					}},
+				Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &sc},
+			},
+		}
+		pod := simplePod("default", "app", "myimage")
+		pod.Spec.Volumes = []corev1.Volume{{
+			Name:         "data",
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
+		}}
+		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/models"}}
+		if _, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, ""); err == nil {
+			t.Errorf("expected error for q8s.io/selinux-label %q", value)
+		}
+	}
 }
 
 func TestContainerPVCHostpathMissingAnnotation(t *testing.T) {
@@ -918,5 +1404,105 @@ func TestCronContainerRejectsUnsafeName(t *testing.T) {
 	}
 	if _, err := quadlet.CronContainer(cj.Name, cj, "", nil, ""); err == nil {
 		t.Error("CronContainer accepted unsafe name")
+	}
+}
+
+// labelValue returns the value of an exact Label=<key>= line, or "".
+func labelValue(out, key string) string {
+	prefix := "Label=" + key + "="
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
+		}
+	}
+	return ""
+}
+
+// TestManagedByLabelOnEveryGeneratedKind pins the ownership marker the server
+// relies on to distinguish its own quadlet files from hand-written ones.
+func TestManagedByLabelOnEveryGeneratedKind(t *testing.T) {
+	pod := simplePod("default", "app", "nginx")
+	if out := mustContainer(t, pod, ""); !strings.Contains(out, quadlet.ManagedByLabel) {
+		t.Errorf("Container output missing %q:\n%s", quadlet.ManagedByLabel, out)
+	}
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "j", Namespace: "default"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
+		}}},
+	}
+	jobOut, err := quadlet.JobContainer(job.Name, job, "", nil, "")
+	if err != nil {
+		t.Fatalf("JobContainer: %v", err)
+	}
+	if !strings.Contains(string(jobOut), quadlet.ManagedByLabel) {
+		t.Errorf("JobContainer output missing %q:\n%s", quadlet.ManagedByLabel, jobOut)
+	}
+
+	cj := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "cj", Namespace: "default"},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "0 3 * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
+				}},
+			}},
+		},
+	}
+	cronOut, err := quadlet.CronContainer(cj.Name, cj, "", nil, "")
+	if err != nil {
+		t.Fatalf("CronContainer: %v", err)
+	}
+	if !strings.Contains(string(cronOut), quadlet.ManagedByLabel) {
+		t.Errorf("CronContainer output missing %q:\n%s", quadlet.ManagedByLabel, cronOut)
+	}
+
+	vol, err := quadlet.Volume(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "v", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("Volume: %v", err)
+	}
+	if !strings.Contains(string(vol), quadlet.ManagedByLabel) {
+		t.Errorf("Volume output missing %q:\n%s", quadlet.ManagedByLabel, vol)
+	}
+
+	net, err := quadlet.Network("default")
+	if err != nil {
+		t.Fatalf("Network: %v", err)
+	}
+	if !strings.Contains(string(net), quadlet.ManagedByLabel) {
+		t.Errorf("Network output missing %q:\n%s", quadlet.ManagedByLabel, net)
+	}
+
+	// A .timer has no Label key, so it carries the same marker as a comment.
+	timer, err := quadlet.CronTimer(cj.Name, cj)
+	if err != nil {
+		t.Fatalf("CronTimer: %v", err)
+	}
+	if !strings.Contains(string(timer), "# app.kubernetes.io/managed-by=q8s") {
+		t.Errorf("CronTimer output missing managed-by comment:\n%s", timer)
+	}
+}
+
+// TestContainerTemplateHash checks the hash is present, stable for equal
+// input, and changes when the rendered unit changes.
+func TestContainerTemplateHash(t *testing.T) {
+	pod := simplePod("default", "app", "nginx:1")
+	first := mustContainer(t, pod, "")
+	second := mustContainer(t, pod.DeepCopy(), "")
+
+	hash := labelValue(first, quadlet.TemplateHashLabel)
+	if len(hash) != 12 {
+		t.Fatalf("template hash = %q, want 12 hex chars", hash)
+	}
+	if !strings.Contains(second, "Label="+quadlet.TemplateHashLabel+"="+hash) {
+		t.Fatalf("same input produced a different hash:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+
+	changed := pod.DeepCopy()
+	changed.Spec.Containers[0].Image = "nginx:2"
+	if got := labelValue(mustContainer(t, changed, ""), quadlet.TemplateHashLabel); got == hash {
+		t.Fatalf("changed input kept the same hash %q", hash)
 	}
 }

@@ -77,6 +77,20 @@ func noControlChars(kind, value string) error {
 	return nil
 }
 
+// ulimitItemRE matches one item of the q8s.io/ulimits annotation:
+// "name=soft" or "name=soft:hard" with a lowercase resource name (memlock,
+// nofile, stack, ...) and integer limits, where -1 means unlimited. The
+// whole string is anchored and contains no free-form characters, so a value
+// with a newline (or a second quadlet directive) can never match.
+var ulimitItemRE = regexp.MustCompile(`^[a-z]+=-?[0-9]+(:-?[0-9]+)?$`)
+
+func validateUlimitItem(item string) error {
+	if !ulimitItemRE.MatchString(item) {
+		return fmt.Errorf("ulimit %q must look like name=soft or name=soft:hard", item)
+	}
+	return nil
+}
+
 // labelKeyRE matches a k8s label key: an optional DNS-subdomain prefix
 // ("example.com/") followed by a name segment of alphanumerics, '-', '_' or
 // '.'. Loose compared to the full k8s spec (doesn't bound segment lengths),

@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/podman"
 	"q8s/internal/store"
 	"q8s/internal/systemd"
 )
@@ -98,6 +99,41 @@ func TestPodmanStateToPhase(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("podmanStateToPhase(%q, %d) = %q, want %q", tc.state, tc.exitCode, got, tc.want)
 		}
+	}
+}
+
+// --- podmanContainerStates (multi-container sync) ---
+
+func TestPodmanContainerStatesMulti(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: "healthy"},
+			{Name: "starting"},
+		}},
+	}
+	infos := []podman.ContainerInfo{
+		{State: "running", Status: "Up 1 minute (healthy)", Labels: map[string]string{"io.kubernetes.container.name": "healthy"}},
+		{State: "running", Status: "Up 1 minute (starting)", Labels: map[string]string{"io.kubernetes.container.name": "starting"}},
+	}
+
+	phase, states := podmanContainerStates(pod, infos)
+	if phase != corev1.PodRunning {
+		t.Fatalf("expected Phase Running when every container runs, got %q", phase)
+	}
+	if states["healthy"].Health != "healthy" || states["starting"].Health != "starting" {
+		t.Fatalf("expected per-container health to be matched by label, got %+v", states)
+	}
+}
+
+func TestPodmanContainerStatesFailed(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+	}
+	phase, _ := podmanContainerStates(pod, []podman.ContainerInfo{
+		{State: "exited", ExitCode: 1, Labels: map[string]string{"io.kubernetes.container.name": "app"}},
+	})
+	if phase != corev1.PodFailed {
+		t.Fatalf("expected Phase Failed, got %q", phase)
 	}
 }
 

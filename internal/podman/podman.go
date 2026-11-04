@@ -18,6 +18,7 @@ const cmdTimeout = 10 * time.Second
 type ContainerInfo struct {
 	Names     []string          `json:"Names"`
 	State     string            `json:"State"`
+	Status    string            `json:"Status"`
 	ExitCode  int               `json:"ExitCode"`
 	Image     string            `json:"Image"`
 	StartedAt int64             `json:"StartedAt"`
@@ -31,9 +32,37 @@ func (c ContainerInfo) Name() string {
 	return strings.TrimPrefix(c.Names[0], "/")
 }
 
+// Health returns the container health reported by Podman, parsed from the
+// parenthesised suffix of Status: "Up 2 minutes (starting)", "Up 5 minutes
+// (healthy)", "Up 1 minute (unhealthy)". It returns "" when Status carries no
+// health suffix, i.e. the container has no health check or the state is
+// unknown.
+func (c ContainerInfo) Health() string {
+	s := c.Status
+	if !strings.HasSuffix(s, ")") {
+		return ""
+	}
+	open := strings.LastIndex(s, "(")
+	if open < 0 {
+		return ""
+	}
+	switch h := s[open+1 : len(s)-1]; h {
+	case "healthy", "unhealthy", "starting":
+		return h
+	}
+	return ""
+}
+
 func (c ContainerInfo) PodName() string       { return c.Labels["io.kubernetes.pod.name"] }
 func (c ContainerInfo) PodNamespace() string  { return c.Labels["io.kubernetes.pod.namespace"] }
 func (c ContainerInfo) PodDeployment() string { return c.Labels["io.kubernetes.pod.deployment"] }
+
+// ContainerName returns the Kubernetes container name q8s writes on a
+// multi-container pod member. It is empty for single-container pods, which
+// keep the historical pod-only labels.
+func (c ContainerInfo) ContainerName() string {
+	return c.Labels["io.kubernetes.container.name"]
+}
 
 // List returns all containers (running and stopped).
 func List() ([]ContainerInfo, error) {

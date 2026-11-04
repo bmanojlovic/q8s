@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"q8s/internal/quadlet"
 )
 
 // InstallConfig holds the configuration for installation.
@@ -641,7 +643,11 @@ RuntimeDirectory=q8s
 		if busAddr == "" {
 			busAddr = fmt.Sprintf("unix:path=%s/bus", os.Getenv("XDG_RUNTIME_DIR"))
 		}
-		serviceUnit += fmt.Sprintf("Environment=DBUS_SESSION_BUS_ADDRESS=%s\n", busAddr)
+		line, err := quadlet.EnvLine("DBUS_SESSION_BUS_ADDRESS", busAddr)
+		if err != nil {
+			return err
+		}
+		serviceUnit += line
 	}
 
 	if cfg.Rootful {

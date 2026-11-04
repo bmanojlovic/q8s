@@ -680,14 +680,18 @@ func restoreConfigMapFiles(configDir string, st *store.Store) {
 // is owned by the Pod API). Deployment-derived pods are also pruned once
 // their container disappears (scale down, rollout restart, deployment
 // delete), since nothing else notices that on their behalf.
-func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) {
+func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) map[string][]podman.ContainerInfo {
 	containers, err := podman.ListOwned()
 	if err != nil {
 		fmt.Printf("reconcile pods: %v\n", err)
-		return
+		return nil
 	}
 
-	live := make(map[string]bool, len(containers))
+	// byPod is the live containers for each q8s pod, returned so callers
+	// can read container state (e.g. health) without another podman call.
+	// A multi-container pod has one entry per member, matched later by the
+	// io.kubernetes.container.name label.
+	byPod := make(map[string][]podman.ContainerInfo, len(containers))
 	imported := 0
 	for _, c := range containers {
 		ns, name := c.PodNamespace(), c.PodName()
@@ -703,8 +707,7 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) {
 			fmt.Printf("reconcile pods: skipping container with unsafe label name %q ns %q\n", name, ns)
 			continue
 		}
-		live[ns+"/"+name] = true
-
+		byPod[ns+"/"+name] = append(byPod[ns+"/"+name], c)
 		// Only import into namespaces that exist — prevents re-importing
 		// containers whose pods were explicitly deleted.
 		if _, err := st.GetNamespace(ns); err != nil {
@@ -739,10 +742,14 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) {
 			continue
 		}
 
+		containerName := c.ContainerName()
+		if !isValidObjectName(containerName) {
+			containerName = name
+		}
 		pod := &corev1.Pod{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, CreationTimestamp: metav1.Now()},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: name, Image: c.Image}}},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: c.Image}}},
 		}
 		if depName := c.PodDeployment(); depName != "" {
 			dep, _ := st.GetDeployment(ns, depName)
@@ -757,7 +764,7 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) {
 		if err != nil {
 			continue
 		}
-		st.UpdatePodPhase(created.Namespace, created.Name, podmanStateToPhase(c.State, c.ExitCode))
+		st.UpdatePodPhase(created.Namespace, created.Name, podmanStateToPhase(c.State, c.ExitCode), c.Health())
 		imported++
 		fmt.Printf("imported container: %s/%s (%s)\n", ns, name, c.State)
 	}
@@ -769,7 +776,7 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) {
 		if !isDeploymentOwned(pod) {
 			continue
 		}
-		if live[pod.Namespace+"/"+pod.Name] {
+		if _, ok := byPod[pod.Namespace+"/"+pod.Name]; ok {
 			continue
 		}
 		// Don't prune if the systemd unit still exists — the container may
@@ -785,6 +792,7 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) {
 			fmt.Printf("pruned deployment pod: %s/%s (container gone)\n", pod.Namespace, pod.Name)
 		}
 	}
+	return byPod
 }
 
 // isValidObjectName matches the RFC-1123 label rule the API boundary
@@ -825,19 +833,38 @@ func boolPtr(b bool) *bool { return &b }
 // correctness backstop (same "push + periodic full resync" shape real k8s
 // controllers use around their informers).
 func reconcileOnce(st *store.Store, mgr *systemd.Manager) {
-	reconcilePodmanPods(st, mgr)
+	live := reconcilePodmanPods(st, mgr)
 	for _, pod := range st.AllPods() {
+		infos := live[pod.Namespace+"/"+pod.Name]
+		if len(pod.Spec.Containers) > 1 {
+			// A multi-container pod runs as a Podman pod: one systemd
+			// service per member container. Derive the pod phase from the
+			// set of members, and fall back to the pod's own service state
+			// when Podman hasn't reported any container yet.
+			phase, states := podmanContainerStates(pod, infos)
+			if len(infos) == 0 {
+				if state, err := mgr.UnitState(fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name)); err == nil && state != nil {
+					phase = unitStateToPhase(state)
+				}
+			}
+			st.UpdatePodContainerPhases(pod.Namespace, pod.Name, phase, states)
+			continue
+		}
+		health := ""
+		if len(infos) > 0 {
+			health = infos[0].Health()
+		}
 		state, err := mgr.UnitState(fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name))
 		if err != nil || state == nil {
 			// No systemd unit — fall back to Podman container state directly.
 			containerName := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
 			cs, perr := podman.InspectState(containerName)
 			if perr == nil {
-				st.UpdatePodPhase(pod.Namespace, pod.Name, podmanStateToPhase(cs.State, cs.ExitCode))
+				st.UpdatePodPhase(pod.Namespace, pod.Name, podmanStateToPhase(cs.State, cs.ExitCode), health)
 			}
 			continue
 		}
-		st.UpdatePodPhase(pod.Namespace, pod.Name, unitStateToPhase(state))
+		st.UpdatePodPhase(pod.Namespace, pod.Name, unitStateToPhase(state), health)
 		st.UpdatePodRestartInfo(pod.Namespace, pod.Name, int32(state.NRestarts), int32(state.ExitCode), state.Result != "")
 	}
 	for _, dep := range st.AllDeployments() {
@@ -951,6 +978,59 @@ func unitStateToPhase(s *systemd.UnitState) corev1.PodPhase {
 		return corev1.PodPending
 	default:
 		return corev1.PodPending
+	}
+}
+
+// podmanContainerStates maps the live Podman containers of a multi-container
+// pod to per-container sync state, matched by io.kubernetes.container.name.
+// The pod phase follows the set: Running when every container runs,
+// Succeeded when every container exited 0, Failed when any container failed,
+// otherwise Pending.
+func podmanContainerStates(pod *corev1.Pod, infos []podman.ContainerInfo) (corev1.PodPhase, map[string]store.ContainerSyncState) {
+	byName := make(map[string]podman.ContainerInfo, len(infos))
+	for _, ci := range infos {
+		name := ci.ContainerName()
+		// Containers created before multi-container support (or imported
+		// from live Podman state) carry only the pod labels; in a pod with
+		// one container that is unambiguous.
+		if name == "" && len(pod.Spec.Containers) == 1 {
+			name = pod.Spec.Containers[0].Name
+		}
+		if name != "" {
+			byName[name] = ci
+		}
+	}
+
+	states := make(map[string]store.ContainerSyncState, len(pod.Spec.Containers))
+	running, succeeded, failed := 0, 0, 0
+	for _, c := range pod.Spec.Containers {
+		phase := corev1.PodPending
+		health := ""
+		if ci, ok := byName[c.Name]; ok {
+			phase = podmanStateToPhase(ci.State, ci.ExitCode)
+			health = ci.Health()
+		}
+		states[c.Name] = store.ContainerSyncState{Phase: phase, Health: health}
+		switch phase {
+		case corev1.PodRunning:
+			running++
+		case corev1.PodSucceeded:
+			succeeded++
+		case corev1.PodFailed:
+			failed++
+		}
+	}
+
+	n := len(pod.Spec.Containers)
+	switch {
+	case n > 0 && running == n:
+		return corev1.PodRunning, states
+	case n > 0 && succeeded == n:
+		return corev1.PodSucceeded, states
+	case failed > 0:
+		return corev1.PodFailed, states
+	default:
+		return corev1.PodPending, states
 	}
 }
 

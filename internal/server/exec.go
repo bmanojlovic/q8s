@@ -208,7 +208,7 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 	// interactive programs (bash, readline, vim) work correctly. Podman owns
 	// the PTY master; we proxy bytes through pipes. Resize events (channel 4)
 	// are accepted but silently ignored — the initial size is Podman's default.
-	containerName := fmt.Sprintf("%s-%s", ns, name)
+	containerName := s.podContainerName(ns, name, q.Get("container"))
 	wantTTY := q.Get("tty") == "true"
 	podmanArgs := []string{"exec", "-i"}
 	if wantTTY {
