@@ -3397,3 +3397,62 @@ func TestUnchangedDeploymentReapplyDoesNotRewrite(t *testing.T) {
 		t.Fatalf("unchanged re-apply changed the content:\ngot:\n%s\nwant:\n%s", got, before)
 	}
 }
+
+// TestIngressBackendHonorsHostIP: a pod that pins its publish to its own
+// loopback address (hostIP 127.25.0.1) is only listening there, so Traefik
+// must dial that address on the real port, not 127.0.0.1. Wildcard and unset
+// hostIPs still resolve to 127.0.0.1.
+func TestIngressBackendHonorsHostIP(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+
+	for _, p := range []struct {
+		name, hostIP string
+		hostPort     int32
+	}{
+		{"own-ip", "127.25.0.1", 8080},
+		{"wildcard", "0.0.0.0", 20021},
+	} {
+		body := map[string]interface{}{
+			"apiVersion": "v1", "kind": "Pod",
+			"metadata": map[string]interface{}{"name": p.name, "namespace": "default", "labels": map[string]string{"app": "mail"}},
+			"spec": map[string]interface{}{
+				"containers": []interface{}{map[string]interface{}{
+					"name": "c", "image": "nginx",
+					"ports": []interface{}{map[string]interface{}{
+						"containerPort": 8080, "hostPort": p.hostPort, "hostIP": p.hostIP,
+					}},
+				}},
+			},
+		}
+		resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", body)
+		assertStatus(t, resp, http.StatusCreated)
+		resp.Body.Close()
+	}
+
+	svc := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Service",
+		"metadata": map[string]interface{}{"name": "mail", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"selector": map[string]string{"app": "mail"},
+			"ports":    []interface{}{map[string]interface{}{"port": 80, "targetPort": 8080}},
+		},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", svc)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses",
+		ingressBody("default", "mail", "mail.example.com", "mail", 80))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "mail")
+	for _, want := range []string{`- url: "http://127.25.0.1:8080"`, `- url: "http://127.0.0.1:20021"`} {
+		if !strings.Contains(cfg, want) {
+			t.Errorf("missing server %s in:\n%s", want, cfg)
+		}
+	}
+	if strings.Contains(cfg, "0.0.0.0") {
+		t.Errorf("wildcard hostIP leaked into backend URL:\n%s", cfg)
+	}
+}

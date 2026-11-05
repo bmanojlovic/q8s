@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -4126,7 +4127,7 @@ func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portNa
 					continue
 				}
 				if cp.HostPort != 0 {
-					servers = append(servers, fmt.Sprintf("http://127.0.0.1:%d", cp.HostPort))
+					servers = append(servers, "http://"+backendHostPort(cp.HostIP, cp.HostPort))
 				}
 				// A pod lists each container port once; stop at the first
 				// matching entry for this container.
@@ -4135,6 +4136,20 @@ func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portNa
 		}
 	}
 	return servers
+}
+
+// backendHostPort is the address an on-host Traefik dials for a published
+// port. A pod that pins its publish to one address (hostIP) is only listening
+// there, so that address is the backend: this is what lets a service own a
+// loopback IP such as 127.25.0.1 and keep its real port, the cheap in-kernel
+// equivalent of a ClusterIP. An unset or wildcard hostIP binds every
+// interface, so loopback reaches it.
+func backendHostPort(hostIP string, port int32) string {
+	ip := net.ParseIP(hostIP)
+	if ip == nil || ip.IsUnspecified() {
+		hostIP = "127.0.0.1"
+	}
+	return net.JoinHostPort(hostIP, strconv.Itoa(int(port)))
 }
 
 // regenerateIngressConfigs rewrites the Traefik dynamic config for every
