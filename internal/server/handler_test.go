@@ -2901,6 +2901,23 @@ func svcNodePort(t *testing.T, m map[string]interface{}) int {
 	return int(np)
 }
 
+// svcWithPortBody builds a Service with an explicit type, selector and
+// single port; tests use it to cover non-NodePort Services.
+func svcWithPortBody(ns, name, svcType string, port int, selector map[string]string) map[string]interface{} {
+	return map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Service",
+		"metadata":   map[string]interface{}{"name": name, "namespace": ns},
+		"spec": map[string]interface{}{
+			"type":     svcType,
+			"selector": selector,
+			"ports": []interface{}{
+				map[string]interface{}{"port": port, "targetPort": port, "protocol": "TCP"},
+			},
+		},
+	}
+}
+
 // TestNodePortAutoAllocated: a NodePort service with no explicit nodePort
 // gets one assigned in range and returned in the created object.
 func TestNodePortAutoAllocated(t *testing.T) {
@@ -2942,6 +2959,98 @@ func TestNodePortDuplicateRejected(t *testing.T) {
 	resp = post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "b", 80, want))
 	assertStatus(t, resp, 409)
 	resp.Body.Close()
+}
+
+// TestPodHostPortAllowsClusterIPServicePort: a ClusterIP Service binds
+// nothing on the host, so a matching pod may use the same number as hostPort.
+func TestPodHostPortAllowsClusterIPServicePort(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services",
+		svcWithPortBody("default", "web", "ClusterIP", 8080, map[string]string{"app": "x"}))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	postPodWithPort(t, ts.URL, "default", "p1", map[string]string{"app": "x"}, 8080, 8080)
+}
+
+// TestClusterIPServicePortAllowsPodHostPort: the reverse order is fine too.
+func TestClusterIPServicePortAllowsPodHostPort(t *testing.T) {
+	ts, _ := newTestServer(t)
+	postPodWithPort(t, ts.URL, "default", "p1", map[string]string{"app": "x"}, 8080, 8080)
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services",
+		svcWithPortBody("default", "web", "ClusterIP", 8080, map[string]string{"app": "x"}))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+}
+
+// TestPodHostPortConflictsWithNodePortOfUnselectedService: a nodePort binds
+// 0.0.0.0, so even an unselected pod with the same hostPort collides.
+func TestPodHostPortConflictsWithNodePortOfUnselectedService(t *testing.T) {
+	ts, _ := newTestServer(t)
+	want := store.NodePortMin + 300
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "np", 80, want))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	body := map[string]interface{}{
+		"apiVersion": "v1", "kind": "Pod",
+		"metadata": map[string]interface{}{
+			"name": "p1", "namespace": "default",
+			"labels": map[string]string{"app": "other"},
+		},
+		"spec": map[string]interface{}{
+			"containers": []interface{}{map[string]interface{}{
+				"name":  "c",
+				"image": "nginx",
+				"ports": []interface{}{map[string]interface{}{
+					"containerPort": 8080,
+					"hostPort":      want,
+				}},
+			}},
+		},
+	}
+	resp = post(t, ts.URL+"/api/v1/namespaces/default/pods", body)
+	assertStatus(t, resp, 409)
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(raw), "collides with nodePort") {
+		t.Errorf("expected a nodePort collision message, got: %s", raw)
+	}
+}
+
+// TestNodePortConflictsWithPodHostPort: the Service side rejects a nodePort
+// that a pod already publishes, and the failed Service is not left stored.
+func TestNodePortConflictsWithPodHostPort(t *testing.T) {
+	ts, _ := newTestServer(t)
+	want := store.NodePortMin + 400
+	postPodWithPort(t, ts.URL, "default", "p1", map[string]string{"app": "x"}, 8080, int32(want))
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "np", 80, want))
+	assertStatus(t, resp, 409)
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(raw), "collides with hostPort") {
+		t.Errorf("expected a hostPort collision message, got: %s", raw)
+	}
+
+	resp = get(t, ts.URL+"/api/v1/namespaces/default/services/np")
+	assertStatus(t, resp, 404)
+	resp.Body.Close()
+}
+
+// TestNodePortComparesNodePortNotServicePort: only nodePort binds the host;
+// the Service port matching a pod hostPort is not a collision.
+func TestNodePortComparesNodePortNotServicePort(t *testing.T) {
+	ts, _ := newTestServer(t)
+	want := store.NodePortMin + 500
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/services", nodePortSvcBody("default", "np", 8080, want))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	// Matching labels, but only the nodePort binds 0.0.0.0; the service
+	// port 8080 does not collide with hostPort 8080.
+	postPodWithPort(t, ts.URL, "default", "p1", map[string]string{"app": "np"}, 8080, 8080)
 }
 
 // TestSecretStringDataFoldedToData is the regression test for tic-b31a: a
