@@ -89,17 +89,112 @@ Containers that **don't** publish ports (internal-only on the `q8s-{ns}` podman 
 ## TLS termination
 
 TLS is **Traefik's job, not q8s's**. Setting `tls` on an ingress rule makes q8s
-emit `tls: {}` in the router — Traefik serves it with *its default
-certificate* (self-signed unless you configured one).
+emit `tls: {}` in the router. In Traefik v3 a router-level `tls` block
+**replaces** the entrypoint's `http.tls` defaults, so `tls: {}` also drops a
+`certResolver` configured on the entrypoint and Traefik serves its default
+self-signed certificate instead of a Let's Encrypt one. To get ACME
+certificates for a specific Ingress, set the
+`traefik.ingress.kubernetes.io/router.tls.certresolver` annotation (see
+"Traefik annotations" below): q8s then writes
+`tls: {certResolver: ...}` for the router instead of an empty block.
 
 `spec.tls[].secretName` is **accepted for manifest compatibility and
 deliberately not read**. q8s does not participate in public-TLS lifecycles
-(certificate renewal, rotation, ACME, cert-manager integration) — that would
+(certificate renewal, rotation, ACME, cert-manager integration); that would
 make q8s part of the trust chain for external traffic, which is exactly the
 surface q8s tries not to have. For real certificates configure Traefik
-itself: `tls.certificates` in its static/dynamic config, or an ACME
-`certificatesResolver` (Let's Encrypt). Containers that must own their certs
-(a Caddy sidecar, certbot) can terminate TLS themselves.
+itself: `tls.certificates` in its static/dynamic config, an ACME
+`certificatesResolver` (Let's Encrypt), or the per-Ingress annotation above.
+Containers that must own their certs (a Caddy sidecar, certbot) can terminate
+TLS themselves.
+
+## Traefik annotations
+
+q8s honors the router annotations of Traefik's own KubernetesIngress provider,
+with the same keys and the same meaning, so an Ingress manifest written for
+real k8s + Traefik works here unchanged. Every router generated from the
+Ingress (one per rule/path) gets the same settings.
+
+| annotation | value | router output |
+|---|---|---|
+| `traefik.ingress.kubernetes.io/router.entrypoints` | comma-separated names | `entryPoints:` list |
+| `traefik.ingress.kubernetes.io/router.middlewares` | comma-separated refs | `middlewares:` list, in the given order |
+| `traefik.ingress.kubernetes.io/router.tls` | `"true"` / `"false"` | `"true"` adds a `tls` block even without `spec.tls` |
+| `traefik.ingress.kubernetes.io/router.tls.certresolver` | resolver name | `tls:` block with `certResolver:` (implies tls) |
+| `traefik.ingress.kubernetes.io/router.priority` | integer | `priority:` |
+
+List items are split on commas, trimmed of surrounding spaces, and empty items
+are dropped. `router.tls: "false"` without a certresolver and without
+`spec.tls` means no `tls` block. Other
+`traefik.ingress.kubernetes.io/*` annotations are ignored.
+
+Example:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: www-redirect@file,hsts@file
+    traefik.ingress.kubernetes.io/router.tls.certresolver: le
+    traefik.ingress.kubernetes.io/router.priority: "10"
+spec:
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: myapp
+                port:
+                  number: 8080
+```
+
+q8s renders:
+
+```yaml
+http:
+  routers:
+    default-myapp-0:
+      rule: "Host(`app.example.com`)"
+      service: default-myapp-0
+      entryPoints: ["websecure"]
+      middlewares: ["www-redirect@file", "hsts@file"]
+      priority: 10
+      tls:
+        certResolver: "le"
+```
+
+q8s only **references** middlewares, it never defines them. A `@file`
+middleware must exist in Traefik's dynamic configuration directory - the same
+directory q8s writes its Ingress files into (`~/.local/share/q8s/traefik/`,
+or `/etc/q8s/traefik/` for rootful q8s), for example:
+
+```yaml
+# ~/.local/share/q8s/traefik/middlewares.yaml
+http:
+  middlewares:
+    www-redirect:
+      redirectRegex:
+        regex: "^https://example\\.com/(.*)"
+        replacement: "https://www.example.com/${1}"
+        permanent: true
+    hsts:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+```
+
+Annotation values are validated when the Ingress is created or updated: an
+entrypoint or certresolver name must match `[A-Za-z0-9][A-Za-z0-9._-]*`, a
+middleware reference must be `name` or `name@provider` (provider
+`[a-z0-9][a-z0-9-]*`), `router.tls` must parse as a boolean, and
+`router.priority` must be a non-negative integer. An invalid value is rejected
+with HTTP 400 rather than written into the config file Traefik loads.
 
 ## Port resolution (selector-based, like Endpoints)
 

@@ -24,6 +24,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/server"
 	"q8s/internal/store"
@@ -2124,6 +2125,268 @@ func TestIngressNilBackendSkippedInTraefikConfig(t *testing.T) {
 	}
 	if !strings.Contains(string(cfg), "/real") {
 		t.Errorf("valid path missing from traefik config:\n%s", cfg)
+	}
+}
+
+// TestIngressRouterAnnotationCertResolver pins the fix for a router-level tls
+// block replacing the entrypoint's http.tls defaults: the annotation's
+// certResolver must be repeated on the router, with or without spec.tls.
+func TestIngressRouterAnnotationCertResolver(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		specTLS bool
+	}{
+		{"with-spec-tls", true},
+		{"without-spec-tls", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, traefikDir := ingressTestServer(t)
+			body := ingressBody("default", tc.name, "example.com", "myservice", 80)
+			body["metadata"].(map[string]interface{})["annotations"] = map[string]interface{}{
+				"traefik.ingress.kubernetes.io/router.tls.certresolver": "le",
+			}
+			if tc.specTLS {
+				body["spec"].(map[string]interface{})["tls"] = []interface{}{
+					map[string]interface{}{"hosts": []interface{}{"example.com"}},
+				}
+			}
+
+			resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", body)
+			assertStatus(t, resp, http.StatusCreated)
+			resp.Body.Close()
+
+			cfg := readTraefikConfig(t, traefikDir, "default", tc.name)
+			if !strings.Contains(cfg, "      tls:\n        certResolver: \"le\"\n") {
+				t.Errorf("router is missing certResolver:\n%s", cfg)
+			}
+			if strings.Contains(cfg, "tls: {}") {
+				t.Errorf("router still has an empty tls block next to certResolver:\n%s", cfg)
+			}
+		})
+	}
+}
+
+// TestIngressRouterAnnotationMiddlewares pins verbatim, ordered middleware
+// refs with spaces trimmed and empty items dropped.
+func TestIngressRouterAnnotationMiddlewares(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+	body := ingressBody("default", "mw", "example.com", "myservice", 80)
+	body["metadata"].(map[string]interface{})["annotations"] = map[string]interface{}{
+		"traefik.ingress.kubernetes.io/router.middlewares": " a@file , b@file ",
+	}
+
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "mw")
+	if !strings.Contains(cfg, `      middlewares: ["a@file", "b@file"]`) {
+		t.Errorf("middlewares annotation not rendered verbatim:\n%s", cfg)
+	}
+}
+
+func TestIngressRouterAnnotationEntryPoints(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+	body := ingressBody("default", "eps", "example.com", "myservice", 80)
+	body["metadata"].(map[string]interface{})["annotations"] = map[string]interface{}{
+		"traefik.ingress.kubernetes.io/router.entrypoints": "websecure",
+	}
+
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "eps")
+	if !strings.Contains(cfg, `      entryPoints: ["websecure"]`) {
+		t.Errorf("entrypoints annotation not rendered:\n%s", cfg)
+	}
+}
+
+// TestIngressRouterAnnotationTLSAndPriority pins router.tls="true" adding a
+// tls block without spec.tls, and the integer priority field.
+func TestIngressRouterAnnotationTLSAndPriority(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+	body := ingressBody("default", "tlsandprio", "example.com", "myservice", 80)
+	body["metadata"].(map[string]interface{})["annotations"] = map[string]interface{}{
+		"traefik.ingress.kubernetes.io/router.tls":      "true",
+		"traefik.ingress.kubernetes.io/router.priority": "10",
+	}
+
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "tlsandprio")
+	if !strings.Contains(cfg, "      tls: {}\n") {
+		t.Errorf("router.tls=true did not add a tls block:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "      priority: 10\n") {
+		t.Errorf("priority annotation not rendered:\n%s", cfg)
+	}
+}
+
+// TestIngressRouterAnnotationTLSFalse pins that router.tls="false" without
+// spec.tls and without a certresolver leaves the router without a tls block.
+func TestIngressRouterAnnotationTLSFalse(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+	body := ingressBody("default", "notls", "example.com", "myservice", 80)
+	body["metadata"].(map[string]interface{})["annotations"] = map[string]interface{}{
+		"traefik.ingress.kubernetes.io/router.tls": "false",
+	}
+
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "notls")
+	if strings.Contains(cfg, "tls:") {
+		t.Errorf("router.tls=false still produced a tls block:\n%s", cfg)
+	}
+}
+
+// TestIngressWithoutRouterAnnotationsUnchanged pins byte-for-byte output for
+// an Ingress without any router annotation: no new keys may appear.
+func TestIngressWithoutRouterAnnotationsUnchanged(t *testing.T) {
+	ts, traefikDir := ingressTestServer(t)
+	body := ingressBody("default", "plain", "example.com", "myservice", 80)
+
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	want := "http:\n" +
+		"  routers:\n" +
+		"    default-plain-0:\n" +
+		"      rule: \"Host(`example.com`)\"\n" +
+		"      service: default-plain-0\n" +
+		"  services:\n" +
+		"    default-plain-0:\n" +
+		"      loadBalancer:\n" +
+		"        servers:\n" +
+		"          - url: \"http://localhost:80\"\n"
+	if cfg := readTraefikConfig(t, traefikDir, "default", "plain"); cfg != want {
+		t.Errorf("traefik config changed for an Ingress without annotations:\ngot:\n%s\nwant:\n%s", cfg, want)
+	}
+}
+
+// TestIngressRouterAnnotationValidationRejects pins the API-boundary check:
+// annotation values are spliced into the YAML file Traefik loads, so anything
+// that could break out of its scalar is a 400 on POST, PUT and PATCH.
+func TestIngressRouterAnnotationValidationRejects(t *testing.T) {
+	bad := []struct {
+		annotation string
+		value      string
+	}{
+		{"traefik.ingress.kubernetes.io/router.middlewares", "evil\"\n  x: y"},
+		{"traefik.ingress.kubernetes.io/router.tls.certresolver", "a b"},
+		{"traefik.ingress.kubernetes.io/router.tls", "maybe"},
+		{"traefik.ingress.kubernetes.io/router.priority", "-1"},
+	}
+	url := "/apis/networking.k8s.io/v1/namespaces/default/ingresses"
+	for _, tc := range bad {
+		t.Run(tc.annotation, func(t *testing.T) {
+			ts, _ := ingressTestServer(t)
+			body := ingressBody("default", "bad", "example.com", "myservice", 80)
+			body["metadata"].(map[string]interface{})["annotations"] = map[string]interface{}{
+				tc.annotation: tc.value,
+			}
+			resp := post(t, ts.URL+url, body)
+			assertStatus(t, resp, http.StatusBadRequest)
+			resp.Body.Close()
+		})
+	}
+
+	// PUT and PATCH of an existing Ingress must reject the same values.
+	ts, _ := ingressTestServer(t)
+	valid := ingressBody("default", "later", "example.com", "myservice", 80)
+	resp := post(t, ts.URL+url, valid)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	put := ingressBody("default", "later", "example.com", "myservice", 80)
+	put["metadata"].(map[string]interface{})["annotations"] = map[string]interface{}{
+		"traefik.ingress.kubernetes.io/router.middlewares": "evil\"\n  x: y",
+	}
+	resp = do(t, http.MethodPut, ts.URL+url+"/later", put)
+	assertStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				"traefik.ingress.kubernetes.io/router.tls": "maybe",
+			},
+		},
+	}
+	resp = strategicPatch(t, ts.URL+url+"/later", patch)
+	assertStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+}
+
+// TestIngressRouterAnnotationGeneratorDefense pins the generator-side check:
+// an Ingress stored without validation (an object written by an older q8s)
+// must not be able to inject config into the rendered YAML.
+func TestIngressRouterAnnotationGeneratorDefense(t *testing.T) {
+	traefikDir := t.TempDir()
+	st := store.New()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:      st,
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		TraefikDir: traefikDir,
+		QuadletDir: t.TempDir(),
+		ConfigDir:  filepath.Join(t.TempDir(), "configmaps"),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	prefix := networkingv1.PathTypePrefix
+	ing := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "tampered",
+			Annotations: map[string]string{
+				"traefik.ingress.kubernetes.io/router.middlewares": "evil\"\n  rule: Host(`pwned`)@file",
+				"traefik.ingress.kubernetes.io/router.entrypoints": "web\n        rule: Host(`pwned`)",
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			Rules: []networkingv1.IngressRule{{
+				Host: "example.com",
+				IngressRuleValue: networkingv1.IngressRuleValue{
+					HTTP: &networkingv1.HTTPIngressRuleValue{
+						Paths: []networkingv1.HTTPIngressPath{{
+							Path:     "/",
+							PathType: &prefix,
+							Backend: networkingv1.IngressBackend{
+								Service: &networkingv1.IngressServiceBackend{
+									Name: "myservice",
+									Port: networkingv1.ServiceBackendPort{Number: 80},
+								},
+							},
+						}},
+					},
+				},
+			}},
+		},
+	}
+	if _, err := st.CreateIngress(ing); err != nil {
+		t.Fatalf("store ingress: %v", err)
+	}
+
+	// Any pod churn in the namespace regenerates every Ingress config.
+	postPodWithPort(t, ts.URL, "default", "trigger", nil, 8080, 20001)
+
+	cfg := readTraefikConfig(t, traefikDir, "default", "tampered")
+	if strings.Contains(cfg, "evil") || strings.Contains(cfg, "pwned") {
+		t.Errorf("invalid annotation leaked into traefik config:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "      rule: \"Host(`example.com`)\"\n") {
+		t.Errorf("valid router settings were dropped:\n%s", cfg)
 	}
 }
 
