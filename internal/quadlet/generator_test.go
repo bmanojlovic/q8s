@@ -16,7 +16,7 @@ import (
 
 func mustContainer(t *testing.T, pod *corev1.Pod, configDir string) string {
 	t.Helper()
-	b, err := quadlet.Container(pod.Name, pod, configDir, nil, nil, "")
+	b, err := quadlet.Container(pod.Name, pod, configDir, nil, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -244,14 +244,14 @@ func TestContainerPropagatesPodLabels(t *testing.T) {
 func TestContainerRejectsInvalidLabelValue(t *testing.T) {
 	pod := simplePod("default", "app", "myimage")
 	pod.Labels = map[string]string{"app": "web\n\n[Service]\nExecStartPre=/bin/evil"}
-	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 		t.Fatal("expected error for label value containing control characters")
 	}
 }
 
 func TestContainerNetworkAlias(t *testing.T) {
 	pod := simplePod("default", "app", "myimage")
-	out, err := quadlet.Container(pod.Name, pod, "", []string{"myservice", "other-svc"}, nil, "")
+	out, err := quadlet.Container(pod.Name, pod, "", []string{"myservice", "other-svc"}, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestContainerNetworkAlias(t *testing.T) {
 func TestContainerNoNetworkAliasWithHostNetwork(t *testing.T) {
 	pod := simplePod("default", "app", "myimage")
 	pod.Spec.HostNetwork = true
-	out, err := quadlet.Container(pod.Name, pod, "", []string{"myservice"}, nil, "")
+	out, err := quadlet.Container(pod.Name, pod, "", []string{"myservice"}, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -271,8 +271,165 @@ func TestContainerNoNetworkAliasWithHostNetwork(t *testing.T) {
 
 func TestContainerRejectsInvalidNetworkAlias(t *testing.T) {
 	pod := simplePod("default", "app", "myimage")
-	if _, err := quadlet.Container(pod.Name, pod, "", []string{"bad alias!"}, nil, ""); err == nil {
+	if _, err := quadlet.Container(pod.Name, pod, "", []string{"bad alias!"}, nil, "", nil); err == nil {
 		t.Fatal("expected error for invalid service alias")
+	}
+}
+
+func networkAliasLines(out string) []string {
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "NetworkAlias=") {
+			lines = append(lines, strings.TrimPrefix(line, "NetworkAlias="))
+		}
+	}
+	return lines
+}
+
+func TestContainerNetworkAliasExpansion(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	out, err := quadlet.Container("app", pod, "", []string{"myservice"}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	got := networkAliasLines(string(out))
+	want := []string{
+		"app.default",
+		"myservice",
+		"myservice.default",
+		"myservice.default.svc.cluster.local",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("aliases = %v, want %v", got, want)
+	}
+}
+
+func TestContainerNetworkAliasWithoutServices(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	out := mustContainer(t, pod, "")
+	got := networkAliasLines(out)
+	if len(got) != 1 || got[0] != "app.default" {
+		t.Errorf("aliases without Services = %v, want [app.default]", got)
+	}
+}
+
+func TestContainerNetworkAliasHostNetworkHasNone(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.HostNetwork = true
+	out, err := quadlet.Container("app", pod, "", []string{"myservice"}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	if got := networkAliasLines(string(out)); len(got) != 0 {
+		t.Errorf("hostNetwork pod got aliases %v", got)
+	}
+}
+
+func networkLines(out string) []string {
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "Network=") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// An empty attachment list must render exactly today's single network line.
+func TestContainerNetworksEmptyList(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	withNil, err := quadlet.Container("app", pod, "", nil, nil, "", nil)
+	if err != nil {
+		t.Fatalf("Container(nil): %v", err)
+	}
+	withEmpty, err := quadlet.Container("app", pod, "", nil, nil, "", []quadlet.NetworkAttachment{})
+	if err != nil {
+		t.Fatalf("Container(empty): %v", err)
+	}
+	if string(withNil) != string(withEmpty) {
+		t.Errorf("nil and empty networks differ:\n%s\n%s", withNil, withEmpty)
+	}
+	if got := networkLines(string(withNil)); len(got) != 1 || got[0] != "Network=q8s-default.network" {
+		t.Errorf("network lines = %v, want [Network=q8s-default.network]", got)
+	}
+}
+
+func TestContainerNetworksOwnNamespaceMissing(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	out, err := quadlet.Container("app", pod, "", nil, nil, "", []quadlet.NetworkAttachment{
+		{Namespace: "other"},
+	})
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	want := []string{"Network=q8s-default.network", "Network=q8s-other.network"}
+	if got := networkLines(string(out)); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("network lines = %v, want %v", got, want)
+	}
+}
+
+func TestContainerNetworksSortedAndIPOption(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	out, err := quadlet.Container("app", pod, "", nil, nil, "", []quadlet.NetworkAttachment{
+		{Namespace: "other"},
+		{Namespace: "default", IP: "10.89.3.254"},
+	})
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	want := []string{
+		"Network=q8s-default.network:ip=10.89.3.254",
+		"Network=q8s-other.network",
+	}
+	if got := networkLines(string(out)); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("network lines = %v, want %v", got, want)
+	}
+}
+
+func TestContainerNetworksRejectsBadIP(t *testing.T) {
+	for _, ip := range []string{"not-an-ip", "fd00::1", "10.89.3.256"} {
+		pod := simplePod("default", "app", "myimage")
+		if _, err := quadlet.Container("app", pod, "", nil, nil, "", []quadlet.NetworkAttachment{
+			{Namespace: "default", IP: ip},
+		}); err == nil {
+			t.Errorf("expected error for network IP %q", ip)
+		}
+	}
+}
+
+func TestLastUsableIPv4(t *testing.T) {
+	tests := []struct {
+		cidr    string
+		want    string
+		wantErr bool
+	}{
+		{cidr: "10.89.3.0/24", want: "10.89.3.254"},
+		{cidr: "10.89.0.0/16", want: "10.89.255.254"},
+		{cidr: "10.0.0.0/8", want: "10.255.255.254"},
+		{cidr: "192.168.5.0/30", want: "192.168.5.2"},
+		{cidr: "10.89.3.7/24", want: "10.89.3.254"},
+		{cidr: "10.0.0.0/31", wantErr: true},
+		{cidr: "10.0.0.0/32", wantErr: true},
+		{cidr: "fd00::/64", wantErr: true},
+		{cidr: "not-a-cidr", wantErr: true},
+		{cidr: "", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.cidr, func(t *testing.T) {
+			got, err := quadlet.LastUsableIPv4(tt.cidr)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LastUsableIPv4(%q): %v", tt.cidr, err)
+			}
+			if got != tt.want {
+				t.Errorf("LastUsableIPv4(%q) = %q, want %q", tt.cidr, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -509,7 +666,7 @@ func TestContainerRejectsInvalidUlimits(t *testing.T) {
 	} {
 		pod := simplePod("default", "llm", "llm:latest")
 		pod.Annotations = map[string]string{quadlet.AnnotationUlimits: value}
-		if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+		if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 			t.Errorf("expected error for q8s.io/ulimits %q", value)
 		}
 	}
@@ -520,7 +677,7 @@ func TestContainerNoContainersError(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "empty", Namespace: "default"},
 		Spec:       corev1.PodSpec{},
 	}
-	_, err := quadlet.Container(pod.Name, pod, "", nil, nil, "")
+	_, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil)
 	if err == nil {
 		t.Fatal("expected error for pod with no containers")
 	}
@@ -843,7 +1000,7 @@ func TestContainerPVCStandardClass(t *testing.T) {
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "my-pvc"}},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
-	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -864,7 +1021,7 @@ func TestContainerPVCSharedClass(t *testing.T) {
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "shared-vol"}},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
-	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -886,7 +1043,7 @@ func TestContainerPVCHostpathClass(t *testing.T) {
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
-	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -913,7 +1070,7 @@ func TestContainerPVCHostpathSharedSELinuxLabel(t *testing.T) {
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/models", ReadOnly: true}}
-	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -938,7 +1095,7 @@ func TestContainerPVCHostpathReadOnly(t *testing.T) {
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/models", ReadOnly: true}}
-	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -971,7 +1128,7 @@ func TestContainerPVCVolumeSourceReadOnly(t *testing.T) {
 				}},
 			}}
 			pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
-			b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+			b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 			if err != nil {
 				t.Fatalf("Container: %v", err)
 			}
@@ -1017,7 +1174,7 @@ func TestContainerPVCUnknownClassReadOnly(t *testing.T) {
 				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "odd-vol"}},
 			}}
 			pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data", ReadOnly: tc.readOnly}}
-			b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+			b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 			if err != nil {
 				t.Fatalf("Container: %v", err)
 			}
@@ -1055,7 +1212,7 @@ func TestContainerPVCHostpathPrivateSELinuxLabel(t *testing.T) {
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/models"}}
-	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -1081,7 +1238,7 @@ func TestContainerPVCHostpathInvalidSELinuxLabel(t *testing.T) {
 			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
 		}}
 		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/models"}}
-		if _, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, ""); err == nil {
+		if _, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil); err == nil {
 			t.Errorf("expected error for q8s.io/selinux-label %q", value)
 		}
 	}
@@ -1101,7 +1258,7 @@ func TestContainerPVCHostpathMissingAnnotation(t *testing.T) {
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "hp"}},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
-	_, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	_, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 	if err == nil {
 		t.Fatal("expected error for hostpath PVC without q8s.io/host-path annotation")
 	}
@@ -1120,7 +1277,7 @@ func TestContainerPVCDefaultClassWhenNil(t *testing.T) {
 		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "my-pvc"}},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
-	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "")
+	b, err := quadlet.Container(pod.Name, pod, "", nil, pvcMap, "", nil)
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
@@ -1179,7 +1336,7 @@ func TestContainerPVCStorageRequest(t *testing.T) {
 
 func TestContainerRejectsNewlineInImage(t *testing.T) {
 	pod := simplePod("default", "victim", "nginx:latest\n\n[Service]\nExecStartPre=/bin/touch /tmp/pwned")
-	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 		t.Fatal("expected error for image containing embedded unit-file directives, got nil")
 	}
 }
@@ -1187,7 +1344,7 @@ func TestContainerRejectsNewlineInImage(t *testing.T) {
 func TestContainerRejectsNewlineInWorkingDir(t *testing.T) {
 	pod := simplePod("default", "victim", "nginx:latest")
 	pod.Spec.Containers[0].WorkingDir = "/app\n\n[Service]\nExecStartPre=/bin/touch /tmp/pwned"
-	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 		t.Fatal("expected error for WorkingDir containing embedded unit-file directives, got nil")
 	}
 }
@@ -1197,7 +1354,7 @@ func TestContainerRejectsNewlineInEnvValue(t *testing.T) {
 	pod.Spec.Containers[0].Env = []corev1.EnvVar{
 		{Name: "FOO", Value: "bar\n\n[Service]\nExecStartPre=/bin/touch /tmp/pwned"},
 	}
-	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 		t.Fatal("expected error for env value containing embedded unit-file directives, got nil")
 	}
 }
@@ -1205,7 +1362,7 @@ func TestContainerRejectsNewlineInEnvValue(t *testing.T) {
 func TestContainerRejectsInvalidEnvName(t *testing.T) {
 	pod := simplePod("default", "victim", "nginx:latest")
 	pod.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "not a valid name", Value: "x"}}
-	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 		t.Fatal("expected error for invalid environment variable name, got nil")
 	}
 }
@@ -1221,7 +1378,7 @@ func TestContainerRejectsNewlineInPVCClaimName(t *testing.T) {
 		},
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
-	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 		t.Fatal("expected error for PVC claim name containing embedded unit-file directives, got nil")
 	}
 }
@@ -1229,7 +1386,7 @@ func TestContainerRejectsNewlineInPVCClaimName(t *testing.T) {
 func TestContainerRejectsNewlineInCommand(t *testing.T) {
 	pod := simplePod("default", "victim", "nginx:latest")
 	pod.Spec.Containers[0].Command = []string{"echo\n\n[Service]\nExecStartPre=/bin/touch /tmp/pwned"}
-	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 		t.Fatal("expected error for command containing embedded unit-file directives, got nil")
 	}
 }
@@ -1340,13 +1497,13 @@ func TestContainerPublishPortHonorsHostIP(t *testing.T) {
 		return pod
 	}
 
-	out, err := quadlet.Container("web", mkPod("127.0.0.1"), "", nil, nil, "")
+	out, err := quadlet.Container("web", mkPod("127.0.0.1"), "", nil, nil, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertContains(t, string(out), "PublishPort=127.0.0.1:20000:8080/tcp")
 
-	out, err = quadlet.Container("web", mkPod(""), "", nil, nil, "")
+	out, err = quadlet.Container("web", mkPod(""), "", nil, nil, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1371,12 +1528,12 @@ func TestContainerRejectsUnsafeNameAndNamespace(t *testing.T) {
 		"trailing-",
 	} {
 		pod := simplePod("default", name, "nginx:latest")
-		if _, err := quadlet.Container(name, pod, "", nil, nil, ""); err == nil {
+		if _, err := quadlet.Container(name, pod, "", nil, nil, "", nil); err == nil {
 			t.Errorf("Container accepted unsafe name %q", name)
 		}
 	}
 	pod := simplePod("bad ns", "ok", "nginx:latest")
-	if _, err := quadlet.Container("ok", pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.Container("ok", pod, "", nil, nil, "", nil); err == nil {
 		t.Error("Container accepted unsafe namespace")
 	}
 }

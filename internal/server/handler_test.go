@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/quadlet"
 	"q8s/internal/server"
 	"q8s/internal/store"
 )
@@ -2472,9 +2473,8 @@ func TestPatchCannotRenameAcrossNamespace(t *testing.T) {
 func ingressTestServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	traefikDir := t.TempDir()
-	// QuadletDir must be set: deployment instance pods (which carry the
-	// allocated replica ports) are only materialized when quadlet
-	// generation runs.
+	// QuadletDir must be set: deployment instance pods are only
+	// materialized when quadlet generation runs.
 	quadletDir := t.TempDir()
 	certPEM, keyPEM := genTestCert(t)
 	srv, err := server.New(server.Config{
@@ -2568,9 +2568,11 @@ func TestIngressEndpointsFromSelectorPods(t *testing.T) {
 	}
 }
 
-// TestIngressSkipsPodsWithoutHostPort: pods that publish nothing are not
-// addressable by an on-host Traefik and must be left out of the server list.
-func TestIngressSkipsPodsWithoutHostPort(t *testing.T) {
+// TestIngressSkipsHostNetworkPodsWithoutHostPort: a hostNetwork pod with no
+// hostPort publishes nothing addressable (its own port is only inside its
+// netns), so it is left out of the server list. Every other non-hostNetwork
+// pod is addressed by DNS instead.
+func TestIngressSkipsHostNetworkPodsWithoutHostPort(t *testing.T) {
 	ts, traefikDir := ingressTestServer(t)
 
 	postPodWithPort(t, ts.URL, "default", "pub", map[string]string{"app": "web"}, 8080, 20010)
@@ -2579,6 +2581,7 @@ func TestIngressSkipsPodsWithoutHostPort(t *testing.T) {
 		"apiVersion": "v1", "kind": "Pod",
 		"metadata": map[string]interface{}{"name": "dark", "namespace": "default", "labels": map[string]string{"app": "web"}},
 		"spec": map[string]interface{}{
+			"hostNetwork": true,
 			"containers": []interface{}{map[string]interface{}{
 				"name": "c", "image": "nginx",
 				"ports": []interface{}{map[string]interface{}{"containerPort": 8080}},
@@ -2609,6 +2612,9 @@ func TestIngressSkipsPodsWithoutHostPort(t *testing.T) {
 	cfg := readTraefikConfig(t, traefikDir, "default", "web")
 	if !strings.Contains(cfg, `http://127.0.0.1:20010`) {
 		t.Errorf("published pod missing from config:\n%s", cfg)
+	}
+	if strings.Contains(cfg, "http://dark") {
+		t.Errorf("hostNetwork pod without hostPort leaked into config:\n%s", cfg)
 	}
 	if got := strings.Count(cfg, "- url:"); got != 1 {
 		t.Errorf("expected exactly 1 server, got %d:\n%s", got, cfg)
@@ -2727,7 +2733,7 @@ func TestIngressNamedTargetPort(t *testing.T) {
 	}
 }
 
-// --- Deployment replica ports through Traefik (kube-proxy emulation) ---
+// --- Deployment backends through Traefik (kube-proxy emulation) ---
 
 func postDeployment(t *testing.T, url, ns, name string, replicas int, labels map[string]string) {
 	t.Helper()
@@ -2784,8 +2790,8 @@ func countTraefikServers(t *testing.T, dir, ns, name string) (int, []string) {
 
 // TestDeploymentReplicasLoadBalancedThroughTraefik is the full
 // kube-proxy-emulation scenario: one Deployment, N replicas, one Service,
-// one Ingress — and a Traefik servers list with one loopback URL per
-// replica, each on its own allocated port.
+// one Ingress, and a Traefik servers list with one DNS URL per replica,
+// <pod>.<ns>:<containerPort>, with no host publish involved.
 func TestDeploymentReplicasLoadBalancedThroughTraefik(t *testing.T) {
 	ts, traefikDir := ingressTestServer(t)
 
@@ -2812,15 +2818,19 @@ func TestDeploymentReplicasLoadBalancedThroughTraefik(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("expected 3 servers (one per replica), got %d:\n%s", n, urls)
 	}
-	seen := map[string]bool{}
+	want := map[string]bool{
+		`- url: "http://web-0.default:8080"`: true,
+		`- url: "http://web-1.default:8080"`: true,
+		`- url: "http://web-2.default:8080"`: true,
+	}
 	for _, u := range urls {
-		if seen[u] {
-			t.Errorf("duplicate server %s", u)
+		if !want[u] {
+			t.Errorf("unexpected server %s", u)
 		}
-		seen[u] = true
-		if !strings.Contains(u, "127.0.0.1:") {
-			t.Errorf("server not loopback-bound: %s", u)
-		}
+		delete(want, u)
+	}
+	for u := range want {
+		t.Errorf("missing server %s", u)
 	}
 
 	// Scale down to 1: the servers list shrinks.
@@ -2847,8 +2857,8 @@ func TestDeploymentReplicasLoadBalancedThroughTraefik(t *testing.T) {
 	resp.Body.Close()
 
 	cfg := readTraefikConfig(t, traefikDir, "default", "web")
-	if strings.Contains(cfg, "127.0.0.1:2") {
-		t.Errorf("allocated ports still present after deployment delete:\n%s", cfg)
+	if strings.Contains(cfg, "://web-") {
+		t.Errorf("deployment backends still present after delete:\n%s", cfg)
 	}
 	if !strings.Contains(cfg, "localhost:80") {
 		t.Errorf("expected fallback after deployment delete:\n%s", cfg)
@@ -3473,6 +3483,257 @@ func TestPodWithInitContainerRejected(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("rejected pod wrote %d quadlet file(s)", len(entries))
+	}
+}
+
+// annotate adds an annotation to a top-level object body.
+func annotate(body map[string]interface{}, key, value string) {
+	meta := body["metadata"].(map[string]interface{})
+	ann, ok := meta["annotations"].(map[string]interface{})
+	if !ok {
+		ann = map[string]interface{}{}
+		meta["annotations"] = ann
+	}
+	ann[key] = value
+}
+
+// annotateDeploymentTemplate adds an annotation to a Deployment pod template.
+func annotateDeploymentTemplate(body map[string]interface{}, key, value string) {
+	tmpl := body["spec"].(map[string]interface{})["template"].(map[string]interface{})
+	meta := tmpl["metadata"].(map[string]interface{})
+	ann, ok := meta["annotations"].(map[string]interface{})
+	if !ok {
+		ann = map[string]interface{}{}
+		meta["annotations"] = ann
+	}
+	ann[key] = value
+}
+
+// TestAnnotationValidation422 covers the section 4 rules: socket activation
+// must parse and fit the shape, attach-all-networks must be a boolean and
+// single-container only.
+func TestAnnotationValidation422(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		body func() map[string]interface{}
+		list func(*store.Store) int
+	}{
+		{
+			name: "pod invalid socket activation",
+			path: "/api/v1/namespaces/default/pods",
+			body: func() map[string]interface{} {
+				b := podBody("default", "bad-socket", "traefik:v3")
+				annotate(b, quadlet.AnnotationSocketActivation, "web")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Pods("default")) },
+		},
+		{
+			name: "pod socket port collides with hostPort",
+			path: "/api/v1/namespaces/default/pods",
+			body: func() map[string]interface{} {
+				b := podBody("default", "collide", "traefik:v3")
+				annotate(b, quadlet.AnnotationSocketActivation, "web=80")
+				spec := b["spec"].(map[string]interface{})
+				spec["containers"] = []interface{}{map[string]interface{}{
+					"name": "traefik", "image": "traefik:v3",
+					"ports": []interface{}{map[string]interface{}{"containerPort": 80, "hostPort": 80}},
+				}}
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Pods("default")) },
+		},
+		{
+			name: "pod socket activation with sidecar",
+			path: "/api/v1/namespaces/default/pods",
+			body: func() map[string]interface{} {
+				b := podBody("default", "socket-sidecar", "traefik:v3")
+				annotate(b, quadlet.AnnotationSocketActivation, "web=80")
+				appendContainer(b["spec"].(map[string]interface{}), "sidecar")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Pods("default")) },
+		},
+		{
+			name: "pod attach-all-networks not a bool",
+			path: "/api/v1/namespaces/default/pods",
+			body: func() map[string]interface{} {
+				b := podBody("default", "bad-attach", "nginx")
+				annotate(b, "q8s.io/attach-all-networks", "sometimes")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Pods("default")) },
+		},
+		{
+			name: "pod attach-all-networks true with sidecar",
+			path: "/api/v1/namespaces/default/pods",
+			body: func() map[string]interface{} {
+				b := podBody("default", "attach-sidecar", "nginx")
+				annotate(b, "q8s.io/attach-all-networks", "true")
+				appendContainer(b["spec"].(map[string]interface{}), "sidecar")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Pods("default")) },
+		},
+		{
+			name: "deployment invalid socket activation",
+			path: "/apis/apps/v1/namespaces/default/deployments",
+			body: func() map[string]interface{} {
+				b := deployBody("default", "bad-socket", "traefik:v3")
+				annotateDeploymentTemplate(b, quadlet.AnnotationSocketActivation, "web=example.com:80")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Deployments("default")) },
+		},
+		{
+			name: "deployment socket activation with replicas 2",
+			path: "/apis/apps/v1/namespaces/default/deployments",
+			body: func() map[string]interface{} {
+				b := deployBody("default", "two-replicas", "traefik:v3")
+				b["spec"].(map[string]interface{})["replicas"] = 2
+				annotateDeploymentTemplate(b, quadlet.AnnotationSocketActivation, "web=80")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Deployments("default")) },
+		},
+		{
+			name: "deployment socket activation with sidecar",
+			path: "/apis/apps/v1/namespaces/default/deployments",
+			body: func() map[string]interface{} {
+				b := deployBodyWithContainers("default", "socket-duo", "traefik", "sidecar")
+				annotateDeploymentTemplate(b, quadlet.AnnotationSocketActivation, "web=80")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Deployments("default")) },
+		},
+		{
+			name: "deployment attach-all-networks true with sidecar",
+			path: "/apis/apps/v1/namespaces/default/deployments",
+			body: func() map[string]interface{} {
+				b := deployBodyWithContainers("default", "attach-duo", "web", "sidecar")
+				annotateDeploymentTemplate(b, "q8s.io/attach-all-networks", "1")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Deployments("default")) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := store.New()
+			srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+			ts := httptest.NewServer(srv)
+			t.Cleanup(ts.Close)
+
+			resp := post(t, ts.URL+tt.path, tt.body())
+			assertStatus(t, resp, http.StatusUnprocessableEntity)
+			resp.Body.Close()
+			if n := tt.list(st); n != 0 {
+				t.Fatalf("rejected object was stored: %d entries", n)
+			}
+		})
+	}
+}
+
+func TestPodPatchRejectsInvalidSocketActivation(t *testing.T) {
+	st := store.New()
+	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", podBody("default", "traefik", "traefik:v3"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	patch := []byte(`{"metadata":{"annotations":{"` + quadlet.AnnotationSocketActivation + `":"web=0"}}}`)
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/namespaces/default/pods/traefik", bytes.NewReader(patch))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	pod, err := st.GetPod("default", "traefik")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pod.Annotations[quadlet.AnnotationSocketActivation]; ok {
+		t.Error("invalid annotation was persisted by the patch")
+	}
+}
+
+func TestDeploymentUpdateRejectsInvalidAnnotations(t *testing.T) {
+	st := store.New()
+	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBody("default", "edge", "traefik:v3"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	// PUT with an unparseable attach-all-networks value.
+	putBody := deployBody("default", "edge", "traefik:v3")
+	annotateDeploymentTemplate(putBody, "q8s.io/attach-all-networks", "maybe")
+	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/edge", putBody)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	// PATCH with an invalid socket activation entry.
+	patch := []byte(`{"spec":{"template":{"metadata":{"annotations":{"` + quadlet.AnnotationSocketActivation + `":"web=80,web=81"}}}}}`)
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/apis/apps/v1/namespaces/default/deployments/edge", bytes.NewReader(patch))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	dep, err := st.GetDeployment("default", "edge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := dep.Spec.Template.Annotations[quadlet.AnnotationSocketActivation]; ok {
+		t.Error("invalid annotation was persisted by the patch")
+	}
+}
+
+// TestDeploymentScaleRejectsSocketActivationReplicas: two instances cannot
+// own the same listen socket, so scaling a socket-activated Deployment above
+// one replica must fail and leave the stored replica count alone.
+func TestDeploymentScaleRejectsSocketActivationReplicas(t *testing.T) {
+	st := store.New()
+	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := deployBody("default", "traefik", "traefik:v3")
+	body["spec"].(map[string]interface{})["replicas"] = 1
+	annotateDeploymentTemplate(body, quadlet.AnnotationSocketActivation, "web=80")
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	scale := []byte(`{"spec":{"replicas":2}}`)
+	req, _ := http.NewRequest(http.MethodPatch,
+		ts.URL+"/apis/apps/v1/namespaces/default/deployments/traefik/scale", bytes.NewReader(scale))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	dep, err := st.GetDeployment("default", "traefik")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := *dep.Spec.Replicas; got != 1 {
+		t.Fatalf("replica count changed to %d after a rejected scale", got)
 	}
 }
 

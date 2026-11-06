@@ -4,8 +4,8 @@ q8s generates [Traefik file-provider](https://doc.traefik.io/traefik/providers/f
 
 ## Requirements
 
-1. **Traefik** running on the host (system service, container with `--network host`, or any setup that can reach `localhost`)
-2. **Published ports** on your deployments — containers must publish their port to the host (`--port` flag on `kubectl create deployment`), otherwise traefik can't reach them via localhost
+1. **Traefik** attached to every namespace podman network (`q8s-{ns}`), so it can resolve and dial pods by their cluster DNS name
+2. Nothing published on the host for the common case: Traefik dials `<pod>.<ns>:<containerPort>` directly inside the namespace network. An explicit `hostPort` is still honored as a host-level publish and dialed on its host address.
 
 ## Traefik static config
 
@@ -31,7 +31,7 @@ For rootful q8s the directory is `/etc/q8s/traefik/`.
 ## Usage
 
 ```sh
-# Create a deployment with a published port
+# Create a deployment with a container port (no host publish needed)
 kubectl create deployment myapp --image=myimage --port=8080
 
 # Create an ingress routing to it
@@ -69,22 +69,17 @@ File location: `~/.local/share/q8s/traefik/{namespace}-{name}.yaml`
 ## How it works
 
 ```
-internet → traefik (host, :80/:443) → localhost:{published_port} → podman container
+internet → traefik (in each q8s namespace network, :80/:443) → <pod>.<ns>:<containerPort>
 ```
 
-1. Deployment replicas publish per-instance loopback ports (auto-allocated, → `PublishPort=127.0.0.1:...` in quadlets); standalone pods publish their own `hostPort`
+1. q8s renders every pod with DNS aliases on its namespace network: `<svc>`, `<svc>.<ns>`, `<svc>.<ns>.svc.cluster.local` and (always) `<pod>.<ns>`. Deployment replicas are ordinary pods (`web-0`, `web-1`, ...), so each one is individually addressable with no host publish and no port allocation.
 2. `kubectl create ingress` → q8s writes `{dataDir}/traefik/{ns}-{name}.yaml`
 3. Traefik's file provider detects the new file, applies the routing
 4. `kubectl delete ingress` → q8s removes the file, traefik drops the route
 
 ## Networking
 
-Traefik must be able to reach `localhost:{port}` where the container publishes. This works when traefik runs:
-- As a system service directly on the host
-- In a container with `--network host`
-- In any setup where `localhost` resolves to the same network namespace as the published ports
-
-Containers that **don't** publish ports (internal-only on the `q8s-{ns}` podman network) are not reachable from traefik via localhost.
+Traefik sits IN each namespace's podman network and dials backends by DNS name on the kernel path (no pasta, no host publish). An explicit `hostPort` (optionally with `hostIP`) is still a host-level publish and is dialed on that host address, so hand-published backends keep working. A `hostNetwork` pod without a `hostPort` publishes nothing addressable and is skipped.
 
 ## TLS termination
 
@@ -200,36 +195,34 @@ with HTTP 400 rather than written into the config file Traefik loads.
 
 When the referenced Service exists, q8s resolves backends the way real k8s
 builds Endpoints: the Service's **selector** picks the pods, and every
-matching pod contributes **one Traefik server** built from its own published
-`hostPort` for the Service's `targetPort` (numeric or a container-port
-name). Traefik load-balances (round-robin) across them.
+matching pod contributes **one Traefik server** for the Service's
+`targetPort` (numeric or a container-port name). A pod with an explicit
+`hostPort` is dialed on its host address; every other non-hostNetwork pod is
+dialed at `http://<pod>.<ns>:<containerPort>`. Traefik load-balances
+(round-robin) across them.
 
 ```yaml
 services:
   default-web-0:
     loadBalancer:
       servers:
-        - url: "http://127.0.0.1:20001"   # pod web-a (hostPort 20001)
-        - url: "http://127.0.0.1:20002"   # pod web-b (hostPort 20002)
-        - url: "http://127.0.0.1:20003"   # pod web-c (hostPort 20003)
+        - url: "http://web-0.default:8080"   # Deployment replica, no hostPort
+        - url: "http://web-1.default:8080"
+        - url: "http://127.0.0.1:20001"      # standalone pod with hostPort 20001
 ```
 
 Key points:
 
 - Pods behind one Service **do not need the same port** — only matching
   labels and a container port matching `targetPort`.
-- Pods without a `hostPort` are skipped: with rootless podman, containers
-  are only reachable from the host through published ports.
+- A `hostNetwork` pod with no `hostPort` is skipped: it publishes nothing
+  addressable. Every other pod resolves by DNS.
 - The config is regenerated whenever matching pods are created or deleted
   (including via Deployment scale), so the server list tracks reality the
   way Endpoints do.
-- **Deployments scale out of the box**: q8s allocates each replica its own
-  loopback host port (range 20000–32767, bound to 127.0.0.1 only, stable
-  across restarts, freed on scale-down) and publishes it automatically —
-  replicas need no `hostPort` in the template. Scale up/down and the Traefik
-  server list follows, one URL per replica. This is q8s's kube-proxy:
-  Traefik fans requests out to the replicas.
-- Keep manually-chosen `hostPorts` outside 20000–32767 to avoid colliding
-  with the allocation range.
-- If the Service doesn't exist (or no matching pod publishes a port), q8s
+- **Deployments scale out of the box**: each replica is an ordinary pod with
+  its own `<pod>.<ns>` DNS name, so scale up/down just extends or shrinks the
+  server list. Nothing is published on the host and no replica ports are
+  allocated.
+- If the Service doesn't exist (or no matching pod yields an address), q8s
   falls back to a single `localhost:{ingress port}` backend.

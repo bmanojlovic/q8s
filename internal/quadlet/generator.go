@@ -339,7 +339,7 @@ func detectCgroupControllers() {
 // This is the single-container shape q8s has always produced. A pod with
 // more than one container is rendered by PodUnits instead, which keeps the
 // same per-container rendering but moves the pod-level settings into a .pod.
-func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
+func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []NetworkAttachment) ([]byte, error) {
 	// Name/namespace are validated here even though the API boundary
 	// already checks them: the Podman-label import path (reconcilePodmanPods)
 	// constructs pods from container labels, which nothing else vets, and a
@@ -359,8 +359,10 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 		pod:            pod,
 		container:      pod.Spec.Containers[0],
 		containerName:  fmt.Sprintf("%s-%s", pod.Namespace, name),
+		podName:        name,
 		configDir:      configDir,
 		serviceAliases: serviceAliases,
+		networks:       networks,
 		pvcMap:         pvcMap,
 		envFile:        envFile,
 		standalone:     true,

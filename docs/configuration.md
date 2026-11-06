@@ -137,12 +137,12 @@ The `hostpath` class reads the host directory from the `q8s.io/host-path` annota
 | `containerPort` | Internal only — reachable within the `q8s-{ns}` podman network via NetworkAlias | None |
 | `hostPort` | Binds to the host | `PublishPort=hostPort:containerPort/proto` |
 | `hostPort` + `hostIP` | Binds one interface (e.g. loopback only) | `PublishPort=hostIP:hostPort:containerPort/proto` |
-| Deployment replicas | Auto-allocated loopback port per replica | `PublishPort=127.0.0.1:20000-32767:containerPort` |
+| Deployment replicas | Addressed by cluster DNS name on the namespace network | None (no host publish) |
 | Service `type: NodePort` | Binds `0.0.0.0:nodePort` on the single backing pod | `PublishPort=nodePort:targetPort/proto` |
 
-A **ClusterIP** Service (the default) never binds a host port. It is a **selector + port map**: its name becomes a DNS alias on the namespace network (aardvark), and its selector + `targetPort` drive ingress backend resolution (one Traefik server per matching pod). For host reachability use `hostPort`, a Deployment (auto-allocated, via Ingress), or a `type: NodePort` Service.
+A **ClusterIP** Service (the default) never binds a host port. It is a **selector + port map**: its name becomes a DNS alias on the namespace network (aardvark), and its selector + `targetPort` drive ingress backend resolution (one Traefik server per matching pod, by `<pod>.<ns>` DNS unless the pod declares a `hostPort`). For host reachability use `hostPort` or a `type: NodePort` Service.
 
-A **NodePort** Service is a real host-level listener: q8s allocates a port in **30000–32767** (or honors an explicit in-range `spec.ports[].nodePort`) and publishes it on `0.0.0.0:nodePort → targetPort` on the Service's single backing pod. It is dumb L4 (protocol-blind, the same `podman -p` mechanism as `hostPort`) — **not** load-balanced. Because one host socket can be bound by only one process, a NodePort has exactly one backing listener: for a Deployment only instance-0 carries it (extra replicas keep their loopback port and stay Ingress-reachable). For load-balanced multi-replica exposure use an Ingress. q8s rejects a NodePort whose number is out of range or already claimed, and rejects any Service whose port collides with a matching pod's `hostPort` — those double-bind and can't work.
+A **NodePort** Service is a real host-level listener: q8s allocates a port in **30000–32767** (or honors an explicit in-range `spec.ports[].nodePort`) and publishes it on `0.0.0.0:nodePort → targetPort` on the Service's single backing pod. It is dumb L4 (protocol-blind, the same `podman -p` mechanism as `hostPort`), **not** load-balanced. Because one host socket can be bound by only one process, a NodePort has exactly one backing listener: for a Deployment only instance-0 carries it (extra replicas stay Ingress-reachable by DNS). For load-balanced multi-replica exposure use an Ingress. q8s rejects a NodePort whose number is out of range or already claimed, and rejects any Service whose port collides with a matching pod's `hostPort`, because those double-bind and can't work.
 
 ## Resource limits and cgroup delegation
 

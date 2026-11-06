@@ -114,7 +114,7 @@ spec:
 - **Shared memory**: an `emptyDir` with `medium: Memory` mounted at `/dev/shm` → `ShmSize=<bytes>` from `sizeLimit`; no `Volume=` line is generated for it. Without a `sizeLimit`, nothing is emitted.
 - **Ulimits**: pod annotation `q8s.io/ulimits` (for example `memlock=-1:-1,nofile=65536`) → one `Ulimit=<item>` line per comma separated item. Items must match `name=soft[:hard]` and are rejected otherwise.
 - **Readiness**: `readinessProbe.exec` or `readinessProbe.httpGet` on the first container, when there is no `livenessProbe`, → `HealthCmd=`, `HealthInterval=` (httpGet only, from `periodSeconds`) and `HealthStartPeriod=` (from `initialDelaySeconds`). An httpGet probe becomes `HealthCmd=curl -fsS http://127.0.0.1:<port><path>`; a named port is resolved against the container's ports and an unknown name emits no health check.
-- **Port semantics**: `containerPort` is internal-only (namespace network); `hostPort` publishes to host via `PublishPort=`; Service never binds a port — it maps selector + `targetPort` to DNS aliases and ingress backends. Deployment replicas get auto-allocated loopback ports (20000-32767).
+- **Port semantics**: `containerPort` is internal-only (namespace network); `hostPort` publishes to host via `PublishPort=`; a Service never binds a port, it maps selector + `targetPort` to DNS aliases and ingress backends. Ingress backends reach non-hostNetwork pods by their `<pod>.<ns>` DNS name on the namespace network; an explicit `hostPort` keeps its host publish.
 - **CrashLoopBackOff**: detected from restart count + non-zero exit, shown in pod status
 - **StartLimitBurst=5**: systemd gives up after 5 failures within 60s
 - **Delete cascade**: deployment delete removes owned pods, stops units, removes quadlets

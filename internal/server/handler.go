@@ -487,10 +487,12 @@ func hasExactLine(content []byte, want string) bool {
 // single-container pod keeps today's single .container; a multi-container
 // pod becomes a Podman pod (.pod plus one .container per container).
 func podQuadletFiles(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) (map[string][]byte, error) {
+	// Extra network attachments are wired up in part B; the rendering layer
+	// already supports them (an empty list is today's single namespace net).
 	if len(pod.Spec.Containers) > 1 {
-		return quadlet.PodUnits(name, pod, configDir, serviceAliases, pvcMap, envFile)
+		return quadlet.PodUnits(name, pod, configDir, serviceAliases, pvcMap, envFile, nil)
 	}
-	content, err := quadlet.Container(name, pod, configDir, serviceAliases, pvcMap, envFile)
+	content, err := quadlet.Container(name, pod, configDir, serviceAliases, pvcMap, envFile, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -637,6 +639,10 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validatePodAnnotations("pod", &pod.Spec, pod.Annotations, 0); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		// Fail fast with a proper 400 instead of storing the pod and only
 		// discovering at quadlet-generation time (after the fact, logged
 		// server-side only) that its spec can't be safely turned into a
@@ -715,6 +721,10 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateSingleContainer("pod spec", &patched.Spec, true); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodAnnotations("pod", &patched.Spec, patched.Annotations, 0); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		// Same fail-fast dry-run as create: a patch whose merged spec can't
@@ -1594,6 +1604,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateDeployment(&dep)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -1630,6 +1644,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		if err := validateSingleContainer("deployment spec.template.spec", &dep.Spec.Template.Spec, true); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if err := validatePatchedIdentity("deployment", dep.Namespace, dep.Name, ns, name); err != nil {
@@ -1708,6 +1726,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validatePodAnnotations("deployment spec.template", &patched.Spec.Template.Spec, patched.Spec.Template.Annotations, deploymentReplicas(&patched)); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		updated, err := s.config.Store.UpdateDeployment(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -1778,6 +1800,10 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 		}
 		if err := json.Unmarshal(body, &patch); err == nil && patch.Spec.Replicas != nil {
 			dep.Spec.Replicas = patch.Spec.Replicas
+		}
+		if err := validatePodAnnotations("deployment", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(dep)); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
 		}
 		updated, err := s.config.Store.UpdateDeployment(dep)
 		if err != nil {
@@ -2739,17 +2765,6 @@ func (s *Server) ReconcileQuadlets() {
 				continue
 			}
 			pod := s.materializeDeploymentInstance(dep, i)
-			// Keep the store pod's ports in sync with the (idempotent)
-			// allocation, so ingresses resolve backends for instances whose
-			// store objects predate the allocator (or lost their ports).
-			if existing, err := s.config.Store.GetPod(dep.Namespace, instanceName); err == nil {
-				if len(existing.Spec.Containers) > 0 && len(existing.Spec.Containers[0].Ports) > 0 &&
-					existing.Spec.Containers[0].Ports[0].HostPort == 0 &&
-					len(pod.Spec.Containers) > 0 && len(pod.Spec.Containers[0].Ports) > 0 {
-					existing.Spec.Containers[0].Ports = pod.Spec.Containers[0].Ports
-					s.config.Store.UpdatePod(existing)
-				}
-			}
 			resolved, envFile, err := s.resolveEnvFrom(pod)
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
@@ -3514,12 +3529,10 @@ func isDeploymentOwned(pod *corev1.Pod) bool {
 }
 
 // materializeDeploymentInstance builds the Pod object for deployment
-// instance i from the template and injects the allocated per-replica
-// hostPorts (loopback-bound) onto the container ports. Deployment replicas
-// share one template, so they cannot declare distinct hostPorts themselves —
-// the allocator provides them, which is what lets Traefik address each
-// replica individually (kube-proxy/Endpoints role) on rootless podman where
-// container IPs are unreachable from the host.
+// instance i from the template. Template container ports are copied as
+// declared: an explicit hostPort/hostIP is kept, but nothing is invented.
+// Ingress backends address replicas by their cluster DNS name instead, so
+// replicas no longer need distinct host publishes.
 func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) *corev1.Pod {
 	instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
 	pod := &corev1.Pod{
@@ -3539,31 +3552,16 @@ func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) 
 				Controller: boolPtr(true),
 			}},
 		},
-		// DeepCopy: a plain struct copy would share the Containers/Ports
-		// slices with the template — writing a per-instance hostPort would
-		// then mutate the deployment template itself (and every sibling
-		// instance would end up with the last-written port).
+		// DeepCopy keeps per-instance port additions (the NodePort publish
+		// below) from mutating the shared deployment template.
 		Spec: *dep.Spec.Template.Spec.DeepCopy(),
 	}
 	pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
-	if !pod.Spec.HostNetwork {
-		for ci := range pod.Spec.Containers {
-			for j := range pod.Spec.Containers[ci].Ports {
-				cp := &pod.Spec.Containers[ci].Ports[j]
-				if cp.ContainerPort == 0 {
-					continue
-				}
-				cp.HostPort = s.config.Store.AllocateReplicaPort(dep.Namespace, dep.Name, i, cp.ContainerPort)
-				cp.HostIP = "127.0.0.1"
-			}
-		}
-	}
-	// A NodePort Service targeting this pod publishes its port on 0.0.0.0 as
-	// well — the loopback replica port stays (Ingress/Traefik backend), the
-	// nodePort adds the real LAN listener. A host port can only be bound by
-	// one process, so only instance 0 carries the nodePort publish; higher
-	// replicas keep just their loopback port (still Ingress-reachable). This
-	// is the single-node NodePort reality — one backing listener per port.
+	// A NodePort Service targeting this pod publishes its port on 0.0.0.0.
+	// A host port can only be bound by one process, so only instance 0
+	// carries the nodePort publish; higher replicas stay reachable as
+	// Ingress backends by DNS. This is the single-node NodePort reality:
+	// one backing listener per port.
 	if i == 0 {
 		pod = s.withNodePortPublish(pod)
 	}
@@ -3572,10 +3570,9 @@ func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) 
 
 // withNodePortPublish appends, for each NodePort Service targeting pod, an
 // extra container port entry that publishes containerPort on 0.0.0.0:nodePort
-// (empty HostIP = all interfaces). The loopback replica-port entry for the
-// same containerPort is left intact, so a pod can be both an Ingress backend
-// (loopback) and a NodePort listener (LAN) at once. Returns pod unchanged
-// when no NodePort targets it.
+// (empty HostIP = all interfaces). The template's own port entries are left
+// intact, so a pod can be both a DNS-addressed Ingress backend and a NodePort
+// listener (LAN) at once. Returns pod unchanged when no NodePort targets it.
 func (s *Server) withNodePortPublish(pod *corev1.Pod) *corev1.Pod {
 	bindings := s.nodePortHostPorts(pod)
 	if len(bindings) == 0 || len(pod.Spec.Containers) == 0 {
@@ -3674,12 +3671,6 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 		// ingress backends (selector-driven) would keep routing to a
 		// scaled-down replica that no longer exists.
 		s.config.Store.DeletePod(dep.Namespace, instanceName)
-	}
-	// Allocations for removed instances re-enter the pool. Done after the
-	// containers are gone so a fresh allocation of the same port (e.g. a
-	// quick scale-up) can't race a dying container's publish.
-	if oldR > newR {
-		s.config.Store.FreeReplicaPorts(dep.Namespace, dep.Name, newR)
 	}
 }
 
@@ -4177,16 +4168,13 @@ func (s *Server) writeEnvFile(ns, name string, containers []corev1.Container, se
 
 // ingressBackendServers resolves the backend URLs for one ingress path: the
 // Service's selector -> matching pods -> one URL per pod, in the spirit of
-// k8s Endpoints. Each pod contributes its own published hostPort, so pods
-// behind one Service do not need identical ports — only matching labels and
-// a container port equal to the Service's targetPort.
+// k8s Endpoints. A pod with an explicit hostPort is dialed on the host (that
+// is an intentional publish); all other non-hostNetwork pods are dialed by
+// their cluster DNS name, <pod>.<ns>:<containerPort>, which resolves on every
+// namespace network Traefik is attached to (no host publish involved).
 //
-// Pods without a hostPort are skipped: on rootless podman, container
-// addresses are only reachable from the host through published ports, so a
-// pod that publishes nothing is not addressable by an on-host Traefik. (An
-// allocated-port scheme for deployment replicas — where the shared template
-// can't declare distinct hostPorts — is a follow-up; today this serves
-// standalone pods and single-replica deployments.)
+// hostNetwork without a hostPort yields no server: the pod is on the host
+// netns but publishes nothing addressable.
 //
 // Returns nil when there is no such Service or no pod yields an address;
 // callers fall back to the ingress-declared port.
@@ -4227,8 +4215,11 @@ func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portNa
 				if cp.ContainerPort != targetNum && cp.Name != targetName {
 					continue
 				}
-				if cp.HostPort != 0 {
+				switch {
+				case cp.HostPort != 0:
 					servers = append(servers, "http://"+backendHostPort(cp.HostIP, cp.HostPort))
+				case !pod.Spec.HostNetwork:
+					servers = append(servers, fmt.Sprintf("http://%s.%s:%d", pod.Name, ns, cp.ContainerPort))
 				}
 				// A pod lists each container port once; stop at the first
 				// matching entry for this container.
@@ -4360,7 +4351,6 @@ func (s *Server) deleteDeploymentByName(ns, name string) error {
 	if err := s.config.Store.DeleteDeployment(ns, name); err != nil {
 		return err
 	}
-	s.config.Store.FreeReplicaPorts(dep.Namespace, dep.Name, 0)
 	s.regenerateIngressConfigs(dep.Namespace)
 	return nil
 }

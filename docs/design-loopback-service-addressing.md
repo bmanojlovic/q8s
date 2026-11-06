@@ -4,13 +4,19 @@ Status: **proposal / not implemented.** Captures the design discussed for
 tic-3124 (Traefik ingress being inert + Service `clusterIP` absent). Written
 to record the idea and its boundaries before committing to code.
 
+Update (tic-3124 part A): the shared-loopback allocated-port scheme described
+below as the starting point has been retired. Ingress backends now use the
+`<pod>.<namespace>` DNS name on the namespace podman network (explicit
+`hostPort` publishes still win). This proposal remains unimplemented.
+
 ## The problem this replaces
 
-Today q8s addresses Deployment-replica backends with a **shared-loopback,
-allocated-port** scheme (`internal/store/store.go`, `AllocateReplicaPort`):
+The former scheme addressed Deployment-replica backends with a
+**shared-loopback, allocated-port** mechanism (removed from
+`internal/store/store.go`):
 
 - Every replica publishes on `127.0.0.1:<allocated-port>`, where the port is
-  drawn from a finite pool (`ReplicaPortMin..ReplicaPortMax` = 20000–32767).
+  drawn from a finite 20000–32767 pool.
 - Traefik reaches each backend at `http://127.0.0.1:<allocated-port>`.
 - `spec.clusterIP` is not allocated at all — after tic-e014 it is reported as
   `None` (a DNS-alias service, no virtual IP).
@@ -19,7 +25,7 @@ Consequences of sharing one loopback IP (`127.0.0.1`) across everything:
 
 - The **port** is the only thing distinguishing backends, so it is scarce
   (~12k), must be allocated, persisted across restarts, and freed on
-  scale-down. That is real bookkeeping (`ReplicaPorts` map in the store).
+  scale-down. That was real persistence bookkeeping in the store.
 - The Traefik backend URL is a meaningless `127.0.0.1:20077` — it does not
   match the service's real port and is not self-documenting.
 - A Service has no address of its own; it is only a DNS alias + port map.
@@ -66,8 +72,10 @@ as `spec.clusterIP` and what it translates from.)
 
 ## What this wins
 
-- **Retire `AllocateReplicaPort` and the 20000–32767 pool.** No port
-  allocation, no `ReplicaPorts` persistence, no free-on-scale-down bookkeeping.
+- **Retire the replica-port pool.** No port allocation, no persisted
+  allocations, no free-on-scale-down bookkeeping. (Done in tic-3124 part A via
+  in-network Traefik and `<pod>.<ns>` backends, not via per-service loopback
+  IPs.)
   The IP is the unique key; the port is just the container's real port.
 - **Readable, self-documenting backends.** Traefik server URLs become
   `http://127.11.1.1:5432` — the service's real port, per-service IP.
@@ -271,8 +279,8 @@ Edges to nail down before this is fully baked (not objections — real work):
 
 ## Relationship to existing behavior / migration notes
 
-- Supersedes the `AllocateReplicaPort` mechanism (`internal/store/store.go`)
-  and the `ReplicaPorts` persisted map for scope 1.
+- Supersedes the former replica-port allocator and its persisted map for
+  scope 1 (both already removed).
 - Supersedes tic-e014's `clusterIP: None` default for non-headless services
   (headless `None` stays a legal explicit choice).
 - NodePort is unaffected — it stays a real `0.0.0.0:nodePort` LAN listener

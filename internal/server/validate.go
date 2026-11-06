@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"q8s/internal/quadlet"
 )
 
 // nameRE matches RFC 1123 DNS label format, the same rule real k8s enforces
@@ -300,6 +301,45 @@ func validateSingleContainer(kind string, spec *corev1.PodSpec, allowMultipleCon
 	}
 	if len(spec.EphemeralContainers) > 0 {
 		return fmt.Errorf("%s has %d ephemeralContainers: ephemeralContainers are not supported", kind, len(spec.EphemeralContainers))
+	}
+	return nil
+}
+
+// annAttachAllNetworks asks q8s to attach the pod to every namespace
+// network. Part B consumes it; until then it is only validated.
+const annAttachAllNetworks = "q8s.io/attach-all-networks"
+
+// validatePodAnnotations rejects q8s pod annotations that cannot be honored
+// by the requested shape. replicas is 0 for a bare Pod.
+func validatePodAnnotations(kind string, spec *corev1.PodSpec, annotations map[string]string, replicas int32) error {
+	containers := 0
+	if spec != nil {
+		containers = len(spec.Containers)
+	}
+	if _, ok := annotations[quadlet.AnnotationSocketActivation]; ok {
+		pod := &corev1.Pod{}
+		pod.Annotations = annotations
+		if spec != nil {
+			pod.Spec = *spec
+		}
+		if err := quadlet.ValidateSocketActivation(pod); err != nil {
+			return fmt.Errorf("%s: %w", kind, err)
+		}
+		if containers > 1 {
+			return fmt.Errorf("%s: annotation %s is not supported on multi-container pods", kind, quadlet.AnnotationSocketActivation)
+		}
+		if replicas > 1 {
+			return fmt.Errorf("%s: annotation %s requires replicas <= 1, got %d (two instances cannot own the same listen socket)", kind, quadlet.AnnotationSocketActivation, replicas)
+		}
+	}
+	if v, ok := annotations[annAttachAllNetworks]; ok {
+		attachAll, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("%s: annotation %s: value %q is invalid: must be a boolean", kind, annAttachAllNetworks, v)
+		}
+		if attachAll && containers > 1 {
+			return fmt.Errorf("%s: annotation %s is not supported on multi-container pods", kind, annAttachAllNetworks)
+		}
 	}
 	return nil
 }
