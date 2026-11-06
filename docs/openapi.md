@@ -31,8 +31,9 @@ The Traefik CRD file is published with each Traefik release as `crds.yaml`.
 
 ## What is kept
 
-`hack/gen-openapi/main.go` has one list, `servedGVKs`, naming every resource
-kind q8s serves. The generator keeps:
+`hack/gen-openapi/main.go` has one list, `servedGVKs`, naming every Kubernetes
+resource kind q8s serves; the two `traefik.io/v1alpha1` kinds come from the
+CRD file instead. The generator keeps:
 
 - the definition for each served kind and its `...List` kind
 - `meta.v1.Status`, `meta.v1.DeleteOptions` and `meta.v1.Patch`
@@ -42,13 +43,21 @@ Everything else from the upstream swagger is dropped. The output is compact
 and deterministic (JSON map keys are sorted), so regenerating without input
 changes produces no diff. The generator fails on a dangling `$ref`.
 
-When adding or removing a served resource, update both the discovery
-handlers in `internal/server/discovery.go` and `servedGVKs` in the
-generator, then regenerate.
+When adding or removing a served Kubernetes resource, update both the
+discovery handlers in `internal/server/discovery.go` and `servedGVKs` in the
+generator, then regenerate. A Traefik CRD added to `wantedCRDs` gets its
+OpenAPI definitions from the CRD file automatically.
 
 The CRD list keeps only `middlewares.traefik.io` and
 `ingressroutetcps.traefik.io` from the Traefik file. Update `wantedCRDs` in
 the generator when the served CRD names change.
+
+The same two CRDs also contribute Swagger definitions for the served
+`traefik.io/v1alpha1` kinds (`Middleware`, `MiddlewareList`,
+`IngressRouteTCP`, `IngressRouteTCPList`), so `/openapi/v2` covers every kind
+advertised by discovery. Their schema comes from the CRD
+`openAPIV3Schema`; OpenAPI v3 composition keywords that Swagger 2.0 rejects
+(`anyOf`, `oneOf`, `allOf`, `not`, `nullable`) are removed from the copy.
 
 ## Bumping versions
 

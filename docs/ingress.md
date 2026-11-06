@@ -7,6 +7,9 @@ q8s generates [Traefik file-provider](https://doc.traefik.io/traefik/providers/f
 1. **Traefik** attached to every namespace podman network (`q8s-{ns}`), so it can resolve and dial pods by their cluster DNS name
 2. Nothing published on the host for the common case: Traefik dials `<pod>.<ns>:<containerPort>` directly inside the namespace network. An explicit `hostPort` is still honored as a host-level publish and dialed on its host address.
 
+For `Middleware` and `IngressRouteTCP` objects, see
+[Traefik Middleware and IngressRouteTCP](traefik.md).
+
 ## Traefik static config
 
 Add the file provider to your Traefik static configuration (`/etc/traefik/traefik.yaml` or equivalent):
@@ -113,7 +116,7 @@ Ingress (one per rule/path) gets the same settings.
 | annotation | value | router output |
 |---|---|---|
 | `traefik.ingress.kubernetes.io/router.entrypoints` | comma-separated names | `entryPoints:` list |
-| `traefik.ingress.kubernetes.io/router.middlewares` | comma-separated refs | `middlewares:` list, in the given order |
+| `traefik.ingress.kubernetes.io/router.middlewares` | comma-separated refs | `middlewares:` list, in the given order; a `@kubernetescrd` suffix becomes `@file` |
 | `traefik.ingress.kubernetes.io/router.tls` | `"true"` / `"false"` | `"true"` adds a `tls` block even without `spec.tls` |
 | `traefik.ingress.kubernetes.io/router.tls.certresolver` | resolver name | `tls:` block with `certResolver:` (implies tls) |
 | `traefik.ingress.kubernetes.io/router.priority` | integer | `priority:` |
@@ -164,25 +167,55 @@ http:
         certResolver: "le"
 ```
 
-q8s only **references** middlewares, it never defines them. A `@file`
-middleware must exist in Traefik's dynamic configuration directory - the same
-directory q8s writes its Ingress files into (`~/.local/share/q8s/traefik/`,
-or `/etc/q8s/traefik/` for rootful q8s), for example:
+q8s can define the referenced middleware itself when it is a `Middleware`
+object, or reference any middleware that already exists in Traefik's dynamic
+configuration directory (the same directory q8s writes its Ingress files into:
+`~/.local/share/q8s/traefik/`, or `/etc/q8s/traefik/` for rootful q8s).
+
+Traefik's Kubernetes provider names a Middleware reference
+`<namespace>-<name>@kubernetescrd`. Because q8s serves `Middleware` objects
+through Traefik's file provider, q8s rewrites that provider suffix to `@file`:
 
 ```yaml
-# ~/.local/share/q8s/traefik/middlewares.yaml
-http:
-  middlewares:
-    www-redirect:
-      redirectRegex:
-        regex: "^https://example\\.com/(.*)"
-        replacement: "https://www.example.com/${1}"
-        permanent: true
-    hsts:
-      headers:
-        stsSeconds: 31536000
-        stsIncludeSubdomains: true
+metadata:
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: default-www-redirect@kubernetescrd,default-hsts@kubernetescrd
 ```
+
+renders as:
+
+```yaml
+      middlewares: ["default-www-redirect@file", "default-hsts@file"]
+```
+
+The referenced objects can then be ordinary `Middleware` resources in the
+same manifest set (see [Traefik Middleware and IngressRouteTCP](traefik.md)):
+
+```yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: www-redirect
+  namespace: default
+spec:
+  redirectRegex:
+    regex: "^https://example\\.com/(.*)"
+    replacement: "https://www.example.com/${1}"
+    permanent: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: hsts
+  namespace: default
+spec:
+  headers:
+    stsSeconds: 31536000
+    stsIncludeSubdomains: true
+```
+
+A reference without a provider, and a reference with any other provider such
+as `@file`, is passed through unchanged.
 
 Annotation values are validated when the Ingress is created or updated: an
 entrypoint or certresolver name must match `[A-Za-z0-9][A-Za-z0-9._-]*`, a

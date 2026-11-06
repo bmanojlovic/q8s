@@ -130,6 +130,16 @@ func (s *Server) handleAPIsRoot(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 			{
+				Name: "traefik.io",
+				Versions: []metav1.GroupVersionForDiscovery{
+					{GroupVersion: "traefik.io/v1alpha1", Version: "v1alpha1"},
+				},
+				PreferredVersion: metav1.GroupVersionForDiscovery{
+					GroupVersion: "traefik.io/v1alpha1",
+					Version:      "v1alpha1",
+				},
+			},
+			{
 				Name: "metrics.k8s.io",
 				Versions: []metav1.GroupVersionForDiscovery{
 					{GroupVersion: "metrics.k8s.io/v1beta1", Version: "v1beta1"},
@@ -266,6 +276,41 @@ func (s *Server) handleNetworkingV1(w http.ResponseWriter, r *http.Request) {
 		GroupVersion: "networking.k8s.io/v1",
 		APIResources: []metav1.APIResource{
 			{Name: "ingresses", SingularName: "ingress", Namespaced: true, Kind: "Ingress", Verbs: verbList(), ShortNames: []string{"ing"}},
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+func (s *Server) handleTraefikRoot(w http.ResponseWriter, r *http.Request) {
+	data, _ := json.Marshal(metav1.APIGroup{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "APIGroup",
+		},
+		Name: "traefik.io",
+		Versions: []metav1.GroupVersionForDiscovery{
+			{GroupVersion: "traefik.io/v1alpha1", Version: "v1alpha1"},
+		},
+		PreferredVersion: metav1.GroupVersionForDiscovery{
+			GroupVersion: "traefik.io/v1alpha1",
+			Version:      "v1alpha1",
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+func (s *Server) handleTraefikV1Alpha1(w http.ResponseWriter, r *http.Request) {
+	data, _ := json.Marshal(metav1.APIResourceList{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "APIResourceList",
+		},
+		GroupVersion: "traefik.io/v1alpha1",
+		APIResources: []metav1.APIResource{
+			{Name: "middlewares", SingularName: "middleware", Namespaced: true, Kind: "Middleware", Verbs: verbList()},
+			{Name: "ingressroutetcps", SingularName: "ingressroutetcp", Namespaced: true, Kind: "IngressRouteTCP", Verbs: verbList()},
 		},
 	})
 	w.Header().Set("Content-Type", "application/json")
@@ -864,6 +909,8 @@ func DiscoveryResources() []schema.GroupVersionResource {
 		{Group: "batch", Version: "v1", Resource: "jobs"},
 		{Group: "batch", Version: "v1", Resource: "cronjobs"},
 		{Group: "networking.k8s.io", Version: "v1", Resource: "ingresses"},
+		{Group: "traefik.io", Version: "v1alpha1", Resource: "middlewares"},
+		{Group: "traefik.io", Version: "v1alpha1", Resource: "ingressroutetcps"},
 		{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"},
 	}
 }

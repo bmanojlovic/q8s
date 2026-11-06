@@ -12,6 +12,7 @@ kubectl  ─── HTTPS/mTLS ──▶  q8s  ──▶  Podman Quadlets + syste
 - `kubectl top nodes` / `kubectl top pods` — live CPU and memory usage
 - `kubectl describe node` — full output with conditions, capacity, lease
 - Pods, Deployments (scale, rollout restart, env), Services, ConfigMaps, Secrets, Jobs, CronJobs
+- Traefik `Middleware` and `IngressRouteTCP` (`traefik.io/v1alpha1`), with Ingress routing
 - `kubectl logs`, `kubectl exec -it`, `kubectl get -w` (watch)
 - CrashLoopBackOff detection, restart limits, delete cascade
 - Namespace isolation via Podman networks
