@@ -211,6 +211,93 @@ func TestPodNotFound(t *testing.T) {
 	}
 }
 
+func TestSyncPodTemplateMissing(t *testing.T) {
+	st := newStore(t)
+	if st.SyncPodTemplate(makePod("default", "missing", "nginx")) {
+		t.Fatal("expected false for a missing pod")
+	}
+	if _, err := st.GetPod("default", "missing"); err == nil {
+		t.Fatal("SyncPodTemplate must not create a missing pod")
+	}
+}
+
+func TestSyncPodTemplateReplacesTemplateMetadata(t *testing.T) {
+	st := newStore(t)
+	pod := makePod("default", "app", "old:1")
+	pod.Labels = map[string]string{"app": "old"}
+	pod.Annotations = map[string]string{"note": "old"}
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "Deployment", Name: "old", UID: types.UID("old-deploy"),
+	}}
+	created, err := st.CreatePod(pod)
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	st.UpdatePodPhase("default", "app", corev1.PodRunning, "")
+	stored, err := st.GetPod("default", "app")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+
+	incoming := makePod("default", "app", "new:2")
+	incoming.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 8080}}
+	incoming.Labels = map[string]string{"app": "new", "extra": "yes"}
+	incoming.Annotations = map[string]string{"note": "new"}
+	incoming.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "Deployment", Name: "new", UID: types.UID("new-deploy"),
+	}}
+	if !st.SyncPodTemplate(incoming) {
+		t.Fatal("expected true for an existing pod")
+	}
+
+	updated, err := st.GetPod("default", "app")
+	if err != nil {
+		t.Fatalf("GetPod after sync: %v", err)
+	}
+	if got := updated.Spec.Containers[0].Image; got != "new:2" {
+		t.Errorf("spec image = %q, want new:2", got)
+	}
+	if got := updated.Spec.Containers[0].Ports; len(got) != 1 || got[0].ContainerPort != 8080 {
+		t.Errorf("spec ports = %v, want containerPort 8080", got)
+	}
+	if got := updated.Labels; len(got) != 2 || got["app"] != "new" || got["extra"] != "yes" {
+		t.Errorf("labels = %v, want the incoming labels", got)
+	}
+	if got := updated.Annotations; len(got) != 1 || got["note"] != "new" {
+		t.Errorf("annotations = %v, want the incoming annotations", got)
+	}
+	if got := updated.OwnerReferences; len(got) != 1 || got[0].Name != "new" || got[0].UID != types.UID("new-deploy") {
+		t.Errorf("ownerReferences = %v, want the incoming owner", got)
+	}
+	if updated.UID != created.UID {
+		t.Errorf("UID changed from %q to %q", created.UID, updated.UID)
+	}
+	if !updated.CreationTimestamp.Equal(&created.CreationTimestamp) {
+		t.Errorf("CreationTimestamp changed from %v to %v", created.CreationTimestamp, updated.CreationTimestamp)
+	}
+	if updated.Status.Phase != stored.Status.Phase {
+		t.Errorf("status phase changed from %s to %s", stored.Status.Phase, updated.Status.Phase)
+	}
+	if len(updated.Status.ContainerStatuses) != len(stored.Status.ContainerStatuses) {
+		t.Errorf("container statuses changed from %v to %v", stored.Status.ContainerStatuses, updated.Status.ContainerStatuses)
+	}
+	if updated.ResourceVersion == stored.ResourceVersion {
+		t.Fatalf("expected ResourceVersion to change, still %s", updated.ResourceVersion)
+	}
+
+	rv := updated.ResourceVersion
+	if !st.SyncPodTemplate(incoming) {
+		t.Fatal("expected true for identical input")
+	}
+	again, err := st.GetPod("default", "app")
+	if err != nil {
+		t.Fatalf("GetPod after identical sync: %v", err)
+	}
+	if again.ResourceVersion != rv {
+		t.Errorf("identical sync bumped ResourceVersion from %s to %s", rv, again.ResourceVersion)
+	}
+}
+
 func TestUpdatePodPhase(t *testing.T) {
 	st := newStore(t)
 	st.CreatePod(makePod("default", "nginx", "nginx"))

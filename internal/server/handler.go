@@ -2768,6 +2768,9 @@ func (s *Server) ReconcileQuadlets() {
 				f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, dep.Namespace, instanceName)
 			}
 			pod := s.materializeDeploymentInstance(dep, i)
+			// Heal instances stored by an older q8s with a stale spec
+			// (tic-d0fc) before anything below reads the store.
+			s.syncInstancePod(pod)
 			socketUnits, socketChanged := s.reconcilePodSockets(pod, instanceName)
 			socketUnitsToStart = append(socketUnitsToStart, socketUnits...)
 			if socketChanged {
@@ -3648,14 +3651,21 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 		fmt.Printf("deployment: wrote %s/%s-%d quadlet files\n", dep.Namespace, dep.Name, i)
 	}
 	// Ensure the pod exists in the store immediately so it shows up in
-	// `kubectl get pods` even before the container starts (or if it fails).
-	if _, err := s.config.Store.GetPod(dep.Namespace, instanceName); err != nil {
-		s.config.Store.CreatePod(pod)
-	}
+	// `kubectl get pods` even before the container starts (or if it fails),
+	// and that an existing one carries the current template (tic-d0fc).
+	s.syncInstancePod(pod)
 	if restart && len(changed) == 0 && !removed && !socketChanged {
 		return
 	}
 	s.reloadAndRun(podUnitNames(dep.Namespace, instanceName, pod.Spec.Containers), restart, removed, socketChanged, changed)
+}
+
+// syncInstancePod stores a freshly materialized Deployment instance: created
+// if missing, otherwise its spec and metadata replaced (status kept).
+func (s *Server) syncInstancePod(pod *corev1.Pod) {
+	if !s.config.Store.SyncPodTemplate(pod) {
+		s.config.Store.CreatePod(pod)
+	}
 }
 
 func (s *Server) stopDeploymentUnits(dep *appsv1.Deployment) {
@@ -4248,11 +4258,17 @@ func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portNa
 				if cp.ContainerPort != targetNum && cp.Name != targetName {
 					continue
 				}
+				// Traefik is a container on the namespace networks, so a
+				// pod on those networks is dialed by name like a k8s
+				// endpoint (pod address, never the hostPort): a hostPort is
+				// an extra publish, and a loopback hostIP would be Traefik's
+				// own loopback (tic-090e). Only a hostNetwork pod is reached
+				// through the host.
 				switch {
-				case cp.HostPort != 0:
-					servers = append(servers, "http://"+backendHostPort(cp.HostIP, cp.HostPort))
 				case !pod.Spec.HostNetwork:
 					servers = append(servers, fmt.Sprintf("http://%s.%s:%d", pod.Name, ns, cp.ContainerPort))
+				case cp.HostPort != 0:
+					servers = append(servers, "http://"+backendHostPort(cp.HostIP, cp.HostPort))
 				}
 				// A pod lists each container port once; stop at the first
 				// matching entry for this container.
