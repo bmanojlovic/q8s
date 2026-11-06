@@ -63,7 +63,7 @@ func multiPod() *corev1.Pod {
 
 func TestPodUnitsTwoContainers(t *testing.T) {
 	pod := multiPod()
-	files, err := quadlet.PodUnits(pod.Name, pod, "/run/q8s/configmaps", []string{"myservice"}, nil, "")
+	files, err := quadlet.PodUnits(pod.Name, pod, "/run/q8s/configmaps", []string{"myservice"}, nil, "", nil)
 	if err != nil {
 		t.Fatalf("PodUnits: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestPodUnitsTwoContainers(t *testing.T) {
 func TestPodUnitsHostNetwork(t *testing.T) {
 	pod := multiPod()
 	pod.Spec.HostNetwork = true
-	files, err := quadlet.PodUnits(pod.Name, pod, "", []string{"myservice"}, nil, "")
+	files, err := quadlet.PodUnits(pod.Name, pod, "", []string{"myservice"}, nil, "", nil)
 	if err != nil {
 		t.Fatalf("PodUnits: %v", err)
 	}
@@ -138,9 +138,34 @@ func TestPodUnitsHostNetwork(t *testing.T) {
 func TestPodUnitsRejectsInvalidContainerName(t *testing.T) {
 	pod := multiPod()
 	pod.Spec.Containers[1].Name = "bad name"
-	if _, err := quadlet.PodUnits(pod.Name, pod, "", nil, nil, ""); err == nil {
+	if _, err := quadlet.PodUnits(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 		t.Fatal("expected error for invalid container name")
 	}
+}
+
+func TestPodUnitsRejectsSocketActivation(t *testing.T) {
+	pod := multiPod()
+	pod.Annotations = map[string]string{quadlet.AnnotationSocketActivation: "web=80"}
+	if _, err := quadlet.PodUnits(pod.Name, pod, "", nil, nil, "", nil); err == nil {
+		t.Fatal("expected error for socket activation on a multi-container pod")
+	}
+}
+
+func TestPodUnitsNetworkAttachments(t *testing.T) {
+	pod := multiPod()
+	files, err := quadlet.PodUnits(pod.Name, pod, "", nil, nil, "", []quadlet.NetworkAttachment{
+		{Namespace: "other"},
+		{Namespace: "default", IP: "10.89.3.254"},
+	})
+	if err != nil {
+		t.Fatalf("PodUnits: %v", err)
+	}
+	podOut := string(files["default-multi.pod"])
+	want := "Network=q8s-default.network:ip=10.89.3.254\nNetwork=q8s-other.network\n"
+	if !strings.Contains(podOut, want) {
+		t.Errorf("pod networks missing:\nwant:\n%s\ngot:\n%s", want, podOut)
+	}
+	assertContains(t, podOut, "NetworkAlias=multi.default")
 }
 
 func keys(files map[string][]byte) string {
@@ -178,7 +203,7 @@ func TestDeploymentTemplateAnnotations(t *testing.T) {
 			"checksum/config": "abc",
 			"a":               `x y %z "q"`,
 		})
-		out, err := quadlet.Container("app-0", pod, "", nil, nil, "")
+		out, err := quadlet.Container("app-0", pod, "", nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("Container: %v", err)
 		}
@@ -207,11 +232,11 @@ func TestDeploymentTemplateAnnotations(t *testing.T) {
 		second.Annotations["checksum/config"] = "abc"
 		second.Annotations["b"] = "2"
 
-		firstOut, err := quadlet.Container("app-0", first, "", nil, nil, "")
+		firstOut, err := quadlet.Container("app-0", first, "", nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("Container first: %v", err)
 		}
-		secondOut, err := quadlet.Container("app-0", second, "", nil, nil, "")
+		secondOut, err := quadlet.Container("app-0", second, "", nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("Container second: %v", err)
 		}
@@ -225,7 +250,7 @@ func TestDeploymentTemplateAnnotations(t *testing.T) {
 			"kubectl.kubernetes.io/last-applied-configuration": `{"huge":"json"}`,
 			"keep": "v",
 		})
-		out, err := quadlet.Container("app-0", pod, "", nil, nil, "")
+		out, err := quadlet.Container("app-0", pod, "", nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("Container: %v", err)
 		}
@@ -238,7 +263,7 @@ func TestDeploymentTemplateAnnotations(t *testing.T) {
 			"multi": "line1\nline2\ttab",
 			"other": "a\x01b\x7fc\rd",
 		})
-		out, err := quadlet.Container("app-0", pod, "", nil, nil, "")
+		out, err := quadlet.Container("app-0", pod, "", nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("Container: %v", err)
 		}
@@ -256,7 +281,7 @@ func TestDeploymentTemplateAnnotations(t *testing.T) {
 	})
 
 	t.Run("no annotations keeps today's output", func(t *testing.T) {
-		out, err := quadlet.Container("app-0", deploymentOwnedPod(nil), "", nil, nil, "")
+		out, err := quadlet.Container("app-0", deploymentOwnedPod(nil), "", nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("Container: %v", err)
 		}
@@ -274,7 +299,7 @@ func TestDeploymentTemplateAnnotations(t *testing.T) {
 				Containers: []corev1.Container{{Name: "c", Image: "nginx:latest"}},
 			},
 		}
-		out, err := quadlet.Container("plain", pod, "", nil, nil, "")
+		out, err := quadlet.Container("plain", pod, "", nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("Container: %v", err)
 		}
@@ -285,7 +310,7 @@ func TestDeploymentTemplateAnnotations(t *testing.T) {
 		pod := multiPod()
 		pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "multi"}}
 		pod.Annotations = map[string]string{"b": "2", "a": "1"}
-		files, err := quadlet.PodUnits(pod.Name, pod, "", nil, nil, "")
+		files, err := quadlet.PodUnits(pod.Name, pod, "", nil, nil, "", nil)
 		if err != nil {
 			t.Fatalf("PodUnits: %v", err)
 		}
@@ -304,7 +329,7 @@ func TestDeploymentTemplateAnnotationInvalidKey(t *testing.T) {
 	for _, key := range []string{"bad key", "a=b", "-x"} {
 		t.Run(key, func(t *testing.T) {
 			pod := deploymentOwnedPod(map[string]string{key: "v"})
-			_, err := quadlet.Container("app-0", pod, "", nil, nil, "")
+			_, err := quadlet.Container("app-0", pod, "", nil, nil, "", nil)
 			if err == nil {
 				t.Fatalf("expected an error for annotation key %q", key)
 			}
@@ -317,7 +342,7 @@ func TestDeploymentTemplateAnnotationInvalidKey(t *testing.T) {
 
 func TestPodUnitsOwnershipAndHashLabels(t *testing.T) {
 	pod := multiPod()
-	files, err := quadlet.PodUnits(pod.Name, pod, "", nil, nil, "")
+	files, err := quadlet.PodUnits(pod.Name, pod, "", nil, nil, "", nil)
 	if err != nil {
 		t.Fatalf("PodUnits: %v", err)
 	}
@@ -331,7 +356,7 @@ func TestPodUnitsOwnershipAndHashLabels(t *testing.T) {
 	}
 
 	// Equal input renders the same pod hash.
-	again, err := quadlet.PodUnits(pod.Name, pod.DeepCopy(), "", nil, nil, "")
+	again, err := quadlet.PodUnits(pod.Name, pod.DeepCopy(), "", nil, nil, "", nil)
 	if err != nil {
 		t.Fatalf("PodUnits second render: %v", err)
 	}

@@ -2,12 +2,52 @@ package quadlet
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 )
+
+// NetworkAttachment is one namespace network a pod joins; IP may be empty.
+type NetworkAttachment struct {
+	Namespace string
+	IP        string
+}
+
+// LastUsableIPv4 returns the highest host address of an IPv4 CIDR: the
+// broadcast address minus one. Part B pins Traefik to this address on each
+// namespace network so its IP is stable across restarts.
+func LastUsableIPv4(cidr string) (string, error) {
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return "", fmt.Errorf("%q is not a valid CIDR: %w", cidr, err)
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return "", fmt.Errorf("%q is not an IPv4 CIDR", cidr)
+	}
+	ones, bits := network.Mask.Size()
+	if bits != 32 || ones > 30 {
+		return "", fmt.Errorf("%q must be an IPv4 CIDR with a prefix of /30 or shorter", cidr)
+	}
+	base := network.IP.To4()
+	last := make(net.IP, net.IPv4len)
+	copy(last, base)
+	for i := range last {
+		last[i] |= ^network.Mask[i]
+	}
+	// broadcast - 1: skip the broadcast address itself.
+	for i := len(last) - 1; i >= 0; i-- {
+		if last[i] > 0 {
+			last[i]--
+			break
+		}
+		last[i] = 0xff
+	}
+	return last.String(), nil
+}
 
 // containerRender carries everything needed to render one .container unit.
 // The same helper serves both shapes: a standalone single-container pod
@@ -20,8 +60,10 @@ type containerRender struct {
 	containerName  string // ContainerName= value
 	podUnit        string // Pod= value; empty for a standalone container
 	containerLabel string // io.kubernetes.container.name value; empty when unset
+	podName        string // name argument of Container/PodUnits, used for DNS aliases
 	configDir      string
 	serviceAliases []string
+	networks       []NetworkAttachment
 	pvcMap         map[string]*corev1.PersistentVolumeClaim
 	envFile        string
 	standalone     bool
@@ -33,7 +75,7 @@ type containerRender struct {
 // keyed by filename (the caller writes each file into the quadlet dir).
 // Single-container pods must keep using Container, whose output is
 // byte-identical to q8s before pods existed.
-func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) (map[string][]byte, error) {
+func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []NetworkAttachment) (map[string][]byte, error) {
 	if err := validateRefName("pod name", name); err != nil {
 		return nil, err
 	}
@@ -43,8 +85,13 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 	if len(pod.Spec.Containers) == 0 {
 		return nil, fmt.Errorf("pod has no containers")
 	}
+	// FileDescriptorName is per unit, so one socket unit can only back one
+	// container; a Podman pod has no single service to activate.
+	if _, ok := pod.Annotations[AnnotationSocketActivation]; ok {
+		return nil, fmt.Errorf("pod %s/%s: %s is not supported on multi-container pods", pod.Namespace, name, AnnotationSocketActivation)
+	}
 
-	podContent, err := renderPod(name, pod, serviceAliases)
+	podContent, err := renderPod(name, pod, serviceAliases, networks)
 	if err != nil {
 		return nil, err
 	}
@@ -66,8 +113,10 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 			containerName:  fmt.Sprintf("%s-%s", podName, c.Name),
 			podUnit:        podName + ".pod",
 			containerLabel: c.Name,
+			podName:        name,
 			configDir:      configDir,
 			serviceAliases: serviceAliases,
+			networks:       networks,
 			pvcMap:         pvcMap,
 			envFile:        envFile,
 			standalone:     false,
@@ -83,7 +132,7 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 // renderPod emits the [Pod] section. Only keys Podman accepts on a pod live
 // here: network, published ports, /dev/shm and labels are pod-level because
 // all containers in the pod share them.
-func renderPod(name string, pod *corev1.Pod, serviceAliases []string) ([]byte, error) {
+func renderPod(name string, pod *corev1.Pod, serviceAliases []string, networks []NetworkAttachment) ([]byte, error) {
 	var b strings.Builder
 
 	b.WriteString("[Pod]\n")
@@ -91,15 +140,19 @@ func renderPod(name string, pod *corev1.Pod, serviceAliases []string) ([]byte, e
 	b.WriteString(fmt.Sprintf("PodName=%s\n", podName))
 
 	// Network: host networking when requested, otherwise the namespace
-	// network. NetworkAlias only makes sense on the namespace bridge.
+	// networks. NetworkAlias only makes sense on the namespace bridge, and
+	// podman applies the aliases on every attached network.
 	if pod.Spec.HostNetwork {
 		b.WriteString("Network=host\n")
 	} else {
-		b.WriteString(fmt.Sprintf("Network=q8s-%s.network\n", pod.Namespace))
-		for _, alias := range serviceAliases {
-			if err := validateRefName("service alias", alias); err != nil {
-				return nil, err
-			}
+		if err := writeNetworks(&b, pod.Namespace, networks); err != nil {
+			return nil, err
+		}
+		aliases, err := networkAliases(pod.Namespace, name, serviceAliases)
+		if err != nil {
+			return nil, err
+		}
+		for _, alias := range aliases {
 			b.WriteString(fmt.Sprintf("NetworkAlias=%s\n", alias))
 		}
 	}
@@ -125,6 +178,77 @@ func renderPod(name string, pod *corev1.Pod, serviceAliases []string) ([]byte, e
 	b.WriteString(fmt.Sprintf("Label=q8s.io/containers=%s\n", strings.Join(names, ",")))
 
 	return []byte(b.String()), nil
+}
+
+// networkAliases expands a pod's matching Service names into the DNS names
+// k8s clients expect on the cluster network. The pod's own <pod>.<ns> name
+// is always present, even with no Service, so Traefik can dial a backend as
+// <pod>.<ns>:<containerPort> without a Service existing.
+func networkAliases(ns, podName string, services []string) ([]string, error) {
+	// Dotted aliases cannot go through validateRefName (it rejects '.'), so
+	// each component is vetted before it is joined.
+	if err := validateRefName("pod namespace", ns); err != nil {
+		return nil, err
+	}
+	if err := validateRefName("pod name", podName); err != nil {
+		return nil, err
+	}
+	set := map[string]bool{
+		fmt.Sprintf("%s.%s", podName, ns): true,
+	}
+	for _, svc := range services {
+		if err := validateRefName("service alias", svc); err != nil {
+			return nil, err
+		}
+		set[svc] = true
+		set[fmt.Sprintf("%s.%s", svc, ns)] = true
+		set[fmt.Sprintf("%s.%s.svc.cluster.local", svc, ns)] = true
+	}
+	aliases := make([]string, 0, len(set))
+	for alias := range set {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	return aliases, nil
+}
+
+// writeNetworks emits the Network= lines for a non-hostNetwork pod. An empty
+// attachment list is today's single own-namespace network; otherwise the pod
+// joins each listed network, sorted by namespace, with an optional fixed IPv4.
+func writeNetworks(b *strings.Builder, ns string, networks []NetworkAttachment) error {
+	if len(networks) == 0 {
+		b.WriteString(fmt.Sprintf("Network=q8s-%s.network\n", ns))
+		return nil
+	}
+	attachments := append([]NetworkAttachment(nil), networks...)
+	sort.SliceStable(attachments, func(i, j int) bool {
+		return attachments[i].Namespace < attachments[j].Namespace
+	})
+	var lines strings.Builder
+	own := false
+	for _, n := range attachments {
+		if err := validateRefName("network namespace", n.Namespace); err != nil {
+			return err
+		}
+		if n.Namespace == ns {
+			own = true
+		}
+		if n.IP == "" {
+			lines.WriteString(fmt.Sprintf("Network=q8s-%s.network\n", n.Namespace))
+			continue
+		}
+		ip := net.ParseIP(n.IP)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("network %q: IP %q is not a valid IPv4 address", n.Namespace, n.IP)
+		}
+		lines.WriteString(fmt.Sprintf("Network=q8s-%s.network:ip=%s\n", n.Namespace, ip.To4().String()))
+	}
+	if !own {
+		// A pod is always on its own namespace network, listed or not.
+		b.WriteString(fmt.Sprintf("Network=q8s-%s.network\n", ns))
+	}
+	b.WriteString(lines.String())
+	return nil
 }
 
 // renderContainer emits one .container unit. Its output for a
@@ -207,11 +331,14 @@ func renderContainer(r containerRender) ([]byte, error) {
 		if pod.Spec.HostNetwork {
 			b.WriteString("Network=host\n")
 		} else {
-			b.WriteString(fmt.Sprintf("Network=q8s-%s.network\n", pod.Namespace))
-			for _, alias := range r.serviceAliases {
-				if err := validateRefName("service alias", alias); err != nil {
-					return nil, err
-				}
+			if err := writeNetworks(&b, pod.Namespace, r.networks); err != nil {
+				return nil, err
+			}
+			aliases, err := networkAliases(pod.Namespace, r.podName, r.serviceAliases)
+			if err != nil {
+				return nil, err
+			}
+			for _, alias := range aliases {
 				b.WriteString(fmt.Sprintf("NetworkAlias=%s\n", alias))
 			}
 		}
@@ -238,6 +365,22 @@ func renderContainer(r containerRender) ([]byte, error) {
 	// work - a missing unit here is a harmless no-op. See tic-1507.
 	b.WriteString("Wants=q8s-api.service\n")
 	b.WriteString("After=q8s-api.service\n")
+
+	// Socket activation: the pod's .socket units hand it listening fds via
+	// LISTEN_FDS. Podman only passes those through when the socket unit is
+	// already active before the container service starts, hence Requires=
+	// plus After= (and not just Wants=).
+	if r.standalone {
+		sockets, err := ParseSocketActivation(pod.Annotations)
+		if err != nil {
+			return nil, err
+		}
+		for _, s := range sockets {
+			unit := fmt.Sprintf("%s-%s-%s.socket", pod.Namespace, r.podName, s.Name)
+			b.WriteString(fmt.Sprintf("Requires=%s\n", unit))
+			b.WriteString(fmt.Sprintf("After=%s\n", unit))
+		}
+	}
 
 	// Every policy maps to an explicit Restart= line. Emitting nothing for
 	// Never (as older code did) is not neutral: quadlet/.container units
@@ -284,11 +427,10 @@ func writePublishPorts(b *strings.Builder, ports []corev1.ContainerPort) {
 		if port.Protocol == corev1.ProtocolUDP {
 			proto = "udp"
 		}
-		// An explicit HostIP binds the published port to one interface -
-		// the q8s replica-port allocator uses 127.0.0.1 so replica backends
-		// are reachable on-host (Traefik) but never exposed on the LAN.
-		// Without HostIP the publish binds all interfaces, matching k8s
-		// hostPort semantics for manually-declared ports.
+		// An explicit HostIP binds the published port to one interface, so
+		// a hand-published backend can stay on-host (for example loopback
+		// only) and never be exposed on the LAN. Without HostIP the publish
+		// binds all interfaces, matching k8s hostPort semantics.
 		if port.HostIP != "" {
 			b.WriteString(fmt.Sprintf("PublishPort=%s:%d:%d/%s\n", port.HostIP, port.HostPort, port.ContainerPort, proto))
 		} else {

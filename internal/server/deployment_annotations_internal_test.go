@@ -27,8 +27,8 @@ func TestMaterializeDeploymentInstanceCopiesPodTemplateAnnotations(t *testing.T)
 		},
 	}
 
-	// Instance 1 avoids the replica-port allocator and node-port publish
-	// paths, which need a populated Store; neither touches annotations.
+	// Instance 1 avoids the node-port publish path, which needs a populated
+	// Store; it does not touch annotations.
 	pod := (&Server{}).materializeDeploymentInstance(dep, 1)
 
 	if got := pod.Annotations["q8s.io/ulimits"]; got != "memlock=-1:-1" {
