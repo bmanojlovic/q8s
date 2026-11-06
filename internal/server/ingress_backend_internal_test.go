@@ -72,9 +72,11 @@ func TestIngressBackendServersDNSForDeployment(t *testing.T) {
 	}
 }
 
-// TestIngressBackendServersExplicitHostPort: an explicit publish keeps
-// priority and is dialed on its host address.
-func TestIngressBackendServersExplicitHostPort(t *testing.T) {
+// TestIngressBackendServersNonHostNetworkIgnoresHostPort: a pod on the
+// namespace networks is dialed by its cluster DNS name on the container
+// port even when it declares a hostPort. Only a hostNetwork pod is reached
+// through the host (tic-090e).
+func TestIngressBackendServersNonHostNetworkIgnoresHostPort(t *testing.T) {
 	st := store.New()
 	s := &Server{config: Config{Store: st}}
 	pod := &corev1.Pod{
@@ -92,7 +94,7 @@ func TestIngressBackendServersExplicitHostPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := s.ingressBackendServers("default", "web", 80, "")
-	want := []string{"http://127.25.0.1:20001"}
+	want := []string{"http://pub.default:8080"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("servers = %v, want %v", got, want)
 	}

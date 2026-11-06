@@ -632,6 +632,51 @@ func (s *Store) UpdatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 	return pod.DeepCopy(), nil
 }
 
+// SyncPodTemplate replaces the spec and the template-derived metadata
+// (labels, annotations, owner references) of a stored pod, keeping its UID,
+// creation time and status. A Deployment instance is materialized from the
+// template on every deploy; without this the stored object kept the spec it
+// was first created with, and every reader of the store (namespace network
+// attach, Ingress backends, kubectl) saw a stale pod. Done under the lock so a
+// concurrent status update is not lost. Returns false if the pod is missing.
+func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+	existing, ok := s.pods[key]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	if reflect.DeepEqual(existing.Spec, pod.Spec) &&
+		reflect.DeepEqual(existing.Labels, pod.Labels) &&
+		reflect.DeepEqual(existing.Annotations, pod.Annotations) &&
+		reflect.DeepEqual(existing.OwnerReferences, pod.OwnerReferences) {
+		s.mu.Unlock()
+		return true
+	}
+	updated := existing.DeepCopy()
+	updated.Spec = *pod.Spec.DeepCopy()
+	updated.Labels = copyStringMap(pod.Labels)
+	updated.Annotations = copyStringMap(pod.Annotations)
+	updated.OwnerReferences = append([]metav1.OwnerReference(nil), pod.OwnerReferences...)
+	updated.ResourceVersion = s.incRV()
+	s.pods[key] = updated
+	s.mu.Unlock()
+	go s.save()
+	return true
+}
+
+func copyStringMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 // UpdatePodPhase updates a pod's phase and syncs container ready state.
 // health is the Podman health of the container ("healthy", "unhealthy",
 // "starting") or "" when there is no health check, in which case readiness

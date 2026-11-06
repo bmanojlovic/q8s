@@ -1506,6 +1506,104 @@ func TestDeploymentUpdatePut(t *testing.T) {
 	}
 }
 
+// TestDeploymentUpdateSyncsInstancePodMetadata pins tic-d0fc: a template
+// annotation and label change on PUT must reach the already stored replica
+// pod without replacing its UID.
+func TestDeploymentUpdateSyncsInstancePodMetadata(t *testing.T) {
+	st := store.New()
+	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBody("default", "synced", "nginx:latest"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	podURL := ts.URL + "/api/v1/namespaces/default/pods/synced-0"
+	resp = get(t, podURL)
+	assertStatus(t, resp, http.StatusOK)
+	var before corev1.Pod
+	if err := json.NewDecoder(resp.Body).Decode(&before); err != nil {
+		t.Fatalf("decode pod: %v", err)
+	}
+	resp.Body.Close()
+
+	body := deployBody("default", "synced", "nginx:latest")
+	tmpl := body["spec"].(map[string]interface{})["template"].(map[string]interface{})
+	meta := tmpl["metadata"].(map[string]interface{})
+	meta["annotations"] = map[string]interface{}{"q8s.io/attach-all-networks": "true"}
+	meta["labels"] = map[string]interface{}{"app": "synced", "tier": "edge"}
+	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/synced", body)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp = get(t, podURL)
+	assertStatus(t, resp, http.StatusOK)
+	var after corev1.Pod
+	if err := json.NewDecoder(resp.Body).Decode(&after); err != nil {
+		t.Fatalf("decode updated pod: %v", err)
+	}
+	resp.Body.Close()
+
+	if after.UID != before.UID {
+		t.Errorf("pod UID changed from %q to %q", before.UID, after.UID)
+	}
+	if got := after.Annotations["q8s.io/attach-all-networks"]; got != "true" {
+		t.Errorf("pod annotation = %q, want true", got)
+	}
+	if got := after.Labels["tier"]; got != "edge" {
+		t.Errorf("pod label tier = %q, want edge", got)
+	}
+	if got := after.Labels["app"]; got != "synced" {
+		t.Errorf("pod label app = %q, want synced", got)
+	}
+}
+
+// TestDeploymentUpdateSyncsInstancePodHostNetwork pins the spec half of
+// tic-d0fc: turning hostNetwork off in the template must reach the stored
+// replica pod.
+func TestDeploymentUpdateSyncsInstancePodHostNetwork(t *testing.T) {
+	st := store.New()
+	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := deployBody("default", "hostmode", "nginx:latest")
+	body["spec"].(map[string]interface{})["template"].(map[string]interface{})["spec"].(map[string]interface{})["hostNetwork"] = true
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	podURL := ts.URL + "/api/v1/namespaces/default/pods/hostmode-0"
+	resp = get(t, podURL)
+	assertStatus(t, resp, http.StatusOK)
+	var before corev1.Pod
+	if err := json.NewDecoder(resp.Body).Decode(&before); err != nil {
+		t.Fatalf("decode pod: %v", err)
+	}
+	resp.Body.Close()
+	if !before.Spec.HostNetwork {
+		t.Fatal("stored pod should start with hostNetwork true")
+	}
+
+	body = deployBody("default", "hostmode", "nginx:latest")
+	body["spec"].(map[string]interface{})["template"].(map[string]interface{})["spec"].(map[string]interface{})["hostNetwork"] = false
+	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/hostmode", body)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp = get(t, podURL)
+	assertStatus(t, resp, http.StatusOK)
+	var after corev1.Pod
+	if err := json.NewDecoder(resp.Body).Decode(&after); err != nil {
+		t.Fatalf("decode updated pod: %v", err)
+	}
+	resp.Body.Close()
+	if after.Spec.HostNetwork {
+		t.Error("stored pod spec still has hostNetwork true after template update")
+	}
+}
+
 func TestDeploymentUpdatePutNotFound(t *testing.T) {
 	ts, _ := newTestServer(t)
 	resp := do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/missing", deployBody("default", "missing", "nginx"))
@@ -2524,12 +2622,13 @@ func readTraefikConfig(t *testing.T, dir, ns, name string) string {
 }
 
 // TestIngressEndpointsFromSelectorPods: a Service selector resolves to every
-// matching pod, each contributing its own hostPort — different ports per pod
-// are fine, exactly like k8s Endpoints.
+// matching pod, each contributing its own container port address. The
+// distinct hostPorts are ignored on pods that are not hostNetwork, exactly
+// like k8s Endpoints.
 func TestIngressEndpointsFromSelectorPods(t *testing.T) {
 	ts, traefikDir := ingressTestServer(t)
 
-	// Three standalone pods, same labels, distinct hostPorts.
+	// Three standalone pods, same labels, distinct hostPorts to be ignored.
 	for i, hp := range []int32{20001, 20002, 20003} {
 		postPodWithPort(t, ts.URL, "default", fmt.Sprintf("web-%d", i),
 			map[string]string{"app": "web"}, 8080, hp)
@@ -2555,9 +2654,9 @@ func TestIngressEndpointsFromSelectorPods(t *testing.T) {
 
 	cfg := readTraefikConfig(t, traefikDir, "default", "web")
 	for _, want := range []string{
-		`- url: "http://127.0.0.1:20001"`,
-		`- url: "http://127.0.0.1:20002"`,
-		`- url: "http://127.0.0.1:20003"`,
+		`- url: "http://web-0.default:8080"`,
+		`- url: "http://web-1.default:8080"`,
+		`- url: "http://web-2.default:8080"`,
 	} {
 		if !strings.Contains(cfg, want) {
 			t.Errorf("missing server %s in:\n%s", want, cfg)
@@ -2565,6 +2664,9 @@ func TestIngressEndpointsFromSelectorPods(t *testing.T) {
 	}
 	if strings.Contains(cfg, "localhost") {
 		t.Errorf("fallback localhost URL leaked into selector-resolved config:\n%s", cfg)
+	}
+	if strings.Contains(cfg, "127.0.0.1") {
+		t.Errorf("host publish leaked into selector-resolved config:\n%s", cfg)
 	}
 }
 
@@ -2610,8 +2712,11 @@ func TestIngressSkipsHostNetworkPodsWithoutHostPort(t *testing.T) {
 	resp.Body.Close()
 
 	cfg := readTraefikConfig(t, traefikDir, "default", "web")
-	if !strings.Contains(cfg, `http://127.0.0.1:20010`) {
-		t.Errorf("published pod missing from config:\n%s", cfg)
+	if !strings.Contains(cfg, `http://pub.default:8080`) {
+		t.Errorf("non-hostNetwork pod missing from config:\n%s", cfg)
+	}
+	if strings.Contains(cfg, "127.0.0.1:20010") {
+		t.Errorf("hostPort leaked into non-hostNetwork backend:\n%s", cfg)
 	}
 	if strings.Contains(cfg, "http://dark") {
 		t.Errorf("hostNetwork pod without hostPort leaked into config:\n%s", cfg)
@@ -2666,11 +2771,14 @@ func TestIngressRegeneratesOnPodChurn(t *testing.T) {
 		t.Errorf("expected fallback before pods exist:\n%s", cfg)
 	}
 
-	// Create a matching pod -> config picks up its hostPort.
+	// Create a matching pod -> config picks up its DNS backend.
 	postPodWithPort(t, ts.URL, "default", "web-0", map[string]string{"app": "web"}, 8080, 20077)
 	cfg = readTraefikConfig(t, traefikDir, "default", "web")
-	if !strings.Contains(cfg, "127.0.0.1:20077") {
+	if !strings.Contains(cfg, "http://web-0.default:8080") {
 		t.Errorf("pod create did not regenerate config:\n%s", cfg)
+	}
+	if strings.Contains(cfg, "127.0.0.1:20077") {
+		t.Errorf("hostPort leaked into backend after pod create:\n%s", cfg)
 	}
 
 	// Delete it -> back to fallback.
@@ -2683,8 +2791,11 @@ func TestIngressRegeneratesOnPodChurn(t *testing.T) {
 	resp.Body.Close()
 
 	cfg = readTraefikConfig(t, traefikDir, "default", "web")
-	if strings.Contains(cfg, "20077") {
+	if strings.Contains(cfg, "http://web-0.default:8080") {
 		t.Errorf("pod delete did not regenerate config:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, "localhost:80") {
+		t.Errorf("expected fallback after pod delete:\n%s", cfg)
 	}
 }
 
@@ -2728,7 +2839,7 @@ func TestIngressNamedTargetPort(t *testing.T) {
 	resp.Body.Close()
 
 	cfg := readTraefikConfig(t, traefikDir, "default", "web")
-	if !strings.Contains(cfg, "127.0.0.1:20090") {
+	if !strings.Contains(cfg, "http://named.default:8080") {
 		t.Errorf("named targetPort not resolved:\n%s", cfg)
 	}
 }
@@ -4092,24 +4203,30 @@ func TestUnchangedDeploymentReapplyDoesNotRewrite(t *testing.T) {
 	}
 }
 
-// TestIngressBackendHonorsHostIP: a pod that pins its publish to its own
-// loopback address (hostIP 127.25.0.1) is only listening there, so Traefik
-// must dial that address on the real port, not 127.0.0.1. Wildcard and unset
-// hostIPs still resolve to 127.0.0.1.
-func TestIngressBackendHonorsHostIP(t *testing.T) {
+// TestIngressBackendHonorsHostIPOnlyOnHostNetwork: a hostNetwork pod that
+// pins its publish to its own loopback address (hostIP 127.25.0.1) is only
+// listening there, so Traefik must dial that address on the real port, not
+// 127.0.0.1. Wildcard hostIPs still resolve to 127.0.0.1. A non-hostNetwork
+// pod with the same hostIP and hostPort is dialed by its cluster DNS name
+// instead (tic-090e).
+func TestIngressBackendHonorsHostIPOnlyOnHostNetwork(t *testing.T) {
 	ts, traefikDir := ingressTestServer(t)
 
 	for _, p := range []struct {
-		name, hostIP string
-		hostPort     int32
+		name        string
+		hostNetwork bool
+		hostIP      string
+		hostPort    int32
 	}{
-		{"own-ip", "127.25.0.1", 8080},
-		{"wildcard", "0.0.0.0", 20021},
+		{"own-ip", true, "127.25.0.1", 8080},
+		{"wildcard", true, "0.0.0.0", 20021},
+		{"podnet", false, "127.25.0.1", 8080},
 	} {
 		body := map[string]interface{}{
 			"apiVersion": "v1", "kind": "Pod",
 			"metadata": map[string]interface{}{"name": p.name, "namespace": "default", "labels": map[string]string{"app": "mail"}},
 			"spec": map[string]interface{}{
+				"hostNetwork": p.hostNetwork,
 				"containers": []interface{}{map[string]interface{}{
 					"name": "c", "image": "nginx",
 					"ports": []interface{}{map[string]interface{}{
@@ -4141,12 +4258,21 @@ func TestIngressBackendHonorsHostIP(t *testing.T) {
 	resp.Body.Close()
 
 	cfg := readTraefikConfig(t, traefikDir, "default", "mail")
-	for _, want := range []string{`- url: "http://127.25.0.1:8080"`, `- url: "http://127.0.0.1:20021"`} {
+	for _, want := range []string{
+		`- url: "http://127.25.0.1:8080"`,
+		`- url: "http://127.0.0.1:20021"`,
+		`- url: "http://podnet.default:8080"`,
+	} {
 		if !strings.Contains(cfg, want) {
 			t.Errorf("missing server %s in:\n%s", want, cfg)
 		}
 	}
 	if strings.Contains(cfg, "0.0.0.0") {
 		t.Errorf("wildcard hostIP leaked into backend URL:\n%s", cfg)
+	}
+	for _, unexpected := range []string{"http://own-ip.default", "http://wildcard.default"} {
+		if strings.Contains(cfg, unexpected) {
+			t.Errorf("hostNetwork pod dialed at %s:\n%s", unexpected, cfg)
+		}
 	}
 }
