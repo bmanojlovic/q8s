@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // This file validates every client-supplied string field before it's
@@ -104,6 +106,17 @@ func validateLabelPair(key, value string) error {
 	}
 	if err := noControlChars("label value", value); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateAnnotationKey applies Kubernetes' own annotation-key rule, so q8s
+// accepts exactly the keys the API server accepts. Anything the rule rejects
+// could corrupt the Annotation= line it is written into (a newline opens a
+// new directive, an '=' splits key and value), so it is an error.
+func validateAnnotationKey(key string) error {
+	if msgs := validation.IsQualifiedName(key); len(msgs) > 0 {
+		return fmt.Errorf("annotation key %q is invalid: %s", key, strings.Join(msgs, "; "))
 	}
 	return nil
 }
