@@ -132,9 +132,16 @@ func ListOwned() ([]ContainerInfo, error) {
 func NetworkSubnet(name string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "podman", "network", "inspect", "--format", "json", name).CombinedOutput()
+	// stdout only: podman logs warnings to stderr (e.g. level=error lines
+	// about runtimes missing from containers.conf) even when it succeeds,
+	// and those would corrupt the JSON.
+	out, err := exec.CommandContext(ctx, "podman", "network", "inspect", "--format", "json", name).Output()
 	if err != nil {
-		return "", fmt.Errorf("podman network inspect %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+		var stderr []byte
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = ee.Stderr
+		}
+		return "", fmt.Errorf("podman network inspect %s: %w: %s", name, err, strings.TrimSpace(string(stderr)))
 	}
 	subnet, err := parseNetworkSubnet(out)
 	if err != nil {
