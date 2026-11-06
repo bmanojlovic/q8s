@@ -594,6 +594,7 @@ func cmdServe() {
 	ensureNamespaceNetworks(d.quadletDir, mgr, st)
 	srv.ReconcileQuadlets()
 	srv.ReconcileNetworkAttachments()
+	srv.ReconcileIngressConfigs()
 	reconcilePodmanPods(st, mgr)
 
 	if mgr != nil {
