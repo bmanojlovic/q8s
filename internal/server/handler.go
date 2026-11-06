@@ -2653,11 +2653,37 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 		fmt.Printf("traefik config: mkdir %s: %v\n", s.config.TraefikDir, err)
 		return
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		fmt.Printf("traefik config: write %s: %v\n", path, err)
+	// Unchanged content is not rewritten: Traefik's file watcher reloads on
+	// every write, and startup regenerates every Ingress.
+	if old, err := os.ReadFile(path); err == nil && string(old) == content {
+		return
+	}
+	// Write-then-rename so Traefik never reads a half-written file.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
+		fmt.Printf("traefik config: write %s: %v\n", tmp, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		fmt.Printf("traefik config: rename %s: %v\n", path, err)
 		return
 	}
 	fmt.Printf("traefik config: wrote %s\n", filename)
+}
+
+// ReconcileIngressConfigs regenerates the Traefik file of every Ingress at
+// startup, so files rendered by an older q8s pick up the current backend
+// rules. It used to run at the end of ReconcileQuadlets, which skips its tail
+// when there is no systemd manager or daemon-reload fails; Traefik files do
+// not depend on systemd.
+func (s *Server) ReconcileIngressConfigs() {
+	if s.config.TraefikDir == "" {
+		return
+	}
+	for _, ns := range s.config.Store.Namespaces() {
+		s.regenerateIngressConfigs(ns.Name)
+	}
 }
 
 // removeTraefikConfig removes the Traefik dynamic config file for an Ingress.
@@ -2962,10 +2988,6 @@ func (s *Server) ReconcileQuadlets() {
 		}
 	}
 
-	// Reconcile Traefik dynamic configs for existing ingresses
-	for _, ing := range s.config.Store.AllIngresses() {
-		s.generateTraefikConfig(ing)
-	}
 }
 
 // --- Quadlet integration ---
