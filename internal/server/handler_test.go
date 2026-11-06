@@ -1682,6 +1682,56 @@ func TestDeploymentStatusForRollout(t *testing.T) {
 	}
 }
 
+// TestDeploymentTemplateAnnotationRollsQuadlet pins that a template-only
+// annotation change (kubectl rollout restart) actually changes the rendered
+// container unit: without Annotation= lines the file was byte-identical and
+// nothing restarted.
+func TestDeploymentTemplateAnnotationRollsQuadlet(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBody("default", "rollpatch", "nginx:latest"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	containerFile := filepath.Join(quadletDir, "default-rollpatch-0.container")
+	before, err := os.ReadFile(containerFile)
+	if err != nil {
+		t.Fatalf("read generated container unit: %v", err)
+	}
+	if strings.Contains(string(before), "Annotation=") {
+		t.Fatalf("deployment without template annotations should have no Annotation= line:\n%s", before)
+	}
+
+	patch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"annotations": map[string]interface{}{"kubectl.kubernetes.io/restartedAt": "2026-09-20T00:00:00Z"},
+				},
+			},
+		},
+	}
+	resp = do(t, http.MethodPatch, ts.URL+"/apis/apps/v1/namespaces/default/deployments/rollpatch", patch)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	after, err := os.ReadFile(containerFile)
+	if err != nil {
+		t.Fatalf("read regenerated container unit: %v", err)
+	}
+	if string(after) == string(before) {
+		t.Fatalf("template annotation change left the container unit byte-identical:\n%s", after)
+	}
+	want := "Annotation=kubectl.kubernetes.io/restartedAt=2026-09-20T00:00:00Z"
+	if !strings.Contains(string(after), want) {
+		t.Fatalf("regenerated container unit is missing %q:\n%s", want, after)
+	}
+}
+
 func TestAppsDiscovery(t *testing.T) {
 	ts, _ := newTestServer(t)
 

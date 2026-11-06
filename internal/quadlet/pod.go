@@ -221,6 +221,10 @@ func renderContainer(r containerRender) ([]byte, error) {
 		return nil, err
 	}
 
+	if err := writeTemplateAnnotations(&b, pod); err != nil {
+		return nil, err
+	}
+
 	if err := writeHealthCheck(&b, c); err != nil {
 		return nil, err
 	}
@@ -414,5 +418,53 @@ func writePodLabels(b *strings.Builder, pod *corev1.Pod, containerName string) e
 		b.WriteString(fmt.Sprintf("Label=io.kubernetes.container.name=%s\n", containerName))
 	}
 	b.WriteString(ManagedByLabel + "\n")
+	return nil
+}
+
+// lastAppliedConfigAnnotation is the kubectl bookkeeping annotation. It
+// carries the whole applied manifest as JSON, which would bloat every unit
+// and never says anything about the pod template being rolled.
+const lastAppliedConfigAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
+
+// writeTemplateAnnotations writes the Deployment pod-template annotations as
+// Annotation= directives, so kubectl rollout restart
+// (kubectl.kubernetes.io/restartedAt) and checksum/config bumps actually
+// change the rendered unit and restart the pod. The values are written out
+// verbatim (not hashed) because the quadlet files double as a recovery
+// source. Only Deployment-owned pods get this: a plain pod's annotation does
+// not restart it in Kubernetes either, and Jobs/CronJobs must keep their
+// current output.
+func writeTemplateAnnotations(b *strings.Builder, pod *corev1.Pod) error {
+	deploymentOwned := false
+	for _, or := range pod.OwnerReferences {
+		if or.Kind == "Deployment" {
+			deploymentOwned = true
+			break
+		}
+	}
+	if !deploymentOwned || len(pod.Annotations) == 0 {
+		return nil
+	}
+
+	// Sorted so an unchanged pod renders byte-identically every time (the
+	// template hash depends on it).
+	keys := make([]string, 0, len(pod.Annotations))
+	for k := range pod.Annotations {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if k == lastAppliedConfigAnnotation {
+			continue
+		}
+		if err := validateAnnotationKey(k); err != nil {
+			return err
+		}
+		line, err := unitAssignmentLine("Annotation", k, pod.Annotations[k], true)
+		if err != nil {
+			return err
+		}
+		b.WriteString(line)
+	}
 	return nil
 }
