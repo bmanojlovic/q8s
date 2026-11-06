@@ -40,6 +40,10 @@ type Server struct {
 	// handler is mux wrapped in the auth middleware, built once. Wrapping
 	// per request allocated a new middleware closure on every call.
 	handler http.Handler
+	// network holds the podman network operations and the subnet cache. Its
+	// ops stay nil in tests (Manager nil), so nothing can reach real podman
+	// unless cmd/q8s installed the CLI-backed implementation through New.
+	network *networkState
 }
 
 // maxRequestBodyBytes caps request bodies (same order of magnitude as real
@@ -61,9 +65,13 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to set up client-cert auth: %w", err)
 	}
 	s := &Server{
-		config: cfg,
-		mux:    http.NewServeMux(),
-		auth:   auth,
+		config:  cfg,
+		mux:     http.NewServeMux(),
+		auth:    auth,
+		network: &networkState{subnets: make(map[string]string)},
+	}
+	if cfg.Manager != nil {
+		s.network.ops = podmanNetworkOps{manager: cfg.Manager}
 	}
 	s.handler = auth.Handler(s.mux)
 

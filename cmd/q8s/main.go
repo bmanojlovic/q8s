@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -285,6 +286,21 @@ func cmdUninstall() {
 		}
 		for _, ns := range st.Namespaces() {
 			rm(fmt.Sprintf("%s/q8s-%s.network", d.quadletDir, ns.Name))
+		}
+		// Pod sockets (q8s.io/socket-activation) live in the systemd dir next
+		// to q8s's own q8s.socket; only files carrying the pod owner key are
+		// q8s-generated pod sockets.
+		if socks, err := filepath.Glob(filepath.Join(d.systemdDir, "*.socket")); err == nil {
+			for _, path := range socks {
+				content, err := os.ReadFile(path)
+				if err != nil || !strings.Contains(string(content), "\nX-Q8s-Namespace=") {
+					continue
+				}
+				unit := filepath.Base(path)
+				exec.Command("systemctl", append(flags, "stop", unit)...).Run()
+				exec.Command("systemctl", append(flags, "disable", unit)...).Run()
+				rm(path)
+			}
 		}
 		if removed > 0 {
 			fmt.Printf("Removed %d quadlet/timer file(s).\n", removed)
@@ -577,6 +593,7 @@ func cmdServe() {
 	srv.RestoreEnvFiles()
 	ensureNamespaceNetworks(d.quadletDir, mgr, st)
 	srv.ReconcileQuadlets()
+	srv.ReconcileNetworkAttachments()
 	reconcilePodmanPods(st, mgr)
 
 	if mgr != nil {
