@@ -292,30 +292,32 @@ func (s *Server) deployFiles(dir string, files map[string][]byte, units []string
 		fmt.Printf("%v\n", err)
 		return
 	}
-	s.reloadAndRun(units, false, false, changed)
+	s.reloadAndRun(units, false, false, false, changed)
 }
 
 // deployPodFiles is deployFiles for a pod or Deployment instance. In addition
 // to writing the files, it removes units q8s generated for that same pod
 // earlier and no longer renders (a container was renamed or removed, or the
 // pod changed between the standalone and Podman-pod shapes). With restart set
-// it restarts only the services whose unit content actually changed.
-func (s *Server) deployPodFiles(dir, ns, podName string, files map[string][]byte, units []string, restart bool) {
+// it restarts only the services whose unit content actually changed; force
+// restarts them even when only a socket unit changed, because the service
+// must pick up the new listening fds.
+func (s *Server) deployPodFiles(dir, ns, podName string, files map[string][]byte, units []string, restart, force bool) {
 	changed, err := writeQuadletFilesTracked(dir, files)
 	if err != nil {
 		fmt.Printf("%v\n", err)
 		return
 	}
 	removed := s.removeStaleOwnedUnits(dir, ns, podName, filenameSet(files))
-	if restart && len(changed) == 0 && !removed {
+	if restart && len(changed) == 0 && !removed && !force {
 		return
 	}
-	s.reloadAndRun(units, restart, removed, changed)
+	s.reloadAndRun(units, restart, removed, force, changed)
 }
 
 // reloadAndRun daemon-reloads and then starts (or restarts) units. skipReload
 // is set when removeStaleOwnedUnits already reloaded after removing files.
-func (s *Server) reloadAndRun(units []string, restart, skipReload bool, changed map[string]bool) {
+func (s *Server) reloadAndRun(units []string, restart, skipReload, force bool, changed map[string]bool) {
 	mgr := s.config.Manager
 	if mgr == nil {
 		return
@@ -339,7 +341,7 @@ func (s *Server) reloadAndRun(units []string, restart, skipReload bool, changed 
 		}
 		if restart {
 			base := strings.TrimSuffix(unit, ".service")
-			if !podChanged && !changed[base+".container"] {
+			if !force && !podChanged && !changed[base+".container"] {
 				continue
 			}
 			if err := mgr.RestartUnit(unit); err != nil {
@@ -486,13 +488,11 @@ func hasExactLine(content []byte, want string) bool {
 // podQuadletFiles renders every quadlet file for one pod object. A
 // single-container pod keeps today's single .container; a multi-container
 // pod becomes a Podman pod (.pod plus one .container per container).
-func podQuadletFiles(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) (map[string][]byte, error) {
-	// Extra network attachments are wired up in part B; the rendering layer
-	// already supports them (an empty list is today's single namespace net).
+func podQuadletFiles(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []quadlet.NetworkAttachment) (map[string][]byte, error) {
 	if len(pod.Spec.Containers) > 1 {
-		return quadlet.PodUnits(name, pod, configDir, serviceAliases, pvcMap, envFile, nil)
+		return quadlet.PodUnits(name, pod, configDir, serviceAliases, pvcMap, envFile, networks)
 	}
-	content, err := quadlet.Container(name, pod, configDir, serviceAliases, pvcMap, envFile, nil)
+	content, err := quadlet.Container(name, pod, configDir, serviceAliases, pvcMap, envFile, networks)
 	if err != nil {
 		return nil, err
 	}
@@ -648,7 +648,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		// server-side only) that its spec can't be safely turned into a
 		// unit file — e.g. an image reference or env value containing
 		// characters that would corrupt the generated quadlet.
-		if _, err := podQuadletFiles(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec), ""); err != nil {
+		if _, err := podQuadletFiles(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec), "", s.networkAttachments(&pod)); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -731,7 +731,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		// be rendered into a unit file must be rejected here, not stored and
 		// then silently left unapplied (200 OK while the running container
 		// keeps the old spec).
-		if _, err := podQuadletFiles(patched.Name, &patched, s.config.ConfigDir, s.matchingServiceAliases(patched.Namespace, patched.Labels), s.podPVCMap(patched.Namespace, patched.Spec), ""); err != nil {
+		if _, err := podQuadletFiles(patched.Name, &patched, s.config.ConfigDir, s.matchingServiceAliases(patched.Namespace, patched.Labels), s.podPVCMap(patched.Namespace, patched.Spec), "", s.networkAttachments(&patched)); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1896,12 +1896,14 @@ func (s *Server) handleNamespaceCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.generateNamespaceNetwork(created.Name)
+	s.attachNamespaceNetwork(created.Name)
 	encode(w, created, http.StatusCreated)
 }
 
 func (s *Server) purgeNamespaceResources(ns string) {
 	for _, pod := range s.config.Store.Pods(ns) {
 		s.stopPodUnit(pod)
+		s.removePodSockets(ns, pod.Name)
 		s.removePodQuadlet(pod)
 	}
 	for _, dep := range s.config.Store.Deployments(ns) {
@@ -2007,6 +2009,9 @@ func (s *Server) handleNamespaceDelete(w http.ResponseWriter, r *http.Request, n
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 		return
 	}
+	// Disconnect and re-render before the network unit disappears: podman
+	// refuses to remove a network while containers are still joined to it.
+	s.detachNamespaceNetwork(name)
 	s.removeNamespaceNetwork(name)
 	encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 }
@@ -2728,6 +2733,7 @@ func (s *Server) ReconcileQuadlets() {
 
 	needReload := false
 	var startUnits []string
+	var socketUnitsToStart []string
 
 	// Sweep stale legacy *.socket files left by old q8s versions before
 	// regenerating anything; fold the removal into the reload below.
@@ -2761,16 +2767,21 @@ func (s *Server) ReconcileQuadlets() {
 			if len(dep.Spec.Template.Spec.Containers) > 1 {
 				f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, dep.Namespace, instanceName)
 			}
+			pod := s.materializeDeploymentInstance(dep, i)
+			socketUnits, socketChanged := s.reconcilePodSockets(pod, instanceName)
+			socketUnitsToStart = append(socketUnitsToStart, socketUnits...)
+			if socketChanged {
+				needReload = true
+			}
 			if !missing(f) {
 				continue
 			}
-			pod := s.materializeDeploymentInstance(dep, i)
 			resolved, envFile, err := s.resolveEnvFrom(pod)
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
 			}
-			files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile)
+			files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile, s.networkAttachments(resolved))
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
@@ -2789,6 +2800,15 @@ func (s *Server) ReconcileQuadlets() {
 	}
 
 	for _, pod := range s.config.Store.AllPods() {
+		// Deployment instances were handled by their Deployment above, so
+		// reconciling them again here would only duplicate socket work.
+		if !isDeploymentOwned(pod) {
+			socketUnits, socketChanged := s.reconcilePodSockets(pod, pod.Name)
+			socketUnitsToStart = append(socketUnitsToStart, socketUnits...)
+			if socketChanged {
+				needReload = true
+			}
+		}
 		f := fmt.Sprintf("%s/%s-%s.container", quadletDir, pod.Namespace, pod.Name)
 		if len(pod.Spec.Containers) > 1 {
 			f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, pod.Namespace, pod.Name)
@@ -2801,7 +2821,7 @@ func (s *Server) ReconcileQuadlets() {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
 		}
-		files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
+		files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved))
 		if err != nil {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
@@ -2921,13 +2941,18 @@ func (s *Server) ReconcileQuadlets() {
 	}
 
 	mgr := s.config.Manager
-	if !needReload || mgr == nil {
+	if mgr == nil {
 		return
 	}
-	if err := mgr.DaemonReload(); err != nil {
-		fmt.Printf("reconcile: daemon-reload failed: %v\n", err)
-		return
+	if needReload {
+		if err := mgr.DaemonReload(); err != nil {
+			fmt.Printf("reconcile: daemon-reload failed: %v\n", err)
+			return
+		}
 	}
+	// Sockets first: a socket-activated service only receives LISTEN_FDS
+	// when the .socket unit is already active at start time.
+	s.startSocketUnits(socketUnitsToStart)
 	for _, unit := range startUnits {
 		if err := mgr.StartUnit(unit); err != nil {
 			fmt.Printf("reconcile: start %s: %v\n", unit, err)
@@ -2983,12 +3008,13 @@ func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
 		s.podMaterializeFailed(pod, "resolving env references", err)
 		return
 	}
-	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
+	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved))
 	if err != nil {
 		s.podMaterializeFailed(pod, "generating quadlet", err)
 		return
 	}
-	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), false)
+	s.deployPodSockets(resolved, pod.Name)
+	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), false, false)
 }
 
 // applyNodePorts returns a copy of pod with any NodePort-Service-driven host
@@ -3024,12 +3050,13 @@ func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
 		s.podMaterializeFailed(pod, "resolving env references", err)
 		return
 	}
-	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile)
+	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved))
 	if err != nil {
 		s.podMaterializeFailed(pod, "generating quadlet", err)
 		return
 	}
-	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), true)
+	socketChanged := s.deployPodSockets(resolved, pod.Name)
+	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), true, socketChanged)
 }
 
 func (s *Server) stopPodUnit(pod *corev1.Pod) {
@@ -3605,11 +3632,12 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return
 	}
-	files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile)
+	files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile, s.networkAttachments(resolved))
 	if err != nil {
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return
 	}
+	socketChanged := s.deployPodSockets(pod, instanceName)
 	changed, err := writeQuadletFilesTracked(s.config.QuadletDir, files)
 	if err != nil {
 		fmt.Printf("write deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
@@ -3624,10 +3652,10 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 	if _, err := s.config.Store.GetPod(dep.Namespace, instanceName); err != nil {
 		s.config.Store.CreatePod(pod)
 	}
-	if restart && len(changed) == 0 && !removed {
+	if restart && len(changed) == 0 && !removed && !socketChanged {
 		return
 	}
-	s.reloadAndRun(podUnitNames(dep.Namespace, instanceName, pod.Spec.Containers), restart, removed, changed)
+	s.reloadAndRun(podUnitNames(dep.Namespace, instanceName, pod.Spec.Containers), restart, removed, socketChanged, changed)
 }
 
 func (s *Server) stopDeploymentUnits(dep *appsv1.Deployment) {
@@ -3644,13 +3672,17 @@ func (s *Server) deleteDeploymentPods(dep *appsv1.Deployment) {
 }
 
 func (s *Server) removeDeploymentQuadlets(dep *appsv1.Deployment) {
-	if s.config.QuadletDir == "" {
-		return
-	}
 	var paths []string
 	for i := int32(0); i < deploymentReplicas(dep); i++ {
 		instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+		s.removePodSockets(dep.Namespace, instanceName)
+		if s.config.QuadletDir == "" {
+			continue
+		}
 		paths = append(paths, podQuadletPaths(s.config.QuadletDir, dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)...)
+	}
+	if s.config.QuadletDir == "" {
+		return
 	}
 	s.reloadAfterRemove(paths...)
 }
@@ -3665,6 +3697,7 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 	for i := newR; i < oldR; i++ {
 		instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
 		s.stopPodByName(dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)
+		s.removePodSockets(dep.Namespace, instanceName)
 		s.reloadAfterRemove(podQuadletPaths(s.config.QuadletDir, dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)...)
 		// Remove the store pod immediately too. The reconcile loop would
 		// eventually prune it once the container disappears, but until then
@@ -4288,6 +4321,7 @@ func (s *Server) deletePodByName(ns, name string) error {
 		return err
 	}
 	s.stopPodUnit(pod)
+	s.removePodSockets(ns, name)
 	s.removePodQuadlet(pod)
 	if err := s.config.Store.DeletePod(ns, name); err != nil {
 		return err

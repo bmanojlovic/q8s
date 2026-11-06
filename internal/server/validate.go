@@ -306,7 +306,8 @@ func validateSingleContainer(kind string, spec *corev1.PodSpec, allowMultipleCon
 }
 
 // annAttachAllNetworks asks q8s to attach the pod to every namespace
-// network. Part B consumes it; until then it is only validated.
+// network. Only pods carrying this opted-in annotation may join a network
+// outside their own namespace.
 const annAttachAllNetworks = "q8s.io/attach-all-networks"
 
 // validatePodAnnotations rejects q8s pod annotations that cannot be honored
@@ -339,6 +340,9 @@ func validatePodAnnotations(kind string, spec *corev1.PodSpec, annotations map[s
 		}
 		if attachAll && containers > 1 {
 			return fmt.Errorf("%s: annotation %s is not supported on multi-container pods", kind, annAttachAllNetworks)
+		}
+		if attachAll && replicas > 1 {
+			return fmt.Errorf("%s: annotation %s requires replicas <= 1, got %d (every instance would claim the same fixed address in each namespace network)", kind, annAttachAllNetworks, replicas)
 		}
 	}
 	return nil

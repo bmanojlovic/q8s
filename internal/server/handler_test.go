@@ -3598,6 +3598,17 @@ func TestAnnotationValidation422(t *testing.T) {
 			list: func(st *store.Store) int { return len(st.Deployments("default")) },
 		},
 		{
+			name: "deployment attach-all-networks with replicas 2",
+			path: "/apis/apps/v1/namespaces/default/deployments",
+			body: func() map[string]interface{} {
+				b := deployBody("default", "two-attached", "traefik:v3")
+				b["spec"].(map[string]interface{})["replicas"] = 2
+				annotateDeploymentTemplate(b, "q8s.io/attach-all-networks", "true")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Deployments("default")) },
+		},
+		{
 			name: "deployment socket activation with sidecar",
 			path: "/apis/apps/v1/namespaces/default/deployments",
 			body: func() map[string]interface{} {
