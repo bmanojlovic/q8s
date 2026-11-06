@@ -938,6 +938,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			return
 		}
 		s.config.Store.UpdateService(created)
+		s.regenerateIngressConfigs(ns)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
 		svc, err := s.config.Store.GetService(ns, name)
@@ -1009,6 +1010,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		s.config.Store.UpdateService(updated)
 		// Clean up legacy per-port socket files (see removeLegacyServiceSockets).
 		s.removeLegacyServiceSockets(svc)
+		s.regenerateIngressConfigs(ns)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
 		if name == "" {
@@ -1988,6 +1990,14 @@ func (s *Server) purgeNamespaceResources(ns string) {
 	for _, ing := range s.config.Store.Ingresses(ns) {
 		s.removeTraefikConfig(ing.Namespace, ing.Name)
 	}
+	// Middlewares and TCP routes live in the same directory and would
+	// otherwise keep Traefik config pointing at a deleted namespace.
+	for _, mw := range s.config.Store.Middlewares(ns) {
+		s.removeTraefikConfigFile(middlewareFilename(mw.Namespace, mw.Name))
+	}
+	for _, irt := range s.config.Store.IngressRouteTCPs(ns) {
+		s.removeTraefikConfigFile(tcpFilename(irt.Namespace, irt.Name))
+	}
 	// Services: drop legacy per-port socket files (see
 	// removeLegacyServiceSockets) along with them.
 	for _, svc := range s.config.Store.Services(ns) {
@@ -2574,7 +2584,7 @@ func parseTraefikRouterOptions(annotations map[string]string) traefikRouterOptio
 	}
 	for _, mw := range splitAnnotationList(annotations[annRouterMiddlewares]) {
 		if validateTraefikMiddlewareRef(annRouterMiddlewares, mw) == nil {
-			opts.middlewares = append(opts.middlewares, mw)
+			opts.middlewares = append(opts.middlewares, middlewareReferenceForFileProvider(mw))
 		}
 	}
 	if v, ok := annotations[annRouterTLS]; ok {
@@ -2592,6 +2602,18 @@ func parseTraefikRouterOptions(annotations map[string]string) traefikRouterOptio
 		}
 	}
 	return opts
+}
+
+// middlewareReferenceForFileProvider rewrites a Traefik Kubernetes-provider
+// middleware reference to the file provider q8s actually serves Middlewares
+// through. <ns>-<name>@kubernetescrd becomes <ns>-<name>@file; references
+// without a provider or with any other provider are passed through unchanged.
+func middlewareReferenceForFileProvider(ref string) string {
+	const suffix = "@kubernetescrd"
+	if strings.HasSuffix(ref, suffix) {
+		return strings.TrimSuffix(ref, suffix) + "@file"
+	}
+	return ref
 }
 
 // yamlFlowList renders items as a quoted YAML flow sequence, the same quoting
@@ -4286,19 +4308,22 @@ func (s *Server) writeEnvFile(ns, name string, containers []corev1.Container, se
 	return path, nil
 }
 
-// ingressBackendServers resolves the backend URLs for one ingress path: the
-// Service's selector -> matching pods -> one URL per pod, in the spirit of
-// k8s Endpoints. A pod with an explicit hostPort is dialed on the host (that
-// is an intentional publish); all other non-hostNetwork pods are dialed by
-// their cluster DNS name, <pod>.<ns>:<containerPort>, which resolves on every
-// namespace network Traefik is attached to (no host publish involved).
-//
-// hostNetwork without a hostPort yields no server: the pod is on the host
-// netns but publishes nothing addressable.
-//
-// Returns nil when there is no such Service or no pod yields an address;
-// callers fall back to the ingress-declared port.
-func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portName string) []string {
+// backendTarget is one pod/container port a Service selector resolves to.
+// Both the Ingress URL renderer and the IngressRouteTCP address renderer use
+// it so the two resolve Service ports, targetPorts and pods identically.
+type backendTarget struct {
+	podName       string
+	hostNetwork   bool
+	containerPort int32
+	hostIP        string
+	hostPort      int32
+}
+
+// serviceBackendTargets resolves one Service port (number or name) to its
+// targetPort and the selected pods' container ports, in the spirit of k8s
+// Endpoints. Terminal pods are skipped. hostNetwork pods carry their hostPort
+// (0 when nothing is published); every other pod carries the container port.
+func (s *Server) serviceBackendTargets(ns, svcName string, svcPort int32, portName string) []backendTarget {
 	svc, err := s.config.Store.GetService(ns, svcName)
 	if err != nil {
 		return nil
@@ -4319,7 +4344,7 @@ func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portNa
 		}
 	}
 
-	var servers []string
+	var targets []backendTarget
 	for _, pod := range s.config.Store.Pods(ns) {
 		if !matchesEqualitySelector(pod.Labels, svc.Spec.Selector) {
 			continue
@@ -4335,22 +4360,47 @@ func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portNa
 				if cp.ContainerPort != targetNum && cp.Name != targetName {
 					continue
 				}
-				// Traefik is a container on the namespace networks, so a
-				// pod on those networks is dialed by name like a k8s
-				// endpoint (pod address, never the hostPort): a hostPort is
-				// an extra publish, and a loopback hostIP would be Traefik's
-				// own loopback (tic-090e). Only a hostNetwork pod is reached
-				// through the host.
-				switch {
-				case !pod.Spec.HostNetwork:
-					servers = append(servers, fmt.Sprintf("http://%s.%s:%d", pod.Name, ns, cp.ContainerPort))
-				case cp.HostPort != 0:
-					servers = append(servers, "http://"+backendHostPort(cp.HostIP, cp.HostPort))
-				}
+				targets = append(targets, backendTarget{
+					podName:       pod.Name,
+					hostNetwork:   pod.Spec.HostNetwork,
+					containerPort: cp.ContainerPort,
+					hostIP:        cp.HostIP,
+					hostPort:      cp.HostPort,
+				})
 				// A pod lists each container port once; stop at the first
 				// matching entry for this container.
 				break
 			}
+		}
+	}
+	return targets
+}
+
+// ingressBackendServers resolves the backend URLs for one ingress path: the
+// Service's selector -> matching pods -> one URL per pod, in the spirit of
+// k8s Endpoints. A pod with an explicit hostPort is dialed on the host (that
+// is an intentional publish); all other non-hostNetwork pods are dialed by
+// their cluster DNS name, <pod>.<ns>:<containerPort>, which resolves on every
+// namespace network Traefik is attached to (no host publish involved).
+//
+// hostNetwork without a hostPort yields no server: the pod is on the host
+// netns but publishes nothing addressable.
+//
+// Returns nil when there is no such Service or no pod yields an address;
+// callers fall back to the ingress-declared port.
+func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portName string) []string {
+	var servers []string
+	for _, target := range s.serviceBackendTargets(ns, svcName, svcPort, portName) {
+		// Traefik is a container on the namespace networks, so a pod on those
+		// networks is dialed by name like a k8s endpoint (pod address, never
+		// the hostPort): a hostPort is an extra publish, and a loopback hostIP
+		// would be Traefik's own loopback (tic-090e). Only a hostNetwork pod
+		// is reached through the host.
+		switch {
+		case !target.hostNetwork:
+			servers = append(servers, fmt.Sprintf("http://%s.%s:%d", target.podName, ns, target.containerPort))
+		case target.hostPort != 0:
+			servers = append(servers, "http://"+backendHostPort(target.hostIP, target.hostPort))
 		}
 	}
 	return servers
@@ -4371,9 +4421,11 @@ func backendHostPort(hostIP string, port int32) string {
 }
 
 // regenerateIngressConfigs rewrites the Traefik dynamic config for every
-// ingress in a namespace. Called whenever pod churn can change the backend
-// set a selector resolves to (pod create/delete, deployment scale/redeploy)
-// so the servers list tracks reality the way Endpoints do.
+// Ingress, IngressRouteTCP and Middleware in a namespace. Called whenever pod
+// or Service churn can change the backend set a selector resolves to (pod
+// create/delete, deployment scale/redeploy, Service create/update/delete) so
+// the servers list tracks reality the way Endpoints do. Middleware files have
+// no backends but are cheap to refresh and unchanged files are not rewritten.
 func (s *Server) regenerateIngressConfigs(ns string) {
 	if s.config.TraefikDir == "" {
 		return
@@ -4381,6 +4433,9 @@ func (s *Server) regenerateIngressConfigs(ns string) {
 	for _, ing := range s.config.Store.Ingresses(ns) {
 		s.generateTraefikConfig(ing)
 	}
+	// TCP files have backends too, so they follow the same pod/Service churn.
+	s.regenerateTCPConfigs(ns)
+	s.regenerateMiddlewareConfigs(ns)
 }
 
 // --- collection delete (deletecollection) ---
@@ -4431,6 +4486,7 @@ func (s *Server) deleteServiceByName(ns, name string) error {
 	if svc != nil {
 		s.removeLegacyServiceSockets(svc)
 	}
+	s.regenerateIngressConfigs(ns)
 	return nil
 }
 

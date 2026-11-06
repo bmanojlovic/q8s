@@ -33,6 +33,8 @@ internal/
     handler.go    All resource handlers (Pod, Service, PVC, ConfigMap, Secret, Deployment, Job, CronJob)
     discovery.go  API discovery, /version, /api/v1/nodes, storage.k8s.io/v1/storageclasses, apiextensions.k8s.io
     crds.go       Embedded read-only CustomResourceDefinition list and table
+    traefik.go    traefik.io/v1alpha1 Middleware and IngressRouteTCP handlers, rendering
+    traefik_validate.go  Validation for the Traefik CRD subset
     apply.go      Server-side apply translation to create/merge-patch
     openapi_v2.json  Generated Swagger 2.0 schema for client-side validation
     crds.json     Generated Traefik CRD list
@@ -42,6 +44,10 @@ internal/
     selector.go   Label selector filtering
     exec.go       kubectl exec WebSocket handler
     validate.go   Request validation
+
+  traefik/
+    types.go      Traefik v1alpha1 Middleware and IngressRouteTCP subset types
+    deepcopy.go   Hand-written DeepCopy/DeepCopyObject for runtime.Object
 
   store/
     store.go      In-memory resource store with JSON persistence

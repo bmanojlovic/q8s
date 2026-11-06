@@ -147,6 +147,8 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/apis/batch/v1", s.handleBatchV1)
 	s.mux.HandleFunc("/apis/networking.k8s.io", s.handleNetworkingRoot)
 	s.mux.HandleFunc("/apis/networking.k8s.io/v1", s.handleNetworkingV1)
+	s.mux.HandleFunc("/apis/traefik.io", s.handleTraefikRoot)
+	s.mux.HandleFunc("/apis/traefik.io/v1alpha1", s.handleTraefikV1Alpha1)
 	s.mux.HandleFunc("/apis/apiextensions.k8s.io", s.handleAPIExtensionsRoot)
 	s.mux.HandleFunc("/apis/apiextensions.k8s.io/v1", s.handleAPIExtensionsV1)
 	s.mux.HandleFunc(crdPath, s.handleCRDs)
@@ -238,6 +240,21 @@ func (s *Server) setupRoutes() {
 	// networking.k8s.io/v1 namespaced resources: /apis/networking.k8s.io/v1/namespaces/{ns}/ingresses[/{name}]
 	s.mux.HandleFunc("/apis/networking.k8s.io/v1/namespaces/", s.handleNetworkingNamespaced)
 
+	// traefik.io/v1alpha1 cluster-wide lists
+	for _, res := range []string{"middlewares", "ingressroutetcps"} {
+		res := res
+		s.mux.HandleFunc("/apis/traefik.io/v1alpha1/"+res, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			s.handleTraefikClusterList(w, r, res)
+		})
+	}
+
+	// traefik.io/v1alpha1 namespaced resources: /apis/traefik.io/v1alpha1/namespaces/{ns}/{resource}[/{name}]
+	s.mux.HandleFunc("/apis/traefik.io/v1alpha1/namespaces/", s.handleTraefikNamespaced)
+
 	// metrics.k8s.io API group (kubectl top nodes/pods)
 	s.mux.HandleFunc("/apis/metrics.k8s.io", s.handleMetricsRoot)
 	s.mux.HandleFunc("/apis/metrics.k8s.io/v1beta1", s.handleMetricsV1beta1)
@@ -283,6 +300,28 @@ func parseNamespaceResource(path string) (namespace, resource, name string, ok b
 // parseBatchNamespaceResource parses /apis/batch/v1/namespaces/{ns}/{resource}[/{name}]
 func parseBatchNamespaceResource(path string) (namespace, resource, name string, ok bool) {
 	parts := strings.TrimPrefix(path, "/apis/batch/v1/namespaces/")
+	if parts == path {
+		return "", "", "", false
+	}
+	parts = strings.TrimSuffix(parts, "/")
+	if parts == "" {
+		return "", "", "", false
+	}
+	pieces := strings.SplitN(parts, "/", 3)
+	ns := pieces[0]
+	if len(pieces) == 1 {
+		return ns, "", "", true
+	}
+	resource = pieces[1]
+	if len(pieces) == 2 {
+		return ns, resource, "", true
+	}
+	return ns, resource, pieces[2], true
+}
+
+// parseTraefikNamespaceResource parses /apis/traefik.io/v1alpha1/namespaces/{ns}/{resource}[/{name}]
+func parseTraefikNamespaceResource(path string) (namespace, resource, name string, ok bool) {
+	parts := strings.TrimPrefix(path, "/apis/traefik.io/v1alpha1/namespaces/")
 	if parts == path {
 		return "", "", "", false
 	}

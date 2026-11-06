@@ -155,6 +155,23 @@ spec:
     kind: IngressRouteTCP
   versions:
   - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              routes:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    port:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      x-kubernetes-int-or-string: true
 `
 
 func TestBuildCRDList(t *testing.T) {
@@ -201,5 +218,38 @@ metadata:
   name: middlewares.traefik.io
 `)); err == nil {
 		t.Fatal("expected an error when wanted CRDs are absent")
+	}
+}
+func TestAddCRDDefinitions(t *testing.T) {
+	trimmed := []byte(`{"swagger":"2.0","info":{"title":"q8s","version":"v1"},"paths":{},"definitions":{"x":{"type":"object"}}}`)
+	out, err := addCRDDefinitions(trimmed, []byte(tinyCRDs))
+	if err != nil {
+		t.Fatalf("addCRDDefinitions: %v", err)
+	}
+	var doc struct {
+		Definitions map[string]map[string]interface{} `json:"definitions"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	for _, name := range []string{
+		"io.traefik.v1alpha1.Middleware",
+		"io.traefik.v1alpha1.MiddlewareList",
+		"io.traefik.v1alpha1.IngressRouteTCP",
+		"io.traefik.v1alpha1.IngressRouteTCPList",
+	} {
+		if _, ok := doc.Definitions[name]; !ok {
+			t.Errorf("missing definition %q", name)
+		}
+	}
+	raw, err := json.Marshal(doc.Definitions["io.traefik.v1alpha1.IngressRouteTCP"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "anyOf") {
+		t.Fatalf("anyOf survived sanitization: %s", raw)
+	}
+	if !strings.Contains(string(raw), "x-kubernetes-int-or-string") {
+		t.Fatalf("int-or-string marker was dropped: %s", raw)
 	}
 }

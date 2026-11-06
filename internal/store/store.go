@@ -16,39 +16,44 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"q8s/internal/quadlet"
+	"q8s/internal/traefik"
 )
 
 // snapshot is the on-disk JSON format for the store.
 type snapshot struct {
-	ResourceVer int                             `json:"resourceVersion"`
-	Pods        []*corev1.Pod                   `json:"pods,omitempty"`
-	Services    []*corev1.Service               `json:"services,omitempty"`
-	PVCs        []*corev1.PersistentVolumeClaim `json:"pvcs,omitempty"`
-	ConfigMaps  []*corev1.ConfigMap             `json:"configMaps,omitempty"`
-	Secrets     []*corev1.Secret                `json:"secrets,omitempty"`
-	Namespaces  []*corev1.Namespace             `json:"namespaces,omitempty"`
-	Jobs        []*batchv1.Job                  `json:"jobs,omitempty"`
-	CronJobs    []*batchv1.CronJob              `json:"cronJobs,omitempty"`
-	Deployments []*appsv1.Deployment            `json:"deployments,omitempty"`
-	Ingresses   []*networkingv1.Ingress         `json:"ingresses,omitempty"`
+	ResourceVer      int                             `json:"resourceVersion"`
+	Pods             []*corev1.Pod                   `json:"pods,omitempty"`
+	Services         []*corev1.Service               `json:"services,omitempty"`
+	PVCs             []*corev1.PersistentVolumeClaim `json:"pvcs,omitempty"`
+	ConfigMaps       []*corev1.ConfigMap             `json:"configMaps,omitempty"`
+	Secrets          []*corev1.Secret                `json:"secrets,omitempty"`
+	Namespaces       []*corev1.Namespace             `json:"namespaces,omitempty"`
+	Jobs             []*batchv1.Job                  `json:"jobs,omitempty"`
+	CronJobs         []*batchv1.CronJob              `json:"cronJobs,omitempty"`
+	Deployments      []*appsv1.Deployment            `json:"deployments,omitempty"`
+	Ingresses        []*networkingv1.Ingress         `json:"ingresses,omitempty"`
+	Middlewares      []*traefik.Middleware           `json:"middlewares,omitempty"`
+	IngressRouteTCPs []*traefik.IngressRouteTCP      `json:"ingressRouteTCPs,omitempty"`
 }
 
 // Store is an in-memory store for k8s resources.
 type Store struct {
-	mu          sync.RWMutex
-	saveMu      sync.Mutex // serialises file writes
-	dataFile    string
-	pods        map[types.NamespacedName]*corev1.Pod
-	services    map[types.NamespacedName]*corev1.Service
-	pvcs        map[types.NamespacedName]*corev1.PersistentVolumeClaim
-	configmaps  map[types.NamespacedName]*corev1.ConfigMap
-	secrets     map[types.NamespacedName]*corev1.Secret
-	namespaces  map[types.NamespacedName]*corev1.Namespace
-	jobs        map[types.NamespacedName]*batchv1.Job
-	cronjobs    map[types.NamespacedName]*batchv1.CronJob
-	deployments map[types.NamespacedName]*appsv1.Deployment
-	ingresses   map[types.NamespacedName]*networkingv1.Ingress
-	resourceVer int
+	mu               sync.RWMutex
+	saveMu           sync.Mutex // serialises file writes
+	dataFile         string
+	pods             map[types.NamespacedName]*corev1.Pod
+	services         map[types.NamespacedName]*corev1.Service
+	pvcs             map[types.NamespacedName]*corev1.PersistentVolumeClaim
+	configmaps       map[types.NamespacedName]*corev1.ConfigMap
+	secrets          map[types.NamespacedName]*corev1.Secret
+	namespaces       map[types.NamespacedName]*corev1.Namespace
+	jobs             map[types.NamespacedName]*batchv1.Job
+	cronjobs         map[types.NamespacedName]*batchv1.CronJob
+	deployments      map[types.NamespacedName]*appsv1.Deployment
+	ingresses        map[types.NamespacedName]*networkingv1.Ingress
+	middlewares      map[types.NamespacedName]*traefik.Middleware
+	ingressRouteTCPs map[types.NamespacedName]*traefik.IngressRouteTCP
+	resourceVer      int
 
 	notifyMu sync.Mutex
 	notifyCh chan struct{}
@@ -148,17 +153,19 @@ func (s *Store) Events(ns string) []*corev1.Event {
 
 func newEmpty() *Store {
 	return &Store{
-		pods:        make(map[types.NamespacedName]*corev1.Pod),
-		services:    make(map[types.NamespacedName]*corev1.Service),
-		pvcs:        make(map[types.NamespacedName]*corev1.PersistentVolumeClaim),
-		configmaps:  make(map[types.NamespacedName]*corev1.ConfigMap),
-		secrets:     make(map[types.NamespacedName]*corev1.Secret),
-		namespaces:  make(map[types.NamespacedName]*corev1.Namespace),
-		jobs:        make(map[types.NamespacedName]*batchv1.Job),
-		cronjobs:    make(map[types.NamespacedName]*batchv1.CronJob),
-		deployments: make(map[types.NamespacedName]*appsv1.Deployment),
-		ingresses:   make(map[types.NamespacedName]*networkingv1.Ingress),
-		notifyCh:    make(chan struct{}),
+		pods:             make(map[types.NamespacedName]*corev1.Pod),
+		services:         make(map[types.NamespacedName]*corev1.Service),
+		pvcs:             make(map[types.NamespacedName]*corev1.PersistentVolumeClaim),
+		configmaps:       make(map[types.NamespacedName]*corev1.ConfigMap),
+		secrets:          make(map[types.NamespacedName]*corev1.Secret),
+		namespaces:       make(map[types.NamespacedName]*corev1.Namespace),
+		jobs:             make(map[types.NamespacedName]*batchv1.Job),
+		cronjobs:         make(map[types.NamespacedName]*batchv1.CronJob),
+		deployments:      make(map[types.NamespacedName]*appsv1.Deployment),
+		ingresses:        make(map[types.NamespacedName]*networkingv1.Ingress),
+		middlewares:      make(map[types.NamespacedName]*traefik.Middleware),
+		ingressRouteTCPs: make(map[types.NamespacedName]*traefik.IngressRouteTCP),
+		notifyCh:         make(chan struct{}),
 	}
 }
 
@@ -245,6 +252,12 @@ func Load(dataFile string) (*Store, error) {
 	}
 	for _, ing := range snap.Ingresses {
 		s.ingresses[types.NamespacedName{Namespace: ing.Namespace, Name: ing.Name}] = ing
+	}
+	for _, mw := range snap.Middlewares {
+		s.middlewares[types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}] = mw
+	}
+	for _, irt := range snap.IngressRouteTCPs {
+		s.ingressRouteTCPs[types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}] = irt
 	}
 	s.ensureDefaultNamespace()
 	return s, nil
@@ -353,6 +366,12 @@ func (s *Store) snapshot() snapshot {
 	for _, ing := range s.ingresses {
 		snap.Ingresses = append(snap.Ingresses, ing.DeepCopy())
 	}
+	for _, mw := range s.middlewares {
+		snap.Middlewares = append(snap.Middlewares, mw.DeepCopy())
+	}
+	for _, irt := range s.ingressRouteTCPs {
+		snap.IngressRouteTCPs = append(snap.IngressRouteTCPs, irt.DeepCopy())
+	}
 	return snap
 }
 
@@ -423,6 +442,12 @@ func (s *Store) Namespaces() []*corev1.Namespace {
 		phantom(k.Namespace)
 	}
 	for k := range s.ingresses {
+		phantom(k.Namespace)
+	}
+	for k := range s.middlewares {
+		phantom(k.Namespace)
+	}
+	for k := range s.ingressRouteTCPs {
 		phantom(k.Namespace)
 	}
 	return result
@@ -550,6 +575,16 @@ func (s *Store) PurgeNamespace(name string) {
 	for key := range s.ingresses {
 		if key.Namespace == name {
 			delete(s.ingresses, key)
+		}
+	}
+	for key := range s.middlewares {
+		if key.Namespace == name {
+			delete(s.middlewares, key)
+		}
+	}
+	for key := range s.ingressRouteTCPs {
+		if key.Namespace == name {
+			delete(s.ingressRouteTCPs, key)
 		}
 	}
 	s.resourceVer++
@@ -1627,6 +1662,192 @@ func (s *Store) UpdateIngress(ing *networkingv1.Ingress) (*networkingv1.Ingress,
 	s.mu.Unlock()
 	go s.save()
 	return ing.DeepCopy(), nil
+}
+
+// --- Middlewares ---
+
+// AllMiddlewares returns all Middlewares across all namespaces.
+func (s *Store) AllMiddlewares() []*traefik.Middleware {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*traefik.Middleware, 0, len(s.middlewares))
+	for _, mw := range s.middlewares {
+		result = append(result, mw.DeepCopy())
+	}
+	return result
+}
+
+// Middlewares returns all Middlewares in a namespace.
+func (s *Store) Middlewares(ns string) []*traefik.Middleware {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*traefik.Middleware
+	for key, mw := range s.middlewares {
+		if key.Namespace == ns {
+			result = append(result, mw.DeepCopy())
+		}
+	}
+	return result
+}
+
+// CreateMiddleware creates a Middleware.
+func (s *Store) CreateMiddleware(mw *traefik.Middleware) (*traefik.Middleware, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}
+	if _, ok := s.middlewares[key]; ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("middleware %q already exists in namespace %q", mw.Name, mw.Namespace)
+	}
+	mw.ResourceVersion = s.incRV()
+	mw.UID = types.UID(fmt.Sprintf("q8s-mw-%s-%s", mw.Namespace, mw.Name))
+	if mw.Labels == nil {
+		mw.Labels = make(map[string]string)
+	}
+	if mw.CreationTimestamp.IsZero() {
+		mw.CreationTimestamp = metav1.Now()
+	}
+	s.middlewares[key] = mw
+	s.mu.Unlock()
+	go s.save()
+	return mw.DeepCopy(), nil
+}
+
+// GetMiddleware gets a Middleware.
+func (s *Store) GetMiddleware(ns, name string) (*traefik.Middleware, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	mw, ok := s.middlewares[types.NamespacedName{Namespace: ns, Name: name}]
+	if !ok {
+		return nil, fmt.Errorf("middleware %q not found in namespace %q", name, ns)
+	}
+	return mw.DeepCopy(), nil
+}
+
+// DeleteMiddleware deletes a Middleware.
+func (s *Store) DeleteMiddleware(ns, name string) error {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: ns, Name: name}
+	if _, ok := s.middlewares[key]; !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("middleware %q not found in namespace %q", name, ns)
+	}
+	delete(s.middlewares, key)
+	s.mu.Unlock()
+	go s.save()
+	return nil
+}
+
+// UpdateMiddleware replaces a Middleware in-place, preserving UID.
+func (s *Store) UpdateMiddleware(mw *traefik.Middleware) (*traefik.Middleware, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}
+	existing, ok := s.middlewares[key]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("middleware %q not found in namespace %q", mw.Name, mw.Namespace)
+	}
+	mw.UID = existing.UID
+	if mw.CreationTimestamp.IsZero() {
+		mw.CreationTimestamp = existing.CreationTimestamp
+	}
+	mw.ResourceVersion = s.incRV()
+	s.middlewares[key] = mw
+	s.mu.Unlock()
+	go s.save()
+	return mw.DeepCopy(), nil
+}
+
+// --- IngressRouteTCPs ---
+
+// AllIngressRouteTCPs returns all IngressRouteTCPs across all namespaces.
+func (s *Store) AllIngressRouteTCPs() []*traefik.IngressRouteTCP {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*traefik.IngressRouteTCP, 0, len(s.ingressRouteTCPs))
+	for _, irt := range s.ingressRouteTCPs {
+		result = append(result, irt.DeepCopy())
+	}
+	return result
+}
+
+// IngressRouteTCPs returns all IngressRouteTCPs in a namespace.
+func (s *Store) IngressRouteTCPs(ns string) []*traefik.IngressRouteTCP {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*traefik.IngressRouteTCP
+	for key, irt := range s.ingressRouteTCPs {
+		if key.Namespace == ns {
+			result = append(result, irt.DeepCopy())
+		}
+	}
+	return result
+}
+
+// CreateIngressRouteTCP creates an IngressRouteTCP.
+func (s *Store) CreateIngressRouteTCP(irt *traefik.IngressRouteTCP) (*traefik.IngressRouteTCP, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}
+	if _, ok := s.ingressRouteTCPs[key]; ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("ingressroutetcp %q already exists in namespace %q", irt.Name, irt.Namespace)
+	}
+	irt.ResourceVersion = s.incRV()
+	irt.UID = types.UID(fmt.Sprintf("q8s-irtcp-%s-%s", irt.Namespace, irt.Name))
+	if irt.Labels == nil {
+		irt.Labels = make(map[string]string)
+	}
+	if irt.CreationTimestamp.IsZero() {
+		irt.CreationTimestamp = metav1.Now()
+	}
+	s.ingressRouteTCPs[key] = irt
+	s.mu.Unlock()
+	go s.save()
+	return irt.DeepCopy(), nil
+}
+
+// GetIngressRouteTCP gets an IngressRouteTCP.
+func (s *Store) GetIngressRouteTCP(ns, name string) (*traefik.IngressRouteTCP, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	irt, ok := s.ingressRouteTCPs[types.NamespacedName{Namespace: ns, Name: name}]
+	if !ok {
+		return nil, fmt.Errorf("ingressroutetcp %q not found in namespace %q", name, ns)
+	}
+	return irt.DeepCopy(), nil
+}
+
+// DeleteIngressRouteTCP deletes an IngressRouteTCP.
+func (s *Store) DeleteIngressRouteTCP(ns, name string) error {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: ns, Name: name}
+	if _, ok := s.ingressRouteTCPs[key]; !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("ingressroutetcp %q not found in namespace %q", name, ns)
+	}
+	delete(s.ingressRouteTCPs, key)
+	s.mu.Unlock()
+	go s.save()
+	return nil
+}
+
+// UpdateIngressRouteTCP replaces an IngressRouteTCP in-place, preserving UID.
+func (s *Store) UpdateIngressRouteTCP(irt *traefik.IngressRouteTCP) (*traefik.IngressRouteTCP, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}
+	existing, ok := s.ingressRouteTCPs[key]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("ingressroutetcp %q not found in namespace %q", irt.Name, irt.Namespace)
+	}
+	irt.UID = existing.UID
+	if irt.CreationTimestamp.IsZero() {
+		irt.CreationTimestamp = existing.CreationTimestamp
+	}
+	irt.ResourceVersion = s.incRV()
+	s.ingressRouteTCPs[key] = irt
+	s.mu.Unlock()
+	go s.save()
+	return irt.DeepCopy(), nil
 }
 
 // --- Deployments ---

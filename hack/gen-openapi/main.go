@@ -46,11 +46,13 @@ type gvk struct {
 	Kind    string
 }
 
-// servedGVKs is the single place listing the resource kinds q8s serves. It
-// must stay in sync with discovery: handleAPIV1, handleAppsV1, handleBatchV1,
-// handleNetworkingV1, handleStorageV1, handleCoordinationV1 and the
-// deployments/scale subresource. autoscaling/v1 Scale is served as that
-// subresource even though q8s has no autoscaling group root.
+// servedGVKs is the single place listing the Kubernetes resource kinds q8s
+// serves. It must stay in sync with discovery: handleAPIV1, handleAppsV1,
+// handleBatchV1, handleNetworkingV1, handleStorageV1, handleCoordinationV1
+// and the deployments/scale subresource. autoscaling/v1 Scale is served as
+// that subresource even though q8s has no autoscaling group root. The
+// traefik.io/v1alpha1 kinds are not in the upstream swagger; addCRDDefinitions
+// adds them from the Traefik CRD file.
 var servedGVKs = []gvk{
 	{Group: "", Version: "v1", Kind: "Pod"},
 	{Group: "", Version: "v1", Kind: "Service"},
@@ -110,14 +112,19 @@ func main() {
 	if err != nil {
 		fatalf("trim swagger: %v", err)
 	}
-	if err := os.WriteFile(*openapiOut, append(openapi, '\n'), 0644); err != nil {
-		fatalf("write %s: %v", *openapiOut, err)
-	}
 
 	crdYAML, err := os.ReadFile(*crdPath)
 	if err != nil {
 		fatalf("read CRDs: %v", err)
 	}
+	openapi, err = addCRDDefinitions(openapi, crdYAML)
+	if err != nil {
+		fatalf("add CRD definitions: %v", err)
+	}
+	if err := os.WriteFile(*openapiOut, append(openapi, '\n'), 0644); err != nil {
+		fatalf("write %s: %v", *openapiOut, err)
+	}
+
 	crds, err := buildCRDList(crdYAML)
 	if err != nil {
 		fatalf("build CRD list: %v", err)
@@ -257,6 +264,110 @@ func definitionRefs(value interface{}) []string {
 	walk(value)
 	sort.Strings(refs)
 	return refs
+}
+
+// addCRDDefinitions adds Swagger 2.0 definitions for the Traefik CRDs q8s
+// serves, so a client that discovers the traefik.io group can also resolve
+// those kinds through /openapi/v2. The CRD schema is used as-is (it is the
+// same schema the read-only CRD API serves); only the kind/list wrapper is
+// added. The CRD schema closure has no $refs, so no extra definitions are
+// needed.
+func addCRDDefinitions(trimmed, crdYAML []byte) ([]byte, error) {
+	var doc struct {
+		Swagger     string                            `json:"swagger"`
+		Info        map[string]interface{}            `json:"info"`
+		Paths       map[string]interface{}            `json:"paths"`
+		Definitions map[string]map[string]interface{} `json:"definitions"`
+	}
+	if err := json.Unmarshal(trimmed, &doc); err != nil {
+		return nil, fmt.Errorf("parse trimmed swagger: %w", err)
+	}
+	for _, document := range splitYAMLDocuments(crdYAML) {
+		js, err := yaml.YAMLToJSON(document)
+		if err != nil {
+			return nil, fmt.Errorf("parse CRD document: %w", err)
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal(js, &obj); err != nil {
+			return nil, fmt.Errorf("decode CRD document: %w", err)
+		}
+		if obj["kind"] != "CustomResourceDefinition" {
+			continue
+		}
+		if !wantedCRDs[nestedString(obj, "metadata", "name")] {
+			continue
+		}
+		group := nestedString(obj, "spec", "group")
+		kind := nestedString(obj, "spec", "names", "kind")
+		version, schema := crdVersionSchema(obj)
+		if group == "" || kind == "" || version == "" || schema == nil {
+			return nil, fmt.Errorf("CRD %s has no group, kind, version or schema", nestedString(obj, "metadata", "name"))
+		}
+		definition := fmt.Sprintf("io.traefik.%s.%s", version, kind)
+		sanitizeSwaggerSchema(schema)
+		schema["x-kubernetes-group-version-kind"] = []interface{}{map[string]interface{}{
+			"group": group, "version": version, "kind": kind,
+		}}
+		doc.Definitions[definition] = schema
+
+		list := map[string]interface{}{
+			"type": "object",
+			"x-kubernetes-group-version-kind": []interface{}{map[string]interface{}{
+				"group": group, "version": version, "kind": kind + "List",
+			}},
+			"properties": map[string]interface{}{
+				"apiVersion": map[string]interface{}{"type": "string"},
+				"kind":       map[string]interface{}{"type": "string"},
+				"metadata":   map[string]interface{}{"type": "object"},
+				"items": map[string]interface{}{
+					"type":  "array",
+					"items": map[string]interface{}{"$ref": "#/definitions/" + definition},
+				},
+			},
+		}
+		doc.Definitions[definition+"List"] = list
+	}
+	return json.Marshal(doc)
+}
+
+// sanitizeSwaggerSchema removes OpenAPI v3 schema-composition keywords that
+// Swagger 2.0 (and gnostic's validator) reject. The CRD schema is otherwise
+// kept as-is; x-kubernetes-int-or-string still tells clients about the
+// integer-or-string shape of fields such as a Service port.
+func sanitizeSwaggerSchema(value interface{}) {
+	switch node := value.(type) {
+	case map[string]interface{}:
+		for _, key := range []string{"anyOf", "oneOf", "allOf", "not", "nullable"} {
+			delete(node, key)
+		}
+		for _, child := range node {
+			sanitizeSwaggerSchema(child)
+		}
+	case []interface{}:
+		for _, child := range node {
+			sanitizeSwaggerSchema(child)
+		}
+	}
+}
+
+// crdVersionSchema returns the first served version name and its
+// openAPIV3Schema from a decoded CRD.
+func crdVersionSchema(obj map[string]interface{}) (string, map[string]interface{}) {
+	spec, _ := obj["spec"].(map[string]interface{})
+	versions, _ := spec["versions"].([]interface{})
+	for _, raw := range versions {
+		version, ok := raw.(map[string]interface{})
+		if !ok || version["served"] == false {
+			continue
+		}
+		name, _ := version["name"].(string)
+		schema, _ := version["schema"].(map[string]interface{})
+		openAPI, _ := schema["openAPIV3Schema"].(map[string]interface{})
+		if name != "" && openAPI != nil {
+			return name, openAPI
+		}
+	}
+	return "", nil
 }
 
 // buildCRDList converts the multi-document Traefik CRD YAML into a

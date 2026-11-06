@@ -37,6 +37,17 @@ Every pod spec q8s accepts must contain exactly one container; specs with additi
 |---|---|---|
 | `ingresses` | get, list, create, patch, delete | Traefik dynamic config per ingress; backends resolved from the Service selector (one server per matching pod's hostPort, like Endpoints) |
 
+## traefik.io/v1alpha1
+
+| Resource | kubectl verbs | Notes |
+|---|---|---|
+| `middlewares` | get, list, create, update, patch, delete | HTTP `ipAllowList`, `redirectRegex`, `redirectScheme` and `headers` subsets; one type per object, rendered as a Traefik file-provider middleware |
+| `ingressroutetcps` | get, list, create, update, patch, delete | Catch-all `HostSNI(`*`)` TCP routers with optional PROXY protocol and TLS passthrough; an entrypoint may be owned by only one object |
+
+See [Traefik Middleware and IngressRouteTCP](traefik.md) for the supported
+subset, generated files and the `@kubernetescrd` to `@file` middleware
+reference rewrite.
+
 ## metrics.k8s.io/v1beta1
 
 | Resource | Notes |
