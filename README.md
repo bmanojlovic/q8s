@@ -66,6 +66,9 @@ make install  # build + q8s install
 
 Requires Go 1.26.4+.
 
+The OpenAPI schema and embedded CRD list are generated and committed; see
+[docs/openapi.md](docs/openapi.md) for regeneration.
+
 ## Uninstall
 
 ```sh

@@ -1,6 +1,7 @@
 package server
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -88,6 +89,16 @@ func (s *Server) handleAPIsRoot(w http.ResponseWriter, r *http.Request) {
 			Kind:       "APIGroupList",
 		},
 		Groups: []metav1.APIGroup{
+			{
+				Name: "apiextensions.k8s.io",
+				Versions: []metav1.GroupVersionForDiscovery{
+					{GroupVersion: "apiextensions.k8s.io/v1", Version: "v1"},
+				},
+				PreferredVersion: metav1.GroupVersionForDiscovery{
+					GroupVersion: "apiextensions.k8s.io/v1",
+					Version:      "v1",
+				},
+			},
 			{
 				Name: "apps",
 				Versions: []metav1.GroupVersionForDiscovery{
@@ -693,48 +704,47 @@ func getOSImage() string {
 	return "Linux"
 }
 
-// openapiV2Schema is a Swagger 2.0 document with permissive definitions for all
-// resource types supported by q8s. {"type":"object"} with no additionalProperties:false
-// means any object structure is valid — kubectl validation passes for all fields.
-const openapiV2Schema = `{
-  "swagger": "2.0",
-  "info": {"title": "q8s", "version": "v0"},
-  "paths": {},
-  "definitions": {
-    "io.k8s.api.core.v1.Pod":                          {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.PodList":                      {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.Node":                         {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.NodeList":                     {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.Service":                      {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.ServiceList":                  {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.Namespace":                    {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.NamespaceList":                {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.PersistentVolumeClaim":        {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.PersistentVolumeClaimList":    {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.ConfigMap":                    {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.ConfigMapList":                {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.Secret":                       {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.SecretList":                   {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.Event":                        {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.core.v1.EventList":                    {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.apps.v1.Deployment":                   {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.apps.v1.DeploymentList":               {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.apps.v1.DaemonSet":                     {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.apps.v1.DaemonSetList":                 {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.apps.v1.StatefulSet":                   {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.apps.v1.StatefulSetList":               {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.apps.v1.ReplicaSet":                    {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.apps.v1.ReplicaSetList":                {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.batch.v1.Job":                         {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.batch.v1.JobList":                     {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.batch.v1.CronJob":                     {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.batch.v1.CronJobList":                 {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.networking.v1.Ingress":                {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.networking.v1.IngressList":            {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.storage.v1.StorageClass":              {"type": "object", "x-kubernetes-preserve-unknown-fields": true},
-    "io.k8s.api.storage.v1.StorageClassList":          {"type": "object", "x-kubernetes-preserve-unknown-fields": true}
-  }
-}`
+// openapiV2Schema is the trimmed Swagger 2.0 document generated from the
+// upstream Kubernetes swagger by hack/gen-openapi. Real definitions (with
+// resolved $refs) are required by clients such as Terraform's
+// kubernetes_manifest provider; see docs/openapi.md for regeneration.
+//
+//go:embed openapi_v2.json
+var openapiV2Schema string
+
+// --- apiextensions.k8s.io ---
+
+// handleAPIExtensionsRoot serves the apiextensions.k8s.io API group discovery.
+func (s *Server) handleAPIExtensionsRoot(w http.ResponseWriter, r *http.Request) {
+	data, _ := json.Marshal(metav1.APIGroup{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "APIGroup"},
+		Name:     "apiextensions.k8s.io",
+		Versions: []metav1.GroupVersionForDiscovery{
+			{GroupVersion: "apiextensions.k8s.io/v1", Version: "v1"},
+		},
+		PreferredVersion: metav1.GroupVersionForDiscovery{
+			GroupVersion: "apiextensions.k8s.io/v1",
+			Version:      "v1",
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+// handleAPIExtensionsV1 serves the apiextensions.k8s.io/v1 resource list.
+// CustomResourceDefinitions are served read-only; q8s does not implement
+// their storage or admission.
+func (s *Server) handleAPIExtensionsV1(w http.ResponseWriter, r *http.Request) {
+	data, _ := json.Marshal(metav1.APIResourceList{
+		TypeMeta:     metav1.TypeMeta{APIVersion: "v1", Kind: "APIResourceList"},
+		GroupVersion: "apiextensions.k8s.io/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "customresourcedefinitions", SingularName: "customresourcedefinition", Namespaced: false, Kind: "CustomResourceDefinition", Verbs: []string{"get", "list"}, ShortNames: []string{"crd", "crds"}},
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
 
 func verbList() []string {
 	return []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"}
@@ -854,5 +864,6 @@ func DiscoveryResources() []schema.GroupVersionResource {
 		{Group: "batch", Version: "v1", Resource: "jobs"},
 		{Group: "batch", Version: "v1", Resource: "cronjobs"},
 		{Group: "networking.k8s.io", Version: "v1", Resource: "ingresses"},
+		{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"},
 	}
 }

@@ -73,7 +73,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Manager != nil {
 		s.network.ops = podmanNetworkOps{manager: cfg.Manager}
 	}
-	s.handler = auth.Handler(s.mux)
+	s.handler = auth.Handler(s.applyMiddleware(s.mux))
 
 	s.setupRoutes()
 
@@ -147,6 +147,10 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/apis/batch/v1", s.handleBatchV1)
 	s.mux.HandleFunc("/apis/networking.k8s.io", s.handleNetworkingRoot)
 	s.mux.HandleFunc("/apis/networking.k8s.io/v1", s.handleNetworkingV1)
+	s.mux.HandleFunc("/apis/apiextensions.k8s.io", s.handleAPIExtensionsRoot)
+	s.mux.HandleFunc("/apis/apiextensions.k8s.io/v1", s.handleAPIExtensionsV1)
+	s.mux.HandleFunc(crdPath, s.handleCRDs)
+	s.mux.HandleFunc(crdPath+"/", s.handleCRDs)
 	s.mux.HandleFunc("/version", s.handleVersion)
 	s.mux.HandleFunc("/version/", s.handleVersion) // trailing slash for python client
 	s.mux.HandleFunc("/healthz", s.handleHealthz)

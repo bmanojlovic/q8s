@@ -550,6 +550,8 @@ func (s *Server) handleNamespaced(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			s.handleNamespaceGet(w, r, ns)
+		case http.MethodPatch:
+			s.handleNamespacePatch(w, r, ns)
 		case http.MethodDelete:
 			s.handleNamespaceDelete(w, r, ns)
 		default:
@@ -1877,6 +1879,59 @@ func (s *Server) handleNamespaceGet(w http.ResponseWriter, r *http.Request, name
 		return
 	}
 	encode(w, ns, http.StatusOK)
+}
+
+// handleNamespacePatch merges a patch into an existing namespace. This is
+// what the server-side apply wrapper re-dispatches to: namespaces are
+// cluster-scoped, so an apply that finds the object must still be able to
+// update its labels and annotations.
+func (s *Server) handleNamespacePatch(w http.ResponseWriter, r *http.Request, name string) {
+	ns, err := s.config.Store.GetNamespace(name)
+	if err != nil {
+		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		return
+	}
+	body, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	existing, _ := json.Marshal(ns)
+	var base map[string]interface{}
+	json.Unmarshal(existing, &base)
+	if isJSONPatch(r) {
+		var ops []map[string]interface{}
+		if err := json.Unmarshal(body, &ops); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+			return
+		}
+		if err := applyJSONPatch(base, ops); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+			return
+		}
+	} else {
+		var overlay map[string]interface{}
+		if err := json.Unmarshal(body, &overlay); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+			return
+		}
+		jsonMerge(base, overlay)
+	}
+	merged, _ := json.Marshal(base)
+	var patched corev1.Namespace
+	if err := json.Unmarshal(merged, &patched); err != nil {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		return
+	}
+	if patched.Name != name || patched.Namespace != "" {
+		s.respondStatus(w, http.StatusBadRequest, "Invalid", "namespace %q: name is immutable", name)
+		return
+	}
+	updated, err := s.config.Store.UpdateNamespace(&patched)
+	if err != nil {
+		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+		return
+	}
+	encode(w, updated, http.StatusOK)
 }
 
 func (s *Server) handleNamespaceCreate(w http.ResponseWriter, r *http.Request) {
