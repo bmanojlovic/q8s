@@ -646,11 +646,11 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		// hostPort and Service socket units both bind the host — reject if
-		// a Service already owns a port this pod wants as hostPort.
-		if port, conflict := s.podHostPortConflict(&pod); conflict {
+		// A NodePort Service publishes its nodePort on 0.0.0.0, the same
+		// host binding a hostPort wants - reject a real collision.
+		if port, svc, conflict := s.podNodePortConflict(&pod); conflict {
 			s.respondStatus(w, http.StatusConflict, "Conflict",
-				"hostPort %d conflicts with an existing Service port — use one or the other", port)
+				"hostPort %d collides with nodePort of Service %s", port, svc)
 			return
 		}
 		if pod.Labels == nil {
@@ -900,10 +900,24 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
 			return
 		}
-		if port, conflict := s.serviceHostPortConflict(created); conflict {
+		// An explicit nodePort is checked before allocation so a collision
+		// is reported as such; the check is repeated after allocation to
+		// cover auto-assigned nodePorts.
+		if port, pod, conflict := s.serviceNodePortConflict(created); conflict {
 			s.config.Store.DeleteService(ns, created.Name)
 			s.respondStatus(w, http.StatusConflict, "Conflict",
-				"service port %d conflicts with hostPort on a matching pod — use one or the other", port)
+				"nodePort %d collides with hostPort of Pod %s", port, pod)
+			return
+		}
+		if err := s.assignNodePorts(created); err != nil {
+			s.config.Store.DeleteService(ns, created.Name)
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+			return
+		}
+		if port, pod, conflict := s.serviceNodePortConflict(created); conflict {
+			s.config.Store.DeleteService(ns, created.Name)
+			s.respondStatus(w, http.StatusConflict, "Conflict",
+				"nodePort %d collides with hostPort of Pod %s", port, pod)
 			return
 		}
 		if err := s.reconcileNodePort(created); err != nil {
@@ -959,9 +973,21 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
 			return
 		}
-		if port, conflict := s.serviceHostPortConflict(updated); conflict {
+		// An explicit nodePort is checked before allocation so a collision
+		// is reported as such; the check is repeated after allocation to
+		// cover auto-assigned nodePorts.
+		if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
 			s.respondStatus(w, http.StatusConflict, "Conflict",
-				"service port %d conflicts with hostPort on a matching pod — use one or the other", port)
+				"nodePort %d collides with hostPort of Pod %s", port, pod)
+			return
+		}
+		if err := s.assignNodePorts(updated); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+			return
+		}
+		if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
+			s.respondStatus(w, http.StatusConflict, "Conflict",
+				"nodePort %d collides with hostPort of Pod %s", port, pod)
 			return
 		}
 		if err := s.reconcileNodePort(updated); err != nil {
@@ -3599,39 +3625,37 @@ func (s *Server) removeNamespaceNetwork(ns string) {
 	s.reloadAfterRemove(fmt.Sprintf("%s/q8s-%s.network", s.config.QuadletDir, ns))
 }
 
-// serviceHostPortConflict checks whether any pod matching the Service's
-// selector already has a hostPort that would conflict with one of the
-// Service's ports. In q8s the Service socket unit and hostPort both bind
-// the same host interface — they're mutually exclusive.
-func (s *Server) serviceHostPortConflict(svc *corev1.Service) (int32, bool) {
+// serviceNodePortConflict checks whether one of a NodePort Service's
+// nodePorts equals a hostPort published by any pod on the host. A nodePort
+// binds 0.0.0.0, so namespace and selector do not limit the collision.
+// Non-NodePort Services bind no host port and never conflict.
+func (s *Server) serviceNodePortConflict(svc *corev1.Service) (int32, string, bool) {
+	if svc.Spec.Type != corev1.ServiceTypeNodePort {
+		return 0, "", false
+	}
 	for _, pod := range s.config.Store.AllPods() {
-		if pod.Namespace != svc.Namespace {
-			continue
-		}
-		if !matchesEqualitySelector(pod.Labels, svc.Spec.Selector) {
-			continue
-		}
 		for _, c := range pod.Spec.Containers {
 			for _, cp := range c.Ports {
 				if cp.HostPort == 0 {
 					continue
 				}
 				for _, sp := range svc.Spec.Ports {
-					if sp.Port == cp.HostPort {
-						return cp.HostPort, true
+					if sp.NodePort != 0 && sp.NodePort == cp.HostPort {
+						return cp.HostPort, fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), true
 					}
 				}
 			}
 		}
 	}
-	return 0, false
+	return 0, "", false
 }
 
-// podHostPortConflict checks whether any Service in the pod's namespace
-// already has a socket unit for a port this pod wants as hostPort.
-func (s *Server) podHostPortConflict(pod *corev1.Pod) (int32, bool) {
-	for _, svc := range s.config.Store.Services(pod.Namespace) {
-		if !matchesEqualitySelector(pod.Labels, svc.Spec.Selector) {
+// podNodePortConflict checks whether a hostPort the pod wants is already the
+// nodePort of any NodePort Service. The nodePort binds 0.0.0.0 on the host,
+// so any pod on the host conflicts, regardless of namespace or selector.
+func (s *Server) podNodePortConflict(pod *corev1.Pod) (int32, string, bool) {
+	for _, svc := range s.config.Store.AllServices() {
+		if svc.Spec.Type != corev1.ServiceTypeNodePort {
 			continue
 		}
 		for _, c := range pod.Spec.Containers {
@@ -3640,14 +3664,14 @@ func (s *Server) podHostPortConflict(pod *corev1.Pod) (int32, bool) {
 					continue
 				}
 				for _, sp := range svc.Spec.Ports {
-					if sp.Port == cp.HostPort {
-						return cp.HostPort, true
+					if sp.NodePort != 0 && sp.NodePort == cp.HostPort {
+						return cp.HostPort, fmt.Sprintf("%s/%s", svc.Namespace, svc.Name), true
 					}
 				}
 			}
 		}
 	}
-	return 0, false
+	return 0, "", false
 }
 
 // assignNodePorts fills in and validates spec.ports[].nodePort for a
