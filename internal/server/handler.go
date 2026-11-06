@@ -2466,12 +2466,80 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 
 // --- Traefik dynamic config ---
 
+// traefikRouterOptions holds the router settings an Ingress requests through
+// Traefik's own annotations. Values are parsed defensively: anything that
+// fails the validation the API applies is dropped, so an Ingress stored by an
+// older q8s (or edited directly in the store) cannot inject config here.
+type traefikRouterOptions struct {
+	entryPoints  []string
+	middlewares  []string
+	tls          bool
+	certResolver string
+	priority     int
+	hasPriority  bool
+}
+
+func parseTraefikRouterOptions(annotations map[string]string) traefikRouterOptions {
+	var opts traefikRouterOptions
+	for _, ep := range splitAnnotationList(annotations[annRouterEntryPoints]) {
+		if validateTraefikName(annRouterEntryPoints, ep) == nil {
+			opts.entryPoints = append(opts.entryPoints, ep)
+		}
+	}
+	for _, mw := range splitAnnotationList(annotations[annRouterMiddlewares]) {
+		if validateTraefikMiddlewareRef(annRouterMiddlewares, mw) == nil {
+			opts.middlewares = append(opts.middlewares, mw)
+		}
+	}
+	if v, ok := annotations[annRouterTLS]; ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			opts.tls = b
+		}
+	}
+	if v, ok := annotations[annRouterTLSCertResolver]; ok && validateTraefikName(annRouterTLSCertResolver, v) == nil {
+		opts.certResolver = v
+	}
+	if v, ok := annotations[annRouterPriority]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			opts.priority = n
+			opts.hasPriority = true
+		}
+	}
+	return opts
+}
+
+// yamlFlowList renders items as a quoted YAML flow sequence, the same quoting
+// the url lines use, so no item can break out of its scalar.
+func yamlFlowList(items []string) string {
+	quoted := make([]string, len(items))
+	for i, item := range items {
+		quoted[i] = fmt.Sprintf("%q", item)
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+// writeRouterLines appends the annotation-derived router fields (everything
+// except tls, which depends on spec.tls as well).
+func (o traefikRouterOptions) writeRouterLines(b *strings.Builder) {
+	if len(o.entryPoints) > 0 {
+		b.WriteString(fmt.Sprintf("      entryPoints: %s\n", yamlFlowList(o.entryPoints)))
+	}
+	if len(o.middlewares) > 0 {
+		b.WriteString(fmt.Sprintf("      middlewares: %s\n", yamlFlowList(o.middlewares)))
+	}
+	if o.hasPriority {
+		b.WriteString(fmt.Sprintf("      priority: %d\n", o.priority))
+	}
+}
+
 // generateTraefikConfig writes a Traefik dynamic config file for an Ingress.
 // The file is placed in TraefikDir and picked up by Traefik's file provider.
 func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 	if s.config.TraefikDir == "" {
 		return
 	}
+
+	routerOpts := parseTraefikRouterOptions(ing.Annotations)
 
 	var routers, services strings.Builder
 	idx := 0
@@ -2524,7 +2592,16 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 			routers.WriteString(fmt.Sprintf("    %s:\n", routerName))
 			routers.WriteString(fmt.Sprintf("      rule: \"%s\"\n", routerRule))
 			routers.WriteString(fmt.Sprintf("      service: %s\n", routerName))
-			if len(ing.Spec.TLS) > 0 {
+			routerOpts.writeRouterLines(&routers)
+			// A router-level tls block replaces the entrypoint's http.tls
+			// defaults, so "tls: {}" drops a configured certResolver. That
+			// is why the annotation's certResolver is repeated per router
+			// instead of relying on the entrypoint.
+			switch {
+			case routerOpts.certResolver != "":
+				routers.WriteString("      tls:\n")
+				routers.WriteString(fmt.Sprintf("        certResolver: %q\n", routerOpts.certResolver))
+			case len(ing.Spec.TLS) > 0 || routerOpts.tls:
 				routers.WriteString("      tls: {}\n")
 			}
 

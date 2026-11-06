@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -124,9 +125,108 @@ func validatePort(port int32) error {
 	return nil
 }
 
+// Traefik's own router annotations, read by its KubernetesIngress provider.
+// q8s honors the same keys with the same meaning so an Ingress manifest
+// written for real k8s + Traefik works here unchanged; other
+// traefik.ingress.kubernetes.io/* annotations are deliberately ignored.
+const (
+	annRouterEntryPoints     = "traefik.ingress.kubernetes.io/router.entrypoints"
+	annRouterMiddlewares     = "traefik.ingress.kubernetes.io/router.middlewares"
+	annRouterTLS             = "traefik.ingress.kubernetes.io/router.tls"
+	annRouterTLSCertResolver = "traefik.ingress.kubernetes.io/router.tls.certresolver"
+	annRouterPriority        = "traefik.ingress.kubernetes.io/router.priority"
+)
+
+// traefikNameRE matches an entrypoint, certresolver or middleware name;
+// traefikProviderRE matches the provider suffix of a middleware reference.
+// Both values are spliced into the generated YAML, so anything that could
+// terminate a quoted scalar is rejected here.
+var (
+	traefikNameRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	traefikProviderRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+)
+
+func validateTraefikName(annotation, value string) error {
+	if len(value) == 0 || len(value) > 253 {
+		return fmt.Errorf("annotation %s: value must be between 1 and 253 characters", annotation)
+	}
+	if !traefikNameRE.MatchString(value) {
+		return fmt.Errorf("annotation %s: value %q is invalid: must start with an alphanumeric character and contain only alphanumeric characters, '.', '_' or '-'", annotation, value)
+	}
+	return nil
+}
+
+func validateTraefikMiddlewareRef(annotation, value string) error {
+	if len(value) == 0 || len(value) > 253 {
+		return fmt.Errorf("annotation %s: middleware reference must be between 1 and 253 characters", annotation)
+	}
+	name, provider := value, ""
+	hasProvider := false
+	if i := strings.IndexByte(value, '@'); i >= 0 {
+		name, provider = value[:i], value[i+1:]
+		hasProvider = true
+	}
+	if !traefikNameRE.MatchString(name) || (hasProvider && !traefikProviderRE.MatchString(provider)) {
+		return fmt.Errorf("annotation %s: middleware reference %q is invalid: expected <name> or <name>@<provider>", annotation, value)
+	}
+	return nil
+}
+
+// splitAnnotationList splits a comma-separated annotation value the way
+// Traefik does: surrounding spaces are trimmed and empty items are dropped.
+func splitAnnotationList(value string) []string {
+	var out []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// validateTraefikAnnotations vets the router annotations before the object is
+// stored. The values land in a YAML file Traefik loads, so a quote, newline,
+// colon or '#' there is a config-injection shape, the same as an Ingress path.
+func validateTraefikAnnotations(annotations map[string]string) error {
+	if v, ok := annotations[annRouterEntryPoints]; ok {
+		for _, ep := range splitAnnotationList(v) {
+			if err := validateTraefikName(annRouterEntryPoints, ep); err != nil {
+				return err
+			}
+		}
+	}
+	if v, ok := annotations[annRouterMiddlewares]; ok {
+		for _, mw := range splitAnnotationList(v) {
+			if err := validateTraefikMiddlewareRef(annRouterMiddlewares, mw); err != nil {
+				return err
+			}
+		}
+	}
+	if v, ok := annotations[annRouterTLS]; ok {
+		if _, err := strconv.ParseBool(v); err != nil {
+			return fmt.Errorf("annotation %s: value %q is invalid: must be a boolean", annRouterTLS, v)
+		}
+	}
+	if v, ok := annotations[annRouterTLSCertResolver]; ok {
+		if err := validateTraefikName(annRouterTLSCertResolver, v); err != nil {
+			return err
+		}
+	}
+	if v, ok := annotations[annRouterPriority]; ok {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return fmt.Errorf("annotation %s: value %q is invalid: must be a non-negative integer", annRouterPriority, v)
+		}
+	}
+	return nil
+}
+
 // validateIngress checks every user-controlled string field that ends up in
 // the generated Traefik dynamic config or references another object by name.
 func validateIngress(ing *networkingv1.Ingress) error {
+	if err := validateTraefikAnnotations(ing.Annotations); err != nil {
+		return err
+	}
 	for _, rule := range ing.Spec.Rules {
 		if rule.Host != "" {
 			if err := validateHost(rule.Host); err != nil {
