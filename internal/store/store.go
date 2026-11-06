@@ -459,6 +459,28 @@ func (s *Store) GetNamespace(name string) (*corev1.Namespace, error) {
 	return ns.DeepCopy(), nil
 }
 
+// UpdateNamespace replaces a namespace in place, preserving UID and creation
+// timestamp. Only metadata changes (labels/annotations) are meaningful; the
+// namespace network is already in place.
+func (s *Store) UpdateNamespace(ns *corev1.Namespace) (*corev1.Namespace, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Name: ns.Name}
+	existing, ok := s.namespaces[key]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("namespace %q not found", ns.Name)
+	}
+	ns.UID = existing.UID
+	ns.ResourceVersion = s.incRV()
+	if ns.CreationTimestamp.IsZero() {
+		ns.CreationTimestamp = existing.CreationTimestamp
+	}
+	s.namespaces[key] = ns
+	s.mu.Unlock()
+	go s.save()
+	return ns.DeepCopy(), nil
+}
+
 // DeleteNamespace deletes a namespace.
 func (s *Store) DeleteNamespace(name string) error {
 	s.mu.Lock()

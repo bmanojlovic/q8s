@@ -31,7 +31,11 @@ internal/
   server/
     server.go     HTTP server, TLS setup, route registration
     handler.go    All resource handlers (Pod, Service, PVC, ConfigMap, Secret, Deployment, Job, CronJob)
-    discovery.go  API discovery, /version, /api/v1/nodes, storage.k8s.io/v1/storageclasses
+    discovery.go  API discovery, /version, /api/v1/nodes, storage.k8s.io/v1/storageclasses, apiextensions.k8s.io
+    crds.go       Embedded read-only CustomResourceDefinition list and table
+    apply.go      Server-side apply translation to create/merge-patch
+    openapi_v2.json  Generated Swagger 2.0 schema for client-side validation
+    crds.json     Generated Traefik CRD list
     metrics.go    metrics.k8s.io (kubectl top), coordination.k8s.io (lease)
     auth.go       mTLS client certificate middleware
     table.go      Table response rendering for kubectl get
@@ -41,6 +45,9 @@ internal/
 
   store/
     store.go      In-memory resource store with JSON persistence
+
+hack/
+  gen-openapi/    Generator for internal/server/openapi_v2.json and crds.json
 
   quadlet/
     generator.go  Quadlet file generators (Container, JobContainer, CronContainer, CronTimer, Volume, Network)

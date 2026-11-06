@@ -7,7 +7,7 @@ Every pod spec q8s accepts must contain exactly one container; specs with additi
 | Resource | kubectl verbs | Notes |
 |---|---|---|
 | `nodes` | get, list | Synthetic single node with real machine stats |
-| `namespaces` | get, list, create, delete | Creates a `q8s-{ns}.network` Podman network |
+| `namespaces` | get, list, create, patch, delete | Creates a `q8s-{ns}.network` Podman network; patch updates labels and annotations |
 | `pods` | get, list, create, patch, delete | Writes a `.container` Quadlet; patch rewrites and restarts |
 | `services` | get, list, create, patch, delete | Selector + port map: DNS aliases (NetworkAlias) and ingress backend resolution; never binds a host port |
 | `persistentvolumeclaims` | get, list, create, patch, delete | Named Podman volume; storageClass selects mount mode |
@@ -97,6 +97,17 @@ spec:
       storage: 1Gi
 ```
 
+## apiextensions.k8s.io/v1
+
+| Resource | kubectl verbs | Notes |
+|---|---|---|
+| `customresourcedefinitions` | get, list | Read-only fixed list of `middlewares.traefik.io` and `ingressroutetcps.traefik.io`, generated from the Traefik CRD file |
+
+CRDs are not stored or modified by q8s. The list exists so clients that
+build their type information from CRD schemas (Terraform's
+`kubernetes_manifest`, for example) can plan Traefik Middleware and
+IngressRouteTCP objects.
+
 ## Pod subresources
 
 | Subresource | kubectl command | Notes |
@@ -108,7 +119,8 @@ spec:
 
 - **Watch**: all list endpoints support `?watch=true` (kubectl get -w, Freelens, k9s)
 - **Label selectors**: `key=value`, `key==value`, `key!=value`, `key`, `!key` on all list endpoints
-- **Patch**: JSON merge patch and strategic merge patch (array-merge-by-name for containers/env/volumes); RFC 6902 JSON Patch (`application/json-patch+json`) on all resources — Terraform's provider patches Secret `data` keys and container/spec changes this way
+- **Patch**: JSON merge patch and strategic merge patch (array-merge-by-name for containers/env/volumes); RFC 6902 JSON Patch (`application/json-patch+json`) on all resources; Terraform's provider patches Secret `data` keys and container/spec changes this way
+- **Server-side apply**: `PATCH` with `Content-Type: application/apply-patch+yaml` is translated to a create or merge patch. q8s has no managed fields, so apply uses a single-manager model: the applier owns `spec`, `data`, `binaryData`, `stringData`, `metadata.labels` and `metadata.annotations`. `fieldManager` and `force` are accepted and ignored, and `dryRun` is rejected
 - **Resource limits**: `resources.limits.memory` → `PodmanArgs=--memory=N --memory-swap=-1`, `resources.limits.cpu` → `PodmanArgs=--cpus=N` (via PodmanArgs for podman-version portability; skipped when cgroup controllers not delegated)
 - **GPU**: `resources.limits["nvidia.com/gpu"]` of at least 1 → `AddDevice=nvidia.com/gpu=all` (CDI; podman resolves the GPU devices). The count is not allocated, so any request of 1 or more exposes every CDI GPU on the host.
 - **Shared memory**: an `emptyDir` with `medium: Memory` mounted at `/dev/shm` → `ShmSize=<bytes>` from `sizeLimit`; no `Volume=` line is generated for it. Without a `sizeLimit`, nothing is emitted.
