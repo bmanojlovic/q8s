@@ -3,7 +3,6 @@ package store_test
 import (
 	"path/filepath"
 	"testing"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -61,13 +60,13 @@ func TestTraefikKindsPersistenceRoundTrip(t *testing.T) {
 		t.Fatal("UID not assigned")
 	}
 
-	// Give the asynchronous save goroutine time to flush.
-	time.Sleep(100 * time.Millisecond)
-
-	st2, err := store.Load(file)
-	if err != nil {
-		t.Fatalf("Load (existing file): %v", err)
-	}
+	// The store saves asynchronously; reload until both objects are on disk
+	// (a fixed sleep was flaky on slower CI runners).
+	st2 := reloadUntil(t, file, func(st *store.Store) bool {
+		_, errMW := st.GetMiddleware("default", "allow")
+		_, errIRT := st.GetIngressRouteTCP("default", "smtp")
+		return errMW == nil && errIRT == nil
+	})
 
 	mw, err := st2.GetMiddleware("default", "allow")
 	if err != nil {

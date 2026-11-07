@@ -958,14 +958,13 @@ func TestPersistence(t *testing.T) {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 
-	// Give async save goroutine time to flush
-	time.Sleep(100 * time.Millisecond)
-
-	// Reload
-	st2, err := store.Load(file)
-	if err != nil {
-		t.Fatalf("Load (existing file): %v", err)
-	}
+	// The store saves asynchronously; reload until the objects are on disk
+	// (a fixed sleep is flaky on slower CI runners).
+	st2 := reloadUntil(t, file, func(st *store.Store) bool {
+		_, errPod := st.GetPod("default", "nginx")
+		_, errNS := st.GetNamespace("staging")
+		return errPod == nil && errNS == nil
+	})
 
 	pod, err := st2.GetPod("default", "nginx")
 	if err != nil {
@@ -1167,5 +1166,26 @@ func TestNodePortConflictsWithHostPort(t *testing.T) {
 	svc := types.NamespacedName{Namespace: "default", Name: "svc"}
 	if s.NodePortAvailable(store.NodePortMin, svc) {
 		t.Error("nodePort colliding with a pod hostPort should be unavailable")
+	}
+}
+
+// reloadUntil loads the store file until ready reports the expected state or
+// five seconds pass. The store persists from a background goroutine, so a
+// test cannot know when the file is written.
+func reloadUntil(t *testing.T, file string, ready func(*store.Store) bool) *store.Store {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := store.Load(file)
+		if err == nil && ready(st) {
+			return st
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				t.Fatalf("Load %s: %v", file, err)
+			}
+			t.Fatalf("store file %s did not reach the expected state within 5s", file)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
