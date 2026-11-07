@@ -76,6 +76,8 @@ pkg/
 
 The store is serialized to `{dataDir}/store.json` on every mutation (atomic write: `.tmp` + rename). On startup, state is loaded from this file. The default namespace is always ensured to exist.
 
+On startup q8s also re-renders the quadlet file of every stored Pod and Deployment instance. A file whose rendering is unchanged is left alone. A file that changed (typically after a q8s upgrade that renders units differently) is rewritten, and if its service is running it is restarted so the upgrade reaches it; a stopped or finished unit only gets the new file. To apply a change to a running pod without restarting q8s, use `kubectl rollout restart deployment/<name>`.
+
 ## Sync loop
 
 A background goroutine reconciles state from Podman/systemd every 30 seconds, plus immediately on container events (with 200ms debounce):

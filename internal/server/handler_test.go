@@ -717,6 +717,59 @@ func TestReconcileSweepsOrphanedSockets(t *testing.T) {
 	}
 }
 
+// TestReconcileRerendersExistingPodUnits: after a q8s upgrade changes how a
+// unit is rendered, startup rewrites the existing file of a stored workload
+// (not only missing ones), so the files stay the current recovery source and
+// the running pod can be restarted onto it. A file whose rendering did not
+// change is left untouched.
+func TestReconcileRerendersExistingPodUnits(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	replicas := int32(1)
+	if _, err := st.CreateDeployment(&appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "web"}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx:1.0"}}},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	unit := filepath.Join(quadletDir, "default-web-0.container")
+	stale := "[Container]\nImage=nginx:1.0\nHealthCmd=curl -fsS http://127.0.0.1/\n"
+	if err := os.WriteFile(unit, []byte(stale), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	srv.ReconcileQuadlets()
+
+	got, err := os.ReadFile(unit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) == stale || !strings.Contains(string(got), "ContainerName=default-web-0") {
+		t.Fatalf("stale unit was not re-rendered:\n%s", got)
+	}
+
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(unit, old, old); err != nil {
+		t.Fatal(err)
+	}
+	srv.ReconcileQuadlets()
+	fi, err := os.Stat(unit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.ModTime().Equal(old) {
+		t.Fatalf("unchanged unit was rewritten (mtime %v)", fi.ModTime())
+	}
+}
+
 // TestRestoreEnvFilesRerendersAfterWipe pins tic-1507: the per-pod
 // Secret-derived _env/*.env files live on tmpfs and are wiped on a q8s-api
 // restart, but the quadlet units' ExecStart --env-file depends on them.

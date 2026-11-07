@@ -2879,6 +2879,32 @@ func (s *Server) ReconcileQuadlets() {
 		return true
 	}
 
+	// Existing pod units are re-rendered too, not only missing ones: a q8s
+	// upgrade can change how a unit is rendered (v0.6.1 changed probes), and
+	// the files are the source a host recovers from. A pod whose unit
+	// actually changed is restarted below if it is running, so the upgrade
+	// reaches it; a stopped or finished one only gets the new file.
+	var restartIfActive []string
+	writePod := func(ns, name string, files map[string][]byte, containers []corev1.Container, wasMissing bool) {
+		changed := false
+		for filename, content := range files {
+			unit := ""
+			if wasMissing && strings.HasSuffix(filename, ".container") {
+				unit = strings.TrimSuffix(filename, ".container") + ".service"
+			}
+			if write(quadletDir, filename, content, unit) {
+				changed = true
+			}
+		}
+		if s.removeStaleOwnedUnits(quadletDir, ns, name, filenameSet(files)) {
+			needReload = true
+			changed = true
+		}
+		if changed && !wasMissing {
+			restartIfActive = append(restartIfActive, podUnitNames(ns, name, containers)...)
+		}
+	}
+
 	for _, dep := range s.config.Store.AllDeployments() {
 		for i := int32(0); i < deploymentReplicas(dep); i++ {
 			instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
@@ -2895,9 +2921,7 @@ func (s *Server) ReconcileQuadlets() {
 			if socketChanged {
 				needReload = true
 			}
-			if !missing(f) {
-				continue
-			}
+			wasMissing := missing(f)
 			resolved, envFile, err := s.resolveEnvFrom(pod)
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
@@ -2908,16 +2932,7 @@ func (s *Server) ReconcileQuadlets() {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
 			}
-			for filename, content := range files {
-				unit := ""
-				if strings.HasSuffix(filename, ".container") {
-					unit = strings.TrimSuffix(filename, ".container") + ".service"
-				}
-				write(quadletDir, filename, content, unit)
-			}
-			if s.removeStaleOwnedUnits(quadletDir, dep.Namespace, instanceName, filenameSet(files)) {
-				needReload = true
-			}
+			writePod(dep.Namespace, instanceName, files, resolved.Spec.Containers, wasMissing)
 		}
 	}
 
@@ -2935,9 +2950,11 @@ func (s *Server) ReconcileQuadlets() {
 		if len(pod.Spec.Containers) > 1 {
 			f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, pod.Namespace, pod.Name)
 		}
-		if !missing(f) {
+		// Deployment instances were rendered by their Deployment above.
+		if isDeploymentOwned(pod) {
 			continue
 		}
+		wasMissing := missing(f)
 		resolved, envFile, err := s.resolveEnvFrom(pod)
 		if err != nil {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
@@ -2948,16 +2965,7 @@ func (s *Server) ReconcileQuadlets() {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
 		}
-		for filename, content := range files {
-			unit := ""
-			if strings.HasSuffix(filename, ".container") {
-				unit = strings.TrimSuffix(filename, ".container") + ".service"
-			}
-			write(quadletDir, filename, content, unit)
-		}
-		if s.removeStaleOwnedUnits(quadletDir, pod.Namespace, pod.Name, filenameSet(files)) {
-			needReload = true
-		}
+		writePod(pod.Namespace, pod.Name, files, resolved.Spec.Containers, wasMissing)
 	}
 
 	for _, pvc := range s.config.Store.AllPVCs() {
@@ -3078,6 +3086,16 @@ func (s *Server) ReconcileQuadlets() {
 	for _, unit := range startUnits {
 		if err := mgr.StartUnit(unit); err != nil {
 			fmt.Printf("reconcile: start %s: %v\n", unit, err)
+		}
+	}
+	for _, unit := range restartIfActive {
+		state, err := mgr.UnitState(unit)
+		if err != nil || state == nil || state.Active != "active" {
+			continue
+		}
+		fmt.Printf("reconcile: restarting %s (unit re-rendered)\n", unit)
+		if err := mgr.RestartUnit(unit); err != nil {
+			fmt.Printf("reconcile: restart %s: %v\n", unit, err)
 		}
 	}
 
