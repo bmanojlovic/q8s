@@ -310,9 +310,32 @@ func validateSingleContainer(kind string, spec *corev1.PodSpec, allowMultipleCon
 // outside their own namespace.
 const annAttachAllNetworks = "q8s.io/attach-all-networks"
 
+// validatePodProbes rejects probe shapes q8s cannot translate, using the
+// same rules as the quadlet generator (quadlet.ValidateProbes). Called from
+// the create/update/patch handlers for Pods, Deployments, Jobs and CronJobs
+// so an unsupported probe fails with 422 at the API instead of being
+// accepted and then silently ignored when the unit is rendered.
+func validatePodProbes(kind string, spec *corev1.PodSpec) error {
+	if spec == nil {
+		return nil
+	}
+	for i := range spec.Containers {
+		c := spec.Containers[i]
+		if err := quadlet.ValidateProbes(c); err != nil {
+			return fmt.Errorf("%s: container %q: %w", kind, c.Name, err)
+		}
+	}
+	return nil
+}
+
 // validatePodAnnotations rejects q8s pod annotations that cannot be honored
-// by the requested shape. replicas is 0 for a bare Pod.
+// by the requested shape. replicas is 0 for a bare Pod. Probe handlers are
+// checked here too, because Pods and Deployments share this choke point and
+// an unsupported probe is the same kind of unrepresentable spec.
 func validatePodAnnotations(kind string, spec *corev1.PodSpec, annotations map[string]string, replicas int32) error {
+	if err := validatePodProbes(kind, spec); err != nil {
+		return err
+	}
 	containers := 0
 	if spec != nil {
 		containers = len(spec.Containers)

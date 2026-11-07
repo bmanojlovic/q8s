@@ -4276,3 +4276,175 @@ func TestIngressBackendHonorsHostIPOnlyOnHostNetwork(t *testing.T) {
 		}
 	}
 }
+
+// podContainer and deploymentContainer reach the first container of a body
+// built by podBody/deployBody, for tests that mutate one container field.
+func podContainer(body map[string]interface{}) map[string]interface{} {
+	spec := body["spec"].(map[string]interface{})
+	return spec["containers"].([]interface{})[0].(map[string]interface{})
+}
+
+func deploymentContainer(body map[string]interface{}) map[string]interface{} {
+	tmpl := body["spec"].(map[string]interface{})["template"].(map[string]interface{})
+	spec := tmpl["spec"].(map[string]interface{})
+	return spec["containers"].([]interface{})[0].(map[string]interface{})
+}
+
+// TestProbeValidation422: every probe shape q8s cannot translate is rejected
+// at create time for both Pods and Deployments, so a manifest is never
+// accepted and then half-applied.
+func TestProbeValidation422(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		probe map[string]interface{}
+	}{
+		{
+			name:  "tcpSocket",
+			field: "livenessProbe",
+			probe: map[string]interface{}{"tcpSocket": map[string]interface{}{"port": 80}},
+		},
+		{
+			name:  "grpc",
+			field: "livenessProbe",
+			probe: map[string]interface{}{"grpc": map[string]interface{}{"port": 50051}},
+		},
+		{
+			name:  "unresolved named port",
+			field: "readinessProbe",
+			probe: map[string]interface{}{"httpGet": map[string]interface{}{"path": "/ready", "port": "missing"}},
+		},
+		{
+			name:  "invalid header name",
+			field: "livenessProbe",
+			probe: map[string]interface{}{"httpGet": map[string]interface{}{
+				"port":        80,
+				"httpHeaders": []interface{}{map[string]interface{}{"name": "Bad Header", "value": "x"}},
+			}},
+		},
+		{
+			name:  "header value with newline",
+			field: "livenessProbe",
+			probe: map[string]interface{}{"httpGet": map[string]interface{}{
+				"port":        80,
+				"httpHeaders": []interface{}{map[string]interface{}{"name": "X-Test", "value": "a\r\nInjected: yes"}},
+			}},
+		},
+		{
+			name:  "hostname host",
+			field: "livenessProbe",
+			probe: map[string]interface{}{"httpGet": map[string]interface{}{"port": 80, "host": "example.com"}},
+		},
+		{
+			name:  "startup alone",
+			field: "startupProbe",
+			probe: map[string]interface{}{"exec": map[string]interface{}{"command": []interface{}{"true"}}},
+		},
+		{
+			name:  "empty exec command",
+			field: "livenessProbe",
+			probe: map[string]interface{}{"exec": map[string]interface{}{"command": []interface{}{}}},
+		},
+	}
+	for _, tt := range tests {
+		for _, kind := range []string{"pod", "deployment"} {
+			t.Run(kind+"/"+tt.name, func(t *testing.T) {
+				st := store.New()
+				srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+				ts := httptest.NewServer(srv)
+				t.Cleanup(ts.Close)
+
+				var path string
+				var body map[string]interface{}
+				var stored func() int
+				if kind == "pod" {
+					path = "/api/v1/namespaces/default/pods"
+					body = podBody("default", "probe-check", "nginx")
+					podContainer(body)[tt.field] = tt.probe
+					stored = func() int { return len(st.Pods("default")) }
+				} else {
+					path = "/apis/apps/v1/namespaces/default/deployments"
+					body = deployBody("default", "probe-check", "nginx")
+					deploymentContainer(body)[tt.field] = tt.probe
+					stored = func() int { return len(st.Deployments("default")) }
+				}
+
+				resp := post(t, ts.URL+path, body)
+				assertStatus(t, resp, http.StatusUnprocessableEntity)
+				resp.Body.Close()
+				if n := stored(); n != 0 {
+					t.Fatalf("rejected object was stored: %d entries", n)
+				}
+			})
+		}
+	}
+}
+
+func TestPodPatchRejectsUnsupportedProbe(t *testing.T) {
+	st := store.New()
+	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", podBody("default", "probe-patch", "nginx"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	patch := []byte(`[{"op":"add","path":"/spec/containers/0/livenessProbe","value":{"tcpSocket":{"port":80}}}]`)
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/namespaces/default/pods/probe-patch", bytes.NewReader(patch))
+	req.Header.Set("Content-Type", "application/json-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	pod, err := st.GetPod("default", "probe-patch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.Containers[0].LivenessProbe != nil {
+		t.Error("unsupported probe was persisted by the patch")
+	}
+}
+
+func TestDeploymentUpdateRejectsUnsupportedProbe(t *testing.T) {
+	st := store.New()
+	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/apps/v1/namespaces/default/deployments", deployBody("default", "probe-edge", "nginx"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	// PUT (full replace) with a grpc probe.
+	putBody := deployBody("default", "probe-edge", "nginx")
+	deploymentContainer(putBody)["livenessProbe"] = map[string]interface{}{
+		"grpc": map[string]interface{}{"port": 50051},
+	}
+	resp = do(t, http.MethodPut, ts.URL+"/apis/apps/v1/namespaces/default/deployments/probe-edge", putBody)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	// PATCH with a hostname host in an httpGet probe.
+	patch := []byte(`[{"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"port":80,"host":"example.com"}}}]`)
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/apis/apps/v1/namespaces/default/deployments/probe-edge", bytes.NewReader(patch))
+	req.Header.Set("Content-Type", "application/json-patch+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	dep, err := st.GetDeployment("default", "probe-edge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := dep.Spec.Template.Spec.Containers[0]
+	if c.LivenessProbe != nil || c.ReadinessProbe != nil {
+		t.Error("unsupported probe was persisted by the update")
+	}
+}

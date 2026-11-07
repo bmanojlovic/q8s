@@ -11,7 +11,6 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
@@ -161,88 +160,6 @@ func writeEmptyDirShm(b *strings.Builder, vol corev1.Volume, mountPath string) b
 // mount. Callers decide whether the size goes on the container or the pod.
 func isEmptyDirShm(vol corev1.Volume, mountPath string) bool {
 	return vol.EmptyDir != nil && vol.EmptyDir.Medium == corev1.StorageMediumMemory && mountPath == "/dev/shm"
-}
-
-// writeHealthCheck emits the single Podman health check a unit can have.
-// A livenessProbe owns it when present, exactly as before (only its exec
-// handler is translated). Otherwise a readinessProbe supplies one, which is
-// what an LLM server needs: it can report ready only after the model has
-// loaded, and until then podman keeps the container marked unhealthy rather
-// than restarting it (the readiness probe has no restart semantics in k8s
-// either).
-func writeHealthCheck(b *strings.Builder, c corev1.Container) error {
-	if probe := c.LivenessProbe; probe != nil {
-		if cmd := probe.Exec; cmd != nil && len(cmd.Command) > 0 {
-			for _, part := range cmd.Command {
-				if err := noControlChars("healthCheck command", part); err != nil {
-					return err
-				}
-			}
-			b.WriteString(fmt.Sprintf("HealthCmd=%s\n", strings.Join(cmd.Command, " ")))
-		}
-		if probe.InitialDelaySeconds > 0 {
-			b.WriteString(fmt.Sprintf("HealthStartPeriod=%ds\n", probe.InitialDelaySeconds))
-		}
-		return nil
-	}
-
-	probe := c.ReadinessProbe
-	if probe == nil {
-		return nil
-	}
-	if cmd := probe.Exec; cmd != nil && len(cmd.Command) > 0 {
-		for _, part := range cmd.Command {
-			if err := noControlChars("healthCheck command", part); err != nil {
-				return err
-			}
-		}
-		b.WriteString(fmt.Sprintf("HealthCmd=%s\n", strings.Join(cmd.Command, " ")))
-		if probe.InitialDelaySeconds > 0 {
-			b.WriteString(fmt.Sprintf("HealthStartPeriod=%ds\n", probe.InitialDelaySeconds))
-		}
-		return nil
-	}
-	if get := probe.HTTPGet; get != nil {
-		port, ok := resolveProbePort(c, get.Port)
-		if !ok {
-			// An unresolved named port must not turn into a health check
-			// against port 0: emitting nothing leaves the container without
-			// a probe, which is safer than a probe that can never pass and
-			// matches how the liveness branch silently skips non-exec probes.
-			return nil
-		}
-		path := get.Path
-		if path == "" {
-			path = "/"
-		}
-		if err := noControlChars("readinessProbe path", path); err != nil {
-			return err
-		}
-		b.WriteString(fmt.Sprintf("HealthCmd=curl -fsS http://127.0.0.1:%d%s\n", port, path))
-		if probe.PeriodSeconds > 0 {
-			b.WriteString(fmt.Sprintf("HealthInterval=%ds\n", probe.PeriodSeconds))
-		}
-		if probe.InitialDelaySeconds > 0 {
-			b.WriteString(fmt.Sprintf("HealthStartPeriod=%ds\n", probe.InitialDelaySeconds))
-		}
-	}
-	return nil
-}
-
-// resolveProbePort returns the numeric port an httpGet probe should hit. A
-// named port is looked up in the container's own port list; the second
-// result is false when the name matches nothing so the caller can skip the
-// health check instead of guessing.
-func resolveProbePort(c corev1.Container, port intstr.IntOrString) (int32, bool) {
-	if port.Type == intstr.Int {
-		return port.IntVal, true
-	}
-	for _, p := range c.Ports {
-		if p.Name == port.StrVal {
-			return p.ContainerPort, true
-		}
-	}
-	return 0, false
 }
 
 // cgroupMemoryAvailable reports whether the cgroup v2 memory controller is

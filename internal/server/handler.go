@@ -2160,6 +2160,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validatePodProbes("job spec.template.spec", &job.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateJob(&job)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -2210,6 +2214,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateSingleContainer("job spec.template.spec", &patched.Spec.Template.Spec, false); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodProbes("job spec.template.spec", &patched.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		updated, err := s.config.Store.UpdateJob(&patched)
@@ -2294,6 +2302,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validatePodProbes("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateCronJob(&cj)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -2344,6 +2356,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		if err := validateSingleContainer("cronjob spec.jobTemplate.spec.template.spec", &patched.Spec.JobTemplate.Spec.Template.Spec, false); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodProbes("cronjob spec.jobTemplate.spec.template.spec", &patched.Spec.JobTemplate.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		updated, err := s.config.Store.UpdateCronJob(&patched)
