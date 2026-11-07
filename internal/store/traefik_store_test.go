@@ -43,7 +43,7 @@ func makeIngressRouteTCP(ns, name string) *traefik.IngressRouteTCP {
 }
 
 func TestTraefikKindsPersistenceRoundTrip(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "store.json")
+	file := filepath.Join(settledTempDir(t), "store.json")
 	st1, err := store.Load(file)
 	if err != nil {
 		t.Fatalf("Load (new file): %v", err)
