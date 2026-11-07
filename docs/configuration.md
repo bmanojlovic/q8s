@@ -172,16 +172,40 @@ An `emptyDir` volume with `medium: Memory` mounted at `/dev/shm` emits `ShmSize=
 
 A pod annotation, or a Deployment/Job/CronJob pod-template annotation, `q8s.io/ulimits` holds a comma separated list such as `memlock=-1:-1,nofile=65536`. Each item becomes one `Ulimit=` line. Items must look like `name=soft` or `name=soft:hard`, otherwise the resource is rejected.
 
-## Readiness probe
+## Health checks (probes)
 
-When the first container has no `livenessProbe` (which keeps owning the single Podman health check), its `readinessProbe` is translated instead:
+Podman has one health check per container, so q8s maps the Kubernetes probes onto it:
+
+1. `livenessProbe` when set. It drives restarts: the unit gets `HealthOnFailure=kill` and the container's `Restart=` policy (`Restart=always` for `RestartPolicy: Always`) brings it back, which is podman's documented restart pattern. Without `HealthOnFailure` podman only marks the container unhealthy and never restarts it.
+2. Otherwise `readinessProbe`, rendered as a status-only check with no `HealthOnFailure`.
+3. Otherwise no health check.
+
+When both are set, liveness is rendered and readiness is not represented: podman cannot carry a second independent check, so `Ready` follows the liveness check. That combination is accepted rather than rejected.
+
+Both handlers render the command in podman's JSON exec form, written verbatim as the `HealthCmd=` value (quadlet reads the array itself and passes it to podman's `--health-cmd`):
 
 | Probe handler | Quadlet output |
 |---|---|
-| `httpGet` | `HealthCmd=curl -fsS http://127.0.0.1:<port><path>`, then `HealthInterval=<periodSeconds>s` and `HealthStartPeriod=<initialDelaySeconds>s` when those are greater than 0 |
-| `exec` | `HealthCmd=<command>`, then `HealthStartPeriod=<initialDelaySeconds>s` when it is greater than 0 |
+| `exec` | `HealthCmd=["CMD", <command...>]` |
+| `httpGet` | `HealthCmd=["CMD","curl","-fsS","-o","/dev/null", <flags>, "<scheme>://<host>:<port><path>"]` |
 
-A named `httpGet` port is resolved against the container's declared ports. If it does not match any port, no health check is emitted (this is not an error). An empty `path` defaults to `/`.
+- `exec` keeps argument boundaries: `["sh","-c","wget -qO- http://x"]` stays one argument list instead of being joined with spaces. An empty command is an error. A literal `%` in a command is written as `%%`, because systemd expands specifiers in the generated `ExecStart=` line.
+- `httpGet` uses `127.0.0.1` unless `host` is set to an IP literal; a hostname is an error because q8s does not resolve names in a probe. An empty `path` becomes `/`. `scheme: HTTPS` adds `-k` (the probe does not verify certificates, matching Kubernetes' default), and each `httpHeaders` entry adds `-H "Name: value"`. Header names must be HTTP tokens and values may not contain CR, LF or NUL. The image must contain `curl`.
+- `tcpSocket` and `grpc` are rejected (422 at the API) instead of being ignored; use an `exec` probe instead.
+- A named httpGet port is resolved against the container's ports; an unknown name is an error.
+
+Timing, with the Kubernetes defaults applied when a field is 0:
+
+| Quadlet key | Kubernetes field | Default |
+|---|---|---|
+| `HealthInterval=` | `periodSeconds` | 10s |
+| `HealthTimeout=` | `timeoutSeconds` | 1s |
+| `HealthRetries=` | `failureThreshold` | 3 |
+| `HealthStartPeriod=` | `initialDelaySeconds` | omitted when 0 |
+
+A `startupProbe` becomes podman's startup health check: `HealthStartupCmd=` (same command rendering), `HealthStartupInterval=`, `HealthStartupTimeout=`, `HealthStartupRetries=` (from `failureThreshold`, default 3) and `HealthStartupSuccess=` (from `successThreshold`, default 1). Podman requires a main health check for it, so a `startupProbe` without a `livenessProbe` or `readinessProbe` is an error.
+
+All of these rules are enforced at the API on Pod and Deployment create, update and patch (and on Job and CronJob create/patch, which render health checks too), so an unsupported probe returns 422 instead of being silently dropped.
 
 ## CronJob timer translation
 

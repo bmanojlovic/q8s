@@ -472,18 +472,130 @@ func TestContainerRestartPolicyEmptyIsAlways(t *testing.T) {
 	assertContains(t, out, "Restart=always")
 }
 
-func TestContainerLivenessProbe(t *testing.T) {
+// healthLines returns every directive writeHealthCheck emits, in order, so a
+// test can assert the exact rendering rather than just substrings.
+func healthLines(out string) []string {
+	var lines []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "Health") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func assertHealthLines(t *testing.T, out string, want ...string) {
+	t.Helper()
+	got := healthLines(out)
+	if len(got) != len(want) {
+		t.Fatalf("expected %d health check lines, got %d:\n%v\nfull output:\n%s", len(want), len(got), got, out)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("health line %d: expected %q, got %q", i, want[i], got[i])
+		}
+	}
+}
+
+func mustContainerErr(t *testing.T, pod *corev1.Pod) error {
+	t.Helper()
+	_, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil)
+	return err
+}
+
+// TestContainerLivenessExecExact: a liveness probe is a JSON exec health
+// command with podman's restart-on-failure hook and the Kubernetes timing
+// defaults filled in.
+func TestContainerLivenessExecExact(t *testing.T) {
 	pod := simplePod("default", "app", "myimage")
 	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
-		ProbeHandler:        corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"cat", "/tmp/healthy"}}},
-		InitialDelaySeconds: 5,
+		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{
+			Command: []string{"sh", "-c", "test -f /tmp/ok && echo fine"},
+		}},
 	}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, "HealthCmd=cat /tmp/healthy")
-	assertContains(t, out, "HealthStartPeriod=5")
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","sh","-c","test -f /tmp/ok && echo fine"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		"HealthOnFailure=kill",
+	)
 }
 
+// TestContainerLivenessExecSpecialChars: argument boundaries survive spaces,
+// quotes and percent signs, and the value is quoted for systemd so the JSON
+// reaches podman intact.
+func TestContainerLivenessExecSpecialChars(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{
+			Command: []string{"printf", "%s", `a "quoted" arg`},
+		}},
+	}
+	out := mustContainer(t, pod, "")
+
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","printf","%%s","a \"quoted\" arg"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		"HealthOnFailure=kill",
+	)
+}
+
+// TestContainerLivenessHTTPGetNamedPort: an httpGet liveness probe becomes a
+// curl health command, killing the container on failure.
+func TestContainerLivenessHTTPGetNamedPort(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}
+	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path: "/live",
+			Port: intstr.FromString("http"),
+		}},
+	}
+	out := mustContainer(t, pod, "")
+
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","curl","-fsS","-o","/dev/null","http://127.0.0.1:8080/live"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		"HealthOnFailure=kill",
+	)
+}
+
+// TestContainerLivenessHTTPGetHTTPSHeadersHost: HTTPS adds -k, headers become
+// -H name: value pairs, and an IP literal host replaces 127.0.0.1.
+func TestContainerLivenessHTTPGetHTTPSHeadersHost(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Path:   "/healthz",
+			Port:   intstr.FromInt32(8443),
+			Scheme: corev1.URISchemeHTTPS,
+			Host:   "10.0.0.5",
+			HTTPHeaders: []corev1.HTTPHeader{
+				{Name: "X-Token", Value: "secret"},
+				{Name: "Accept", Value: "application/json"},
+			},
+		}},
+	}
+	out := mustContainer(t, pod, "")
+
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","curl","-fsS","-o","/dev/null","-k","-H","X-Token: secret","-H","Accept: application/json","https://10.0.0.5:8443/healthz"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		"HealthOnFailure=kill",
+	)
+}
+
+// TestContainerReadinessHTTPGet: a readiness probe is status-only; no
+// HealthOnFailure means podman never restarts the container for it.
 func TestContainerReadinessHTTPGet(t *testing.T) {
 	pod := simplePod("default", "llm", "llm:latest")
 	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}
@@ -497,9 +609,14 @@ func TestContainerReadinessHTTPGet(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, "HealthCmd=curl -fsS http://127.0.0.1:8080/healthz")
-	assertContains(t, out, "HealthInterval=10s")
-	assertContains(t, out, "HealthStartPeriod=30s")
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","curl","-fsS","-o","/dev/null","http://127.0.0.1:8080/healthz"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		"HealthStartPeriod=30s",
+	)
+	assertNotContains(t, out, "HealthOnFailure=")
 }
 
 func TestContainerReadinessHTTPGetNamedPort(t *testing.T) {
@@ -513,26 +630,7 @@ func TestContainerReadinessHTTPGetNamedPort(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, "HealthCmd=curl -fsS http://127.0.0.1:8080/ready")
-}
-
-func TestContainerReadinessHTTPGetUnresolvablePort(t *testing.T) {
-	pod := simplePod("default", "llm", "llm:latest")
-	pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-			Path: "/ready",
-			Port: intstr.FromString("missing"),
-		}},
-		PeriodSeconds:       10,
-		InitialDelaySeconds: 30,
-	}
-	out := mustContainer(t, pod, "")
-
-	// An unknown named port must not error, and must not become a probe
-	// against port 0 either.
-	assertNotContains(t, out, "HealthCmd=")
-	assertNotContains(t, out, "HealthInterval=")
-	assertNotContains(t, out, "HealthStartPeriod=")
+	assertContains(t, out, "http://127.0.0.1:8080/ready")
 }
 
 func TestContainerReadinessExec(t *testing.T) {
@@ -543,10 +641,18 @@ func TestContainerReadinessExec(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, "HealthCmd=cat /tmp/ready")
-	assertContains(t, out, "HealthStartPeriod=5s")
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","cat","/tmp/ready"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		"HealthStartPeriod=5s",
+	)
+	assertNotContains(t, out, "HealthOnFailure=")
 }
 
+// TestContainerLivenessProbeWinsOverReadiness: podman has one health check;
+// liveness owns it and the readiness probe is deliberately not represented.
 func TestContainerLivenessProbeWinsOverReadiness(t *testing.T) {
 	pod := simplePod("default", "app", "myimage")
 	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
@@ -560,8 +666,94 @@ func TestContainerLivenessProbeWinsOverReadiness(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, "HealthCmd=cat /tmp/live")
-	assertNotContains(t, out, "curl -fsS")
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","cat","/tmp/live"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		"HealthOnFailure=kill",
+	)
+	assertNotContains(t, out, "curl")
+}
+
+// TestContainerStartupProbe: startup gets podman's separate startup health
+// check with its own interval/timeout/retries/success keys.
+func TestContainerStartupProbe(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"test", "-f", "/tmp/live"}}},
+	}
+	pod.Spec.Containers[0].StartupProbe = &corev1.Probe{
+		ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"test", "-f", "/tmp/started"}}},
+		PeriodSeconds:    5,
+		TimeoutSeconds:   2,
+		FailureThreshold: 30,
+		SuccessThreshold: 2,
+	}
+	out := mustContainer(t, pod, "")
+
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","test","-f","/tmp/live"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		"HealthOnFailure=kill",
+		`HealthStartupCmd=["CMD","test","-f","/tmp/started"]`,
+		"HealthStartupInterval=5s",
+		"HealthStartupTimeout=2s",
+		"HealthStartupRetries=30",
+		"HealthStartupSuccess=2",
+	)
+}
+
+// TestContainerStartupProbeDefaults: an empty startupProbe timing block gets
+// the Kubernetes defaults, including successThreshold 1.
+func TestContainerStartupProbeDefaults(t *testing.T) {
+	pod := simplePod("default", "llm", "llm:latest")
+	pod.Spec.Containers[0].ReadinessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}},
+	}
+	pod.Spec.Containers[0].StartupProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+			Port: intstr.FromInt32(8080),
+		}},
+	}
+	out := mustContainer(t, pod, "")
+
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","true"]`,
+		"HealthInterval=10s",
+		"HealthTimeout=1s",
+		"HealthRetries=3",
+		`HealthStartupCmd=["CMD","curl","-fsS","-o","/dev/null","http://127.0.0.1:8080/"]`,
+		"HealthStartupInterval=10s",
+		"HealthStartupTimeout=1s",
+		"HealthStartupRetries=3",
+		"HealthStartupSuccess=1",
+	)
+}
+
+// TestContainerLivenessExplicitTiming: explicit probe timing values are used
+// verbatim (seconds suffix on the duration keys).
+func TestContainerLivenessExplicitTiming(t *testing.T) {
+	pod := simplePod("default", "app", "myimage")
+	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
+		ProbeHandler:        corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}},
+		PeriodSeconds:       7,
+		TimeoutSeconds:      2,
+		FailureThreshold:    5,
+		InitialDelaySeconds: 11,
+	}
+	out := mustContainer(t, pod, "")
+
+	assertHealthLines(t, out,
+		`HealthCmd=["CMD","true"]`,
+		"HealthInterval=7s",
+		"HealthTimeout=2s",
+		"HealthRetries=5",
+		"HealthStartPeriod=11s",
+		"HealthOnFailure=kill",
+	)
 }
 
 func TestContainerNoReadinessProbe(t *testing.T) {
@@ -570,6 +762,101 @@ func TestContainerNoReadinessProbe(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	assertNotContains(t, out, "HealthCmd=")
+}
+
+// TestContainerProbeErrors covers every unsupported probe shape: none may be
+// silently dropped.
+func TestContainerProbeErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		probe func(*corev1.Container)
+	}{
+		{
+			name: "tcpSocket",
+			probe: func(c *corev1.Container) {
+				c.LivenessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(80)},
+				}}
+			},
+		},
+		{
+			name: "grpc",
+			probe: func(c *corev1.Container) {
+				c.ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					GRPC: &corev1.GRPCAction{Port: 50051},
+				}}
+			},
+		},
+		{
+			name: "unresolved named port",
+			probe: func(c *corev1.Container) {
+				c.ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{Path: "/ready", Port: intstr.FromString("missing")},
+				}}
+			},
+		},
+		{
+			name: "header name with space",
+			probe: func(c *corev1.Container) {
+				c.LivenessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Port:        intstr.FromInt32(80),
+						HTTPHeaders: []corev1.HTTPHeader{{Name: "Bad Header", Value: "x"}},
+					},
+				}}
+			},
+		},
+		{
+			name: "header value with newline",
+			probe: func(c *corev1.Container) {
+				c.LivenessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{
+						Port:        intstr.FromInt32(80),
+						HTTPHeaders: []corev1.HTTPHeader{{Name: "X-Test", Value: "a\r\nInjected: yes"}},
+					},
+				}}
+			},
+		},
+		{
+			name: "hostname host",
+			probe: func(c *corev1.Container) {
+				c.LivenessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromInt32(80), Host: "example.com"},
+				}}
+			},
+		},
+		{
+			name: "startup alone",
+			probe: func(c *corev1.Container) {
+				c.StartupProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{Command: []string{"true"}},
+				}}
+			},
+		},
+		{
+			name: "empty exec command",
+			probe: func(c *corev1.Container) {
+				c.LivenessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{},
+				}}
+			},
+		},
+		{
+			name: "empty handler",
+			probe: func(c *corev1.Container) {
+				c.LivenessProbe = &corev1.Probe{}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := simplePod("default", "app", "myimage")
+			tt.probe(&pod.Spec.Containers[0])
+			if err := mustContainerErr(t, pod); err == nil {
+				t.Fatal("expected an error, got none")
+			}
+		})
+	}
 }
 
 func TestContainerGPUDevice(t *testing.T) {
@@ -756,7 +1043,7 @@ func TestJobContainerPodTemplateAnnotations(t *testing.T) {
 
 	assertContains(t, out, "Ulimit=memlock=-1:-1")
 	assertContains(t, out, "AddDevice=nvidia.com/gpu=all")
-	assertContains(t, out, "HealthCmd=true")
+	assertContains(t, out, `HealthCmd=["CMD","true"]`)
 }
 
 func TestJobContainerReadOnlyPVC(t *testing.T) {

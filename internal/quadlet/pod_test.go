@@ -113,7 +113,7 @@ func TestPodUnitsTwoContainers(t *testing.T) {
 		"ContainerName=default-multi-sidecar",
 		"Pod=default-multi.pod",
 		"Environment=ROLE=sidecar",
-		"HealthCmd=test -f /tmp/ready",
+		`HealthCmd=["CMD","test","-f","/tmp/ready"]`,
 		"Label=io.kubernetes.container.name=sidecar",
 	} {
 		assertContains(t, sidecarOut, want)
