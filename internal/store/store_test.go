@@ -943,7 +943,7 @@ func TestResourceVersionIncrements(t *testing.T) {
 // --- Persistence ---
 
 func TestPersistence(t *testing.T) {
-	dir := t.TempDir()
+	dir := settledTempDir(t)
 	file := filepath.Join(dir, "store.json")
 
 	// Write
@@ -985,7 +985,7 @@ func TestPersistence(t *testing.T) {
 }
 
 func TestLoadNonExistentFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := settledTempDir(t)
 	file := filepath.Join(dir, "nosuchfile.json")
 	st, err := store.Load(file)
 	if err != nil {
@@ -998,7 +998,7 @@ func TestLoadNonExistentFile(t *testing.T) {
 }
 
 func TestLoadCorruptedFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := settledTempDir(t)
 	file := filepath.Join(dir, "store.json")
 	if err := os.WriteFile(file, []byte("not valid json"), 0600); err != nil {
 		t.Fatal(err)
@@ -1015,7 +1015,7 @@ func TestLoadCorruptedFile(t *testing.T) {
 // stringData into Data at load time so a bare restart's restoreSecretFiles
 // (which writes from Data alone) rewrites real content, not empty files.
 func TestLoadNormalizesLegacySecrets(t *testing.T) {
-	dir := t.TempDir()
+	dir := settledTempDir(t)
 	file := filepath.Join(dir, "store.json")
 
 	// stringData-only legacy secret (content nowhere in data) + a dual-map
@@ -1079,7 +1079,7 @@ func TestLoadNormalizesLegacySecrets(t *testing.T) {
 // a replicaPorts map. The allocator is gone, but such a snapshot must still
 // load (the field is ignored) so an upgrade keeps its existing objects.
 func TestLoadIgnoresLegacyReplicaPorts(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "store.json")
+	file := filepath.Join(settledTempDir(t), "store.json")
 	legacy := `{
 		"resourceVersion": 7,
 		"pods": [{"metadata":{"name":"nginx","namespace":"default"},"spec":{"containers":[{"name":"nginx","image":"nginx:latest"}]}}],
@@ -1188,4 +1188,31 @@ func reloadUntil(t *testing.T, file string, ready func(*store.Store) bool) *stor
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// settledTempDir is t.TempDir for tests that write through a file-backed
+// store. Saves run on background goroutines and can still be writing
+// store.json.tmp when the test returns, which makes t.TempDir's cleanup fail
+// with "directory not empty"; this cleanup retries until they are done.
+func settledTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "q8s-store-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			err := os.RemoveAll(dir)
+			if err == nil {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("remove %s: %v", dir, err)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+	return dir
 }
