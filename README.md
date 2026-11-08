@@ -35,6 +35,8 @@ chmod +x q8s
 
 This generates TLS certificates, installs systemd units, and prints the exact `kubectl config` commands to run.
 Run it as root (`sudo ./q8s install`) for a system-wide install: data in `/etc/q8s`, units in `/etc/systemd/system`.
+Rootless needs lingering, so the user's systemd manager and every pod keep running after logout;
+`q8s install` enables it (or prints the `sudo loginctl enable-linger` command), and `q8s status` warns when it is off.
 See [docs/configuration.md](docs/configuration.md#rootless-vs-rootful).
 
 Alternatively, export a standalone kubeconfig file:
