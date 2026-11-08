@@ -206,7 +206,7 @@ func TestUserNamespaceCheck(t *testing.T) {
 			subuid:   "",
 			subgid:   "",
 			want:     StatusWarn,
-			wantFix:  "echo containers:2147483647:2147483648 >> /etc/subuid",
+			wantFix:  "q8s serve adds it on its next start",
 			wantLoss: true,
 		},
 		{
@@ -713,7 +713,7 @@ func TestRenderText(t *testing.T) {
 		"q8s doctor: rootful, podman 5.8.2",
 		"[warn] userns",
 		"lose: container uids are host uids",
-		"fix:  echo containers:2147483647:2147483648 >> /etc/subuid",
+		"fix:  q8s serve adds it on its next start (or by hand: echo containers:2147483647:2147483648 >> /etc/subuid",
 		"\nsummary\n",
 		"  isolation",
 		"  certificates",

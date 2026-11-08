@@ -125,6 +125,41 @@ Deployment-owned pods are restored from container labels on startup if the deplo
 
 All API traffic uses mutual TLS (mTLS). No certificate = 401. Certificates are ECDSA P-256, valid 1 year. Having the client cert implies full access (single-user system, no RBAC).
 
+## User namespaces (rootful)
+
+Rootful q8s runs every pod in its own user namespace, the podman equivalent of
+Kubernetes `pod.spec.hostUsers: false` (KEP-127). Standalone containers, Jobs
+and CronJobs get `UserNS=auto` in their `[Container]` section; a multi-container
+pod gets it once in its `[Pod]` section, because podman rejects a user namespace
+on a container that joins a pod and members inherit the pod's namespace.
+
+`UserNS=auto` makes podman allocate a fresh, unprivileged host uid range for the
+pod from the `containers` entry in `/etc/subuid` and `/etc/subgid`. Root inside
+the container is therefore not host root, and two containers using the same uid
+no longer share a host identity. On startup rootful `q8s serve` ensures that
+range exists (`containers:2147483647:2147483648`) by appending it when missing.
+The choice is deliberately high so it cannot collide with ordinary login users,
+and existing lines are never rewritten.
+
+Every `Volume=` line of a unit in a user namespace gets the `idmap` mount option
+(named volumes, hostpath binds, ConfigMap and Secret binds, with or without
+`:ro`). Without it the shifted uids would see the host owners of existing data
+as unmapped; with it, files owned by host uid 0 or 2000 appear as 0 or 2000
+inside the container. Data keeps its host owners and no chown is needed.
+
+The memory-backed emptyDir at `/dev/shm` is not a `Volume=` line and stays as
+rendered (`ShmSize=` when a size limit is set).
+
+Two exceptions stay in the host user namespace:
+
+- `hostNetwork: true` pods. A user namespace with the host network namespace
+  gains no isolation and cannot bind host ports below 1024.
+- `hostUsers: true` pods, the Kubernetes opt-out. `hostUsers: false` is the
+  same as leaving it unset: the pod gets a user namespace.
+
+Rootless mode is unchanged: rootless podman containers already run inside the
+user's subordinate uid range.
+
 ## Directory layout
 
 ```

@@ -1,11 +1,15 @@
 // Package hostcheck inspects what the local host gives q8s workloads and
-// reports it in plain words. It is strictly read-only: every host access goes
-// through Env, and the only external commands it may run are podman version,
+// reports it in plain words. The checks are read-only: every host access goes
+// through Env, and the only external commands they may run are podman version,
 // podman info and (rootless) loginctl via install.LingerEnabled.
 //
-// The package is deliberately independent of cmd/q8s so a later change can
-// reuse the same checks at `q8s serve` startup, for example to decide whether
-// pods default to UserNS=auto.
+// The one writer is EnsureContainersRange, which appends the subordinate id
+// range podman's --userns=auto needs. Rootful `q8s serve` calls it before
+// rendering units, the way kubelet prepares the host it owns.
+//
+// The package is deliberately independent of cmd/q8s so the same checks can be
+// reused at `q8s serve` startup, for example to decide whether pods default to
+// UserNS=auto.
 package hostcheck
 
 import (
@@ -75,13 +79,14 @@ const (
 	// 65536 ids is the conventional minimum for a single container image.
 	minSubIDCount = 65536
 
-	// largeSubIDRange is the range suggested for the rootful 'containers'
-	// entry. It is deliberately high to avoid colliding with login users.
-	largeSubIDRange = "2147483647:2147483648"
-
 	// rootlessSubIDRange is a placeholder range for rootless usermod fixes.
 	rootlessSubIDRange = "100000-165535"
 )
+
+// largeSubIDRange is the range suggested for the rootful 'containers' entry.
+// It is deliberately high to avoid colliding with login users. Derived from
+// the constants so the doctor fix and subid.go cannot drift apart.
+var largeSubIDRange = fmt.Sprintf("%d:%d", ContainersRangeStart, ContainersRangeCount)
 
 func (e Env) readFile(path string) ([]byte, error) {
 	if e.ReadFile == nil {
@@ -159,8 +164,8 @@ func Run(env Env) Report {
 	return r
 }
 
-// UserNSAvailable is exported for the later startup reuse: true when the host
-// can run --userns=auto. Rootful needs a 'containers' entry in BOTH
+// UserNSAvailable is exported for startup reuse: true when the host can run
+// --userns=auto. Rootful needs a 'containers' entry in BOTH
 // /etc/subuid and /etc/subgid with at least 65536 ids. Rootless is already
 // inside a user namespace, so it always reports false here.
 func UserNSAvailable(env Env) bool {
@@ -289,7 +294,9 @@ func checkUserNS(env Env) Check {
 		c.Loss = "container uids are host uids: root in a container is real host root, and two containers using the same uid share an identity"
 		if len(missing) > 0 {
 			c.Detail = fmt.Sprintf("no 'containers' entry in %s", strings.Join(missing, ", "))
-			c.Fix = fmt.Sprintf("echo containers:%s >> %s && echo containers:%s >> %s",
+			// q8s serve now adds the range itself before rendering units, so
+			// the manual commands are only the fallback for a stopped service.
+			c.Fix = fmt.Sprintf("q8s serve adds it on its next start (or by hand: echo containers:%s >> %s && echo containers:%s >> %s)",
 				largeSubIDRange, subUIDPath, largeSubIDRange, subGIDPath)
 			return c
 		}

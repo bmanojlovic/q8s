@@ -185,6 +185,37 @@ var (
 	cgroupHasCPU    bool
 )
 
+// userNSEnabled is the package-level switch for rootful UserNS=auto. It is
+// off by default so rootless mode, tests and any rendering done before serve
+// has probed the host keep producing exactly what q8s produced before user
+// namespaces existed.
+var userNSEnabled bool
+
+// SetUserNS turns rootful user namespaces on for every unit rendered
+// afterwards. Off by default (rootless, and tests). Returns a restore func for
+// tests, matching SetCgroupOverride.
+func SetUserNS(enabled bool) func() {
+	orig := userNSEnabled
+	userNSEnabled = enabled
+	return func() {
+		userNSEnabled = orig
+	}
+}
+
+// podUsesUserNS reports whether this pod gets UserNS=auto. A user namespace
+// combined with the host network namespace gains no isolation and cannot bind
+// host ports below 1024, so hostNetwork pods stay in the host user namespace.
+// hostUsers: true is the Kubernetes opt-out (pod.spec.hostUsers, KEP-127).
+func podUsesUserNS(spec corev1.PodSpec) bool {
+	if !userNSEnabled {
+		return false
+	}
+	if spec.HostNetwork {
+		return false
+	}
+	return spec.HostUsers == nil || !*spec.HostUsers
+}
+
 // SetCgroupOverride forces the memory/cpu controller flags for testing.
 // It returns a function that restores the original values.
 func SetCgroupOverride(memory, cpu bool) func() {
@@ -295,6 +326,7 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
 	spec := job.Spec.Template.Spec
 	ns := job.Namespace
+	userNS := podUsesUserNS(spec)
 
 	if err := validateRefName("job name", name); err != nil {
 		return nil, err
@@ -314,6 +346,9 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 	}
 	writeImageAndPull(&b, spec.Containers[0])
 	b.WriteString(fmt.Sprintf("ContainerName=%s-%s-job\n", ns, name))
+	if userNS {
+		b.WriteString("UserNS=auto\n")
+	}
 
 	if cmd := append(spec.Containers[0].Command, spec.Containers[0].Args...); len(cmd) > 0 {
 		for _, part := range cmd {
@@ -370,13 +405,13 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 						return nil, err
 					}
 					if pvc, ok := pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
-						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath, readOnly)
+						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath, readOnly, userNS)
 						if err != nil {
 							return nil, err
 						}
 						b.WriteString(line)
 					} else {
-						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, mountOptions(readOnly, "Z")))
+						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
 					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
@@ -384,7 +419,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 					}
 					if configDir != "" {
 						cmPath := fmt.Sprintf("%s/%s/%s", configDir, ns, vol.ConfigMap.Name)
-						b.WriteString(fmt.Sprintf("Volume=%s:%s:ro,z\n", cmPath, vm.MountPath))
+						b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", cmPath, vm.MountPath, volumeOptions(true, "z", userNS)))
 					}
 				case vol.Secret != nil:
 					if err := validateRefName("secret.secretName", vol.Secret.SecretName); err != nil {
@@ -393,13 +428,13 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 					if configDir != "" {
 						secretDir := filepath.Join(filepath.Dir(configDir), "secrets")
 						secPath := filepath.Join(secretDir, ns, vol.Secret.SecretName)
-						b.WriteString(fmt.Sprintf("Volume=%s:%s:ro,z\n", secPath, vm.MountPath))
+						b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", secPath, vm.MountPath, volumeOptions(true, "z", userNS)))
 					}
 				default:
 					if err := validateRefName("volume.name", vol.Name); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, mountOptions(readOnly, "")))
+					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, volumeOptions(readOnly, "", userNS)))
 				}
 			}
 		}
@@ -444,6 +479,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
 	spec := cj.Spec.JobTemplate.Spec.Template.Spec
 	ns := cj.Namespace
+	userNS := podUsesUserNS(spec)
 
 	if err := validateRefName("cronjob name", name); err != nil {
 		return nil, err
@@ -463,6 +499,9 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 	}
 	writeImageAndPull(&b, spec.Containers[0])
 	b.WriteString(fmt.Sprintf("ContainerName=%s-%s-cron\n", ns, name))
+	if userNS {
+		b.WriteString("UserNS=auto\n")
+	}
 
 	if cmd := append(spec.Containers[0].Command, spec.Containers[0].Args...); len(cmd) > 0 {
 		for _, part := range cmd {
@@ -519,13 +558,13 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 						return nil, err
 					}
 					if pvc, ok := pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
-						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath, readOnly)
+						line, err := pvcVolumeDirective(ns, pvc, vm.MountPath, readOnly, userNS)
 						if err != nil {
 							return nil, err
 						}
 						b.WriteString(line)
 					} else {
-						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, mountOptions(readOnly, "Z")))
+						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
 					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
@@ -533,7 +572,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 					}
 					if configDir != "" {
 						cmPath := fmt.Sprintf("%s/%s/%s", configDir, ns, vol.ConfigMap.Name)
-						b.WriteString(fmt.Sprintf("Volume=%s:%s:ro,z\n", cmPath, vm.MountPath))
+						b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", cmPath, vm.MountPath, volumeOptions(true, "z", userNS)))
 					}
 				case vol.Secret != nil:
 					if err := validateRefName("secret.secretName", vol.Secret.SecretName); err != nil {
@@ -542,13 +581,13 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 					if configDir != "" {
 						secretDir := filepath.Join(filepath.Dir(configDir), "secrets")
 						secPath := filepath.Join(secretDir, ns, vol.Secret.SecretName)
-						b.WriteString(fmt.Sprintf("Volume=%s:%s:ro,z\n", secPath, vm.MountPath))
+						b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", secPath, vm.MountPath, volumeOptions(true, "z", userNS)))
 					}
 				default:
 					if err := validateRefName("volume.name", vol.Name); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, mountOptions(readOnly, "")))
+					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, volumeOptions(readOnly, "", userNS)))
 				}
 			}
 		}
@@ -824,17 +863,33 @@ func mountOptions(readOnly bool, relabel string) string {
 	return ":" + opts
 }
 
+// volumeOptions is mountOptions plus idmap when the unit runs in its own
+// user namespace. The namespace shifts the container's uids on the host, so
+// without an idmapped mount existing data (owned by host uid 0 or 2000) would
+// show up as unmapped and unreadable. idmap keeps the host owners visible as
+// the same numbers and avoids a chown of every volume.
+func volumeOptions(readOnly bool, relabel string, userNS bool) string {
+	opts := mountOptions(readOnly, relabel)
+	if !userNS {
+		return opts
+	}
+	if opts == "" {
+		return ":idmap"
+	}
+	return opts + ",idmap"
+}
+
 // pvcVolumeDirective returns the Volume= value for a PVC-backed volume mount.
 // It inspects the PVC's storageClassName and annotations to decide between a
 // named-volume reference (with :Z or :z) and a hostpath bind mount, and adds
 // the ro option when readOnly is set.
-func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath string, readOnly bool) (string, error) {
+func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath string, readOnly, userNS bool) (string, error) {
 	class := pvcStorageClass(pvc)
 	switch class {
 	case StorageClassStandard:
-		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, mountOptions(readOnly, "Z")), nil
+		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, volumeOptions(readOnly, "Z", userNS)), nil
 	case StorageClassShared:
-		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, mountOptions(readOnly, "z")), nil
+		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, volumeOptions(readOnly, "z", userNS)), nil
 	case StorageClassHostPath:
 		hostPath, ok := pvc.Annotations[AnnotationHostPath]
 		if !ok || hostPath == "" {
@@ -848,11 +903,11 @@ func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath 
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Volume=%s:%s%s\n", hostPath, mountPath, mountOptions(readOnly, relabel)), nil
+		return fmt.Sprintf("Volume=%s:%s%s\n", hostPath, mountPath, volumeOptions(readOnly, relabel, userNS)), nil
 	default:
 		// Unknown class — fall back to named volume without SELinux option
 		// for forward compatibility.
-		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, mountOptions(readOnly, "")), nil
+		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, volumeOptions(readOnly, "", userNS)), nil
 	}
 }
 

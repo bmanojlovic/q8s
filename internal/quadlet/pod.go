@@ -139,6 +139,13 @@ func renderPod(name string, pod *corev1.Pod, serviceAliases []string, networks [
 	podName := fmt.Sprintf("%s-%s", pod.Namespace, name)
 	b.WriteString(fmt.Sprintf("PodName=%s\n", podName))
 
+	// The pod owns the user namespace, not its member containers: podman
+	// rejects UserNS= on a container that joins a pod, and members inherit
+	// the pod's namespace. Their Volume= lines still get idmap.
+	if podUsesUserNS(pod.Spec) {
+		b.WriteString("UserNS=auto\n")
+	}
+
 	// Network: host networking when requested, otherwise the namespace
 	// networks. NetworkAlias only makes sense on the namespace bridge, and
 	// podman applies the aliases on every attached network.
@@ -269,6 +276,8 @@ func renderContainer(r containerRender) ([]byte, error) {
 	b.WriteString(fmt.Sprintf("ContainerName=%s\n", r.containerName))
 	if r.podUnit != "" {
 		b.WriteString(fmt.Sprintf("Pod=%s\n", r.podUnit))
+	} else if podUsesUserNS(pod.Spec) {
+		b.WriteString("UserNS=auto\n")
 	}
 
 	// Exec: combine command (entrypoint override) and args
@@ -446,6 +455,9 @@ func writePublishPorts(b *strings.Builder, ports []corev1.ContainerPort) {
 // pod by renderPod.
 func writeContainerVolumes(b *strings.Builder, r containerRender) error {
 	pod := r.pod
+	// A member of a userns pod needs idmap just like a standalone unit: the
+	// namespace is inherited from the pod, the volume options are not.
+	userNS := podUsesUserNS(pod.Spec)
 	for _, vol := range pod.Spec.Volumes {
 		for _, vm := range r.container.VolumeMounts {
 			if vm.Name != vol.Name {
@@ -467,14 +479,14 @@ func writeContainerVolumes(b *strings.Builder, r containerRender) error {
 					return err
 				}
 				if pvc, ok := r.pvcMap[vol.PersistentVolumeClaim.ClaimName]; ok {
-					line, err := pvcVolumeDirective(pod.Namespace, pvc, vm.MountPath, readOnly)
+					line, err := pvcVolumeDirective(pod.Namespace, pvc, vm.MountPath, readOnly, userNS)
 					if err != nil {
 						return err
 					}
 					b.WriteString(line)
 				} else {
 					// PVC not found in map - fall back to named volume with :Z
-					b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", pod.Namespace, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, mountOptions(readOnly, "Z")))
+					b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", pod.Namespace, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
 				}
 			case vol.ConfigMap != nil:
 				if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
@@ -482,7 +494,7 @@ func writeContainerVolumes(b *strings.Builder, r containerRender) error {
 				}
 				if r.configDir != "" {
 					cmPath := fmt.Sprintf("%s/%s/%s", r.configDir, pod.Namespace, vol.ConfigMap.Name)
-					b.WriteString(fmt.Sprintf("Volume=%s:%s:ro,z\n", cmPath, vm.MountPath))
+					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", cmPath, vm.MountPath, volumeOptions(true, "z", userNS)))
 				}
 			case vol.Secret != nil:
 				if err := validateRefName("secret.secretName", vol.Secret.SecretName); err != nil {
@@ -491,13 +503,13 @@ func writeContainerVolumes(b *strings.Builder, r containerRender) error {
 				if r.configDir != "" {
 					secretDir := filepath.Join(filepath.Dir(r.configDir), "secrets")
 					secPath := filepath.Join(secretDir, pod.Namespace, vol.Secret.SecretName)
-					b.WriteString(fmt.Sprintf("Volume=%s:%s:ro,z\n", secPath, vm.MountPath))
+					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", secPath, vm.MountPath, volumeOptions(true, "z", userNS)))
 				}
 			default:
 				if err := validateRefName("volume.name", vol.Name); err != nil {
 					return err
 				}
-				b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, mountOptions(readOnly, "")))
+				b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, volumeOptions(readOnly, "", userNS)))
 			}
 		}
 	}

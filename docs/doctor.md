@@ -41,7 +41,7 @@ q8s doctor: rootful, podman 5.8.2, kernel 6.12.0-160100.8-default
 [info] kernel        6.12.0-160100.8-default
 [warn] userns        no 'containers' entry in /etc/subuid, /etc/subgid
        lose: container uids are host uids: root in a container is real host root, and two containers using the same uid share an identity
-       fix:  echo containers:2147483647:2147483648 >> /etc/subuid && echo containers:2147483647:2147483648 >> /etc/subgid
+       fix:  q8s serve adds it on its next start (or by hand: echo containers:2147483647:2147483648 >> /etc/subuid && echo containers:2147483647:2147483648 >> /etc/subgid)
 [ok]   idmap         /var/lib/containers/storage=xfs, /etc/q8s=xfs, /run/q8s=tmpfs, /etc/q8s/traefik=tmpfs
        gain: volumes keep their host owners inside a user namespace, no chown needed
 [ok]   cgroups       cpu, memory and pids are delegated
@@ -84,9 +84,10 @@ Rootful: looks for a `containers` entry in both `/etc/subuid` and
 `/etc/subgid` with at least 65536 ids. With it, root inside a container is an
 unprivileged uid on the host and each pod gets a separate range. Without it,
 container uids are host uids, so root in a container is real host root and two
-containers sharing a uid share an identity. The fix appends the `containers`
-range to both files. Too small a range gets a fix that replaces those lines
-(`containers` is not a login user, so `usermod` cannot change it).
+containers sharing a uid share an identity. Rootful `q8s serve` adds the
+`containers` range itself on its next start, so the fix says that and also
+shows the equivalent manual command. Too small a range gets a fix that replaces
+those lines (`containers` is not a login user, so `usermod` cannot change it).
 
 Rootless: looks for the current login name or numeric uid in both files. It is
 a fail when missing, because rootless podman cannot run images that need more

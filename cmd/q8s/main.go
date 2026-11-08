@@ -618,6 +618,34 @@ func cmdServe() {
 	}
 	d := resolveDirs(rootful)
 
+	// Rootful pods run in their own user namespace, the podman equivalent of
+	// kubelet's pod.spec.hostUsers: false. q8s owns the host like kubelet
+	// does, so it ensures the subordinate range podman's --userns=auto
+	// allocates from before rendering any unit. Startup re-renders every
+	// unit, which is also how existing pods move into a namespace on upgrade.
+	if rootful {
+		changedUID, changedGID, ensureErr := hostcheck.EnsureContainersRange("/etc/subuid", "/etc/subgid")
+		if changedUID {
+			fmt.Printf("added containers:%d:%d to /etc/subuid\n", hostcheck.ContainersRangeStart, hostcheck.ContainersRangeCount)
+		}
+		if changedGID {
+			fmt.Printf("added containers:%d:%d to /etc/subgid\n", hostcheck.ContainersRangeStart, hostcheck.ContainersRangeCount)
+		}
+		if ensureErr != nil {
+			fmt.Printf("warning: user namespaces disabled: %v\n", ensureErr)
+		}
+		if hostcheck.UserNSAvailable(hostcheck.Env{Rootful: true, ReadFile: os.ReadFile}) {
+			quadlet.SetUserNS(true)
+			fmt.Println("user namespaces: on (UserNS=auto, idmap volumes)")
+		} else {
+			reason := "no usable 'containers' range in /etc/subuid and /etc/subgid"
+			if ensureErr != nil {
+				reason = ensureErr.Error()
+			}
+			fmt.Printf("user namespaces: off (%s)\n", reason)
+		}
+	}
+
 	caCert, err := os.ReadFile(d.dataDir + "/certs/ca.crt")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to read CA cert: %v\n", err)
