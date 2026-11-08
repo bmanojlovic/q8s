@@ -214,7 +214,12 @@ func cmdInstall() {
 				fmt.Fprintln(os.Stderr, "--san-dns requires a value")
 				os.Exit(1)
 			}
-			extraDNS = append(extraDNS, args[i])
+			name, err := install.NormalizeSANDNS(args[i])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid --san-dns %q: %v\n", args[i], err)
+				os.Exit(1)
+			}
+			extraDNS = append(extraDNS, name)
 		case "--server":
 			i++
 			if i >= len(args) {

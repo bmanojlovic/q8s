@@ -186,3 +186,34 @@ func writeTestCerts(t *testing.T, dir string, validity time.Duration) error {
 	}
 	return writeCerts(dir, c)
 }
+
+func TestNormalizeSANDNS(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+		ok       bool
+	}{
+		{"node1.example.com", "node1.example.com", true},
+		{" Node1 ", "node1", true},
+		{"*.apps.example.com", "*.apps.example.com", true},
+		{"root@203.0.113.10", "", false},
+		{"https://example.com", "", false},
+		{"", "", false},
+		{"a..b", "", false},
+	} {
+		got, err := NormalizeSANDNS(tc.in)
+		if (err == nil) != tc.ok || got != tc.want {
+			t.Errorf("NormalizeSANDNS(%q) = %q, %v; want %q ok=%v", tc.in, got, err, tc.want, tc.ok)
+		}
+	}
+}
+
+// A persisted invalid name (from an install before validation existed) is
+// dropped from the existing list itself, so the cleanup does not count as a
+// SAN change: that would mint a new CA and client identity.
+func TestInvalidPersistedSANIsNotARegenReason(t *testing.T) {
+	existing := PersistentConfig{ExtraSANDNS: validSANDNS([]string{"a.example", "root@203.0.113.10"})}
+	merged := PersistentConfig{ExtraSANDNS: []string{"a.example"}}
+	if !sameStrings(merged.ExtraSANDNS, existing.ExtraSANDNS) {
+		t.Fatalf("existing after filter = %v, want [a.example]", existing.ExtraSANDNS)
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/validation"
 	"q8s/internal/quadlet"
 )
 
@@ -292,6 +293,13 @@ func Install(cfg InstallConfig) error {
 
 	// Load existing persistent config (preserves SANs across regen).
 	existing, _ := LoadConfig(dataDir)
+	// Older installs persisted --san-dns unvalidated. Drop invalid names from
+	// the existing list itself, not only from the merge, so cleaning them up
+	// is not a SAN change: a SAN change regenerates the CA and the client
+	// identity, which would invalidate every kubeconfig for a name that was
+	// never usable. The invalid name leaves the certificate at the next real
+	// regeneration.
+	existing.ExtraSANDNS = validSANDNS(existing.ExtraSANDNS)
 
 	// Merge: new flags override, existing values fill gaps.
 	pcfg := PersistentConfig{Port: cfg.Port}
@@ -339,13 +347,19 @@ func Install(cfg InstallConfig) error {
 
 	sanDNSSet := make(map[string]bool)
 	addDNS := func(name string) {
+		// Both inputs are normalized before they get here: new ones just
+		// below, persisted ones by validSANDNS.
 		if !sanDNSSet[name] {
 			sanDNSSet[name] = true
 			pcfg.ExtraSANDNS = append(pcfg.ExtraSANDNS, name)
 		}
 	}
 	for _, name := range cfg.ExtraSANDNS {
-		addDNS(name)
+		n, err := NormalizeSANDNS(name)
+		if err != nil {
+			return fmt.Errorf("invalid certificate DNS name %q: %w", name, err)
+		}
+		addDNS(n)
 	}
 	for _, name := range existing.ExtraSANDNS {
 		addDNS(name)
@@ -790,4 +804,32 @@ func enableLinger() {
 		return
 	}
 	fmt.Println("Enabled lingering (user services keep running after logout).")
+}
+
+// NormalizeSANDNS lowercases a certificate DNS name and checks it is a valid
+// DNS name (RFC 1123 subdomain, the same rule Kubernetes applies), optionally
+// with a leading "*." wildcard label. Anything else, such as "root@1.2.3.4" or
+// a URL, would end up as a meaningless DNS SAN in the server certificate.
+func NormalizeSANDNS(name string) (string, error) {
+	n := strings.ToLower(strings.TrimSpace(name))
+	check := strings.TrimPrefix(n, "*.")
+	if errs := validation.IsDNS1123Subdomain(check); len(errs) > 0 {
+		return "", fmt.Errorf("not a DNS name: %s", strings.Join(errs, "; "))
+	}
+	return n, nil
+}
+
+// validSANDNS returns the valid, normalized names from a persisted SAN list,
+// warning about each one it drops.
+func validSANDNS(names []string) []string {
+	var out []string
+	for _, name := range names {
+		n, err := NormalizeSANDNS(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: dropping invalid certificate DNS name %q: %v\n", name, err)
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
 }
