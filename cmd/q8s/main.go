@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,9 +18,11 @@ import (
 	"time"
 
 	"github.com/coreos/go-systemd/v22/daemon"
+	"golang.org/x/sys/unix"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/hostcheck"
 	"q8s/internal/podman"
 	"q8s/internal/quadlet"
 	"q8s/internal/server"
@@ -43,6 +48,8 @@ func main() {
 		cmdUninstall()
 	case "status":
 		cmdStatus()
+	case "doctor":
+		cmdDoctor()
 	case "start":
 		cmdStart()
 	case "stop":
@@ -72,6 +79,7 @@ func printUsage() {
 	fmt.Println("  install    Generate certs, create dirs, install systemd units")
 	fmt.Println("  uninstall  Remove q8s installation")
 	fmt.Println("  status     Show q8s server status and connectivity")
+	fmt.Println("  doctor     Report host capabilities and limits for workloads (read-only)")
 	fmt.Println("  start      Start the q8s socket (begin accepting connections)")
 	fmt.Println("  stop       Stop the q8s socket and API server")
 	fmt.Println("  enable     Enable and start q8s socket on boot")
@@ -399,6 +407,112 @@ func cmdStatus() {
 		fmt.Printf("q8s port %d: reachable\n", port)
 	} else {
 		fmt.Printf("q8s port %d: not reachable\n", port)
+	}
+}
+
+func cmdDoctor() {
+	rootful := os.Getuid() == 0
+	d := resolveDirs(rootful)
+
+	jsonOut := false
+	for _, arg := range os.Args[2:] {
+		switch arg {
+		case "-h", "--help":
+			printDoctorUsage(os.Stdout)
+			return
+		case "--json":
+			jsonOut = true
+		default:
+			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", arg)
+			printDoctorUsage(os.Stderr)
+			os.Exit(2)
+		}
+	}
+
+	uid := os.Getuid()
+	username := strconv.Itoa(uid)
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		username = u.Username
+	}
+
+	kernel := ""
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err == nil {
+		kernel = unix.ByteSliceToString(uts.Release[:])
+	}
+
+	report := hostcheck.Run(hostcheck.Env{
+		Rootful:  rootful,
+		UID:      uid,
+		User:     username,
+		Kernel:   kernel,
+		ReadFile: os.ReadFile,
+		Command: func(name string, args ...string) ([]byte, error) {
+			return exec.Command(name, args...).Output()
+		},
+		FSType:   realFSType,
+		Writable: func(path string) bool { return unix.Access(path, unix.W_OK) == nil },
+		Linger:   install.LingerEnabled,
+		Now:      time.Now(),
+		Dirs: hostcheck.Dirs{
+			Data:    d.dataDir,
+			Quadlet: d.quadletDir,
+			Config:  d.configDir,
+			Secret:  d.secretDir,
+			Systemd: d.systemdDir,
+			Traefik: d.dataDir + "/traefik",
+		},
+	})
+
+	if jsonOut {
+		data, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to encode report: %v\n", err)
+			os.Exit(2)
+		}
+		fmt.Println(string(data))
+	} else {
+		hostcheck.RenderText(os.Stdout, report)
+	}
+	os.Exit(hostcheck.ExitCode(report))
+}
+
+func printDoctorUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: q8s doctor [--json]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Reports what this host gives q8s workloads and what it does not.")
+	fmt.Fprintln(w, "Read-only: it never writes files or starts containers.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --json   Print the report as JSON")
+	fmt.Fprintln(w, "  -h, --help")
+}
+
+// realFSType maps the Statfs magic to a filesystem name. Names, not magic
+// numbers, are what the idmap check reasons about.
+func realFSType(path string) (string, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return "", err
+	}
+	magic := uint32(st.Type)
+	switch magic {
+	case 0xEF53:
+		return "ext4", nil
+	case 0x58465342:
+		return "xfs", nil
+	case 0x9123683E:
+		return "btrfs", nil
+	case 0x01021994:
+		return "tmpfs", nil
+	case 0x794C7630:
+		return "overlay", nil
+	case 0x2FC12FC1:
+		return "zfs", nil
+	case 0x6969:
+		return "nfs", nil
+	default:
+		return fmt.Sprintf("other:0x%x", magic), nil
 	}
 }
 

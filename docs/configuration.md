@@ -64,6 +64,7 @@ q8s stop       # stop socket and service
 q8s enable     # enable and start socket on boot
 q8s disable    # disable socket
 q8s status     # show socket/service state
+q8s doctor     # read-only host capability report
 q8s kubeconfig # print kubeconfig to stdout (uses persisted server URL)
 ```
 

@@ -58,6 +58,8 @@ kubectl --context q8s create deployment --image=nginx nginx
 kubectl --context q8s get pods
 ```
 
+Run `q8s doctor` for a read-only report of what this host gives your workloads; see [docs/doctor.md](docs/doctor.md).
+
 ## Build from source
 
 ```sh
