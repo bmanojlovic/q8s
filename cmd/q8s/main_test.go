@@ -202,7 +202,7 @@ func TestRestoreSecretFilesWritesContent(t *testing.T) {
 // secret persisted before the tic-b31a fix keeps its content only in
 // stringData. A bare restart (store.Load -> restoreSecretFiles) must write
 // real file content, not the empty placeholders that crash-looped the pod on
-// the testvm VM. Load folds stringData into Data, so restore writes it out.
+// the test VM. Load folds stringData into Data, so restore writes it out.
 func TestRestoreLegacySecretSelfHealsOnLoad(t *testing.T) {
 	tmp := t.TempDir()
 	storeFile := filepath.Join(tmp, "store.json")
