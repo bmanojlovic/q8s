@@ -11,12 +11,17 @@ kubectl  ─── HTTPS/mTLS ──▶  q8s  ──▶  Podman Quadlets + syste
 - `kubectl get nodes` — real hostname, IP, OS, CPU/memory/disk, podman version
 - `kubectl top nodes` / `kubectl top pods` — live CPU and memory usage
 - `kubectl describe node` — full output with conditions, capacity, lease
-- Pods, Deployments (scale, rollout restart, env), Services, ConfigMaps, Secrets, Jobs, CronJobs
-- Traefik `Middleware` and `IngressRouteTCP` (`traefik.io/v1alpha1`), with Ingress routing
-- `kubectl logs`, `kubectl exec -it`, `kubectl get -w` (watch)
+- Pods, Deployments (scale, rollout restart, env), Services, ConfigMaps, Secrets, Jobs, CronJobs, Namespaces
+- PersistentVolumeClaims backed by Podman volumes or host directories ([storage classes](docs/configuration.md#storage-classes))
+- Ingress, plus Traefik `Middleware` and `IngressRouteTCP` (`traefik.io/v1alpha1`); see [docs/ingress.md](docs/ingress.md) and [docs/traefik.md](docs/traefik.md)
+- `kubectl logs`, `kubectl exec -it`, `kubectl get -w` (watch), `kubectl apply --server-side`
+- OpenAPI schema for clients that need one, e.g. terraform's `kubernetes_manifest` ([docs/openapi.md](docs/openapi.md))
 - CrashLoopBackOff detection, restart limits, delete cascade
-- Namespace isolation via Podman networks
-- Socket-activated — zero resource usage until first request
+- Namespace isolation via Podman networks (`q8s-<namespace>`)
+- Rootless (per user) or rootful (system-wide); rootful pods run in their own user namespace ([details](docs/architecture.md#user-namespaces-rootful))
+- Socket-activated: nothing runs until the first request
+
+Not supported: StatefulSets, DaemonSets and ReplicaSets are listed so `kubectl get all` works, but are always empty and read-only.
 
 ## Install
 
@@ -29,6 +34,8 @@ chmod +x q8s
 ```
 
 This generates TLS certificates, installs systemd units, and prints the exact `kubectl config` commands to run.
+Run it as root (`sudo ./q8s install`) for a system-wide install: data in `/etc/q8s`, units in `/etc/systemd/system`.
+See [docs/configuration.md](docs/configuration.md#rootless-vs-rootful).
 
 Alternatively, export a standalone kubeconfig file:
 
@@ -40,8 +47,12 @@ export KUBECONFIG=~/.kube/config:~/.kube/q8s.yaml
 ## Start
 
 ```sh
-systemctl --user enable --now q8s.socket
+q8s enable                                   # same as below, for either mode
+systemctl --user enable --now q8s.socket     # rootless
+sudo systemctl enable --now q8s.socket       # rootful
 ```
+
+`q8s status`, `q8s start`, `q8s stop` and `q8s disable` manage the same units.
 
 Or run directly:
 
@@ -80,6 +91,7 @@ q8s uninstall
 
 ## System impact
 
-- ~22 MB RSS, 0% CPU when idle
-- Socket-activated: not running until first kubectl request
+- About 12-20 MB RSS, 0% CPU when idle
+- Socket-activated: not running until the first kubectl request; after that `q8s serve` keeps running
+- Pods are ordinary systemd units: they keep running when q8s is stopped
 - Single static binary, no dependencies beyond Podman and systemd
