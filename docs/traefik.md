@@ -13,6 +13,13 @@ Both kinds are stored like any other q8s object, appear in discovery under
 `traefik.io/v1alpha1`, and are accepted by `kubectl`, the Python client and
 Terraform's `kubernetes_manifest`.
 
+## Traefik version
+
+q8s does not ship Traefik; you run it as an ordinary pod. Use **Traefik v3.7.17 or
+newer** (e.g. `image: traefik:v3.7.17`): it is the first release with
+andybalholm/brotli v1.2.7, which fixes CVE-2026-111497. Pin an exact tag rather than `traefik:v3` or `latest`, so the version
+you run is the version you checked.
+
 ## Generated files
 
 q8s translates both kinds into [Traefik file-provider](https://doc.traefik.io/traefik/providers/file/)

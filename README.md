@@ -13,7 +13,7 @@ kubectl  ─── HTTPS/mTLS ──▶  q8s  ──▶  Podman Quadlets + syste
 - `kubectl describe node` — full output with conditions, capacity, lease
 - Pods, Deployments (scale, rollout restart, env), Services, ConfigMaps, Secrets, Jobs, CronJobs, Namespaces
 - PersistentVolumeClaims backed by Podman volumes or host directories ([storage classes](docs/configuration.md#storage-classes))
-- Ingress, plus Traefik `Middleware` and `IngressRouteTCP` (`traefik.io/v1alpha1`); see [docs/ingress.md](docs/ingress.md) and [docs/traefik.md](docs/traefik.md)
+- Ingress, plus Traefik `Middleware` and `IngressRouteTCP` (`traefik.io/v1alpha1`); see [docs/ingress.md](docs/ingress.md) and [docs/traefik.md](docs/traefik.md) (run Traefik v3.7.17 or newer)
 - `kubectl logs`, `kubectl exec -it`, `kubectl get -w` (watch), `kubectl apply --server-side`
 - OpenAPI schema for clients that need one, e.g. terraform's `kubernetes_manifest` ([docs/openapi.md](docs/openapi.md))
 - CrashLoopBackOff detection, restart limits, delete cascade
