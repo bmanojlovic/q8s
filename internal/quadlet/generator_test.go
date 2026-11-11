@@ -1,6 +1,8 @@
 package quadlet_test
 
 import (
+	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -497,6 +499,74 @@ func assertHealthLines(t *testing.T, out string, want ...string) {
 	}
 }
 
+// healthCmdArgv decodes a HealthCmd= or HealthStartupCmd= line back into
+// argv, undoing the systemd escaping healthCmdLine applies.
+func healthCmdArgv(t *testing.T, out, directive string) []string {
+	t.Helper()
+	prefix := directive + "="
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		raw := strings.TrimPrefix(line, prefix)
+		raw = strings.ReplaceAll(raw, "$$", "$")
+		raw = strings.ReplaceAll(raw, "%%", "%")
+		var argv []string
+		if err := json.Unmarshal([]byte(raw), &argv); err != nil {
+			t.Fatalf("decode %s: %v (value %q)", directive, err, raw)
+		}
+		return argv
+	}
+	t.Fatalf("no %s line in output:\n%s", directive, out)
+	return nil
+}
+
+// assertHTTPProbeArgv checks the positional shape of an httpGet health
+// command and returns the in-container script for optional marker checks.
+func assertHTTPProbeArgv(t *testing.T, out, directive, insecure, url string, headers ...string) string {
+	t.Helper()
+	argv := healthCmdArgv(t, out, directive)
+	wantLen := 7 + len(headers)
+	if len(argv) != wantLen {
+		t.Fatalf("%s: expected %d argv entries, got %d: %v", directive, wantLen, len(argv), argv)
+	}
+	if argv[0] != "CMD" || argv[1] != "sh" || argv[2] != "-c" || argv[4] != "q8s-probe" {
+		t.Errorf("%s: unexpected prefix: %v", directive, argv[:5])
+	}
+	if argv[5] != insecure {
+		t.Errorf("%s: insecure flag: expected %q, got %q", directive, insecure, argv[5])
+	}
+	if argv[6] != url {
+		t.Errorf("%s: URL: expected %q, got %q", directive, url, argv[6])
+	}
+	got := argv[7:]
+	if len(got) != len(headers) {
+		t.Errorf("%s: headers: expected %v, got %v", directive, headers, got)
+	} else {
+		for i := range headers {
+			if got[i] != headers[i] {
+				t.Errorf("%s: header %d: expected %q, got %q", directive, i, headers[i], got[i])
+			}
+		}
+	}
+	return argv[3]
+}
+
+// assertHealthTiming checks every health directive except the command lines.
+func assertHealthTiming(t *testing.T, out string, want ...string) {
+	t.Helper()
+	var got []string
+	for _, line := range healthLines(out) {
+		if strings.HasPrefix(line, "HealthCmd=") || strings.HasPrefix(line, "HealthStartupCmd=") {
+			continue
+		}
+		got = append(got, line)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("health timing lines: expected %v, got %v", want, got)
+	}
+}
+
 func mustContainerErr(t *testing.T, pod *corev1.Pod) error {
 	t.Helper()
 	_, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil)
@@ -545,8 +615,8 @@ func TestContainerLivenessExecSpecialChars(t *testing.T) {
 	)
 }
 
-// TestContainerLivenessHTTPGetNamedPort: an httpGet liveness probe becomes a
-// curl health command, killing the container on failure.
+// TestContainerLivenessHTTPGetNamedPort: an httpGet liveness probe becomes an
+// in-container sh health command, killing the container on failure.
 func TestContainerLivenessHTTPGetNamedPort(t *testing.T) {
 	pod := simplePod("default", "llm", "llm:latest")
 	pod.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}
@@ -558,8 +628,9 @@ func TestContainerLivenessHTTPGetNamedPort(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertHealthLines(t, out,
-		`HealthCmd=["CMD","curl","-fsS","-o","/dev/null","http://127.0.0.1:8080/live"]`,
+	script := assertHTTPProbeArgv(t, out, "HealthCmd", "", "http://127.0.0.1:8080/live")
+	assertContains(t, script, "command -v curl")
+	assertHealthTiming(t, out,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
@@ -567,8 +638,9 @@ func TestContainerLivenessHTTPGetNamedPort(t *testing.T) {
 	)
 }
 
-// TestContainerLivenessHTTPGetHTTPSHeadersHost: HTTPS adds -k, headers become
-// -H name: value pairs, and an IP literal host replaces 127.0.0.1.
+// TestContainerLivenessHTTPGetHTTPSHeadersHost: HTTPS sets the insecure flag,
+// headers become separate "Name: value" arguments, and an IP literal host
+// replaces 127.0.0.1.
 func TestContainerLivenessHTTPGetHTTPSHeadersHost(t *testing.T) {
 	pod := simplePod("default", "app", "myimage")
 	pod.Spec.Containers[0].LivenessProbe = &corev1.Probe{
@@ -576,7 +648,7 @@ func TestContainerLivenessHTTPGetHTTPSHeadersHost(t *testing.T) {
 			Path:   "/healthz",
 			Port:   intstr.FromInt32(8443),
 			Scheme: corev1.URISchemeHTTPS,
-			Host:   "10.0.0.5",
+			Host:   "192.0.2.5",
 			HTTPHeaders: []corev1.HTTPHeader{
 				{Name: "X-Token", Value: "secret"},
 				{Name: "Accept", Value: "application/json"},
@@ -585,8 +657,10 @@ func TestContainerLivenessHTTPGetHTTPSHeadersHost(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertHealthLines(t, out,
-		`HealthCmd=["CMD","curl","-fsS","-o","/dev/null","-k","-H","X-Token: secret","-H","Accept: application/json","https://10.0.0.5:8443/healthz"]`,
+	script := assertHTTPProbeArgv(t, out, "HealthCmd", "1", "https://192.0.2.5:8443/healthz",
+		"X-Token: secret", "Accept: application/json")
+	assertContains(t, script, "command -v wget")
+	assertHealthTiming(t, out,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
@@ -609,8 +683,9 @@ func TestContainerReadinessHTTPGet(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertHealthLines(t, out,
-		`HealthCmd=["CMD","curl","-fsS","-o","/dev/null","http://127.0.0.1:8080/healthz"]`,
+	script := assertHTTPProbeArgv(t, out, "HealthCmd", "", "http://127.0.0.1:8080/healthz")
+	assertContains(t, script, "command -v python3")
+	assertHealthTiming(t, out,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
@@ -630,7 +705,7 @@ func TestContainerReadinessHTTPGetNamedPort(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, "http://127.0.0.1:8080/ready")
+	assertHTTPProbeArgv(t, out, "HealthCmd", "", "http://127.0.0.1:8080/ready")
 }
 
 func TestContainerReadinessExec(t *testing.T) {
@@ -720,12 +795,12 @@ func TestContainerStartupProbeDefaults(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertHealthLines(t, out,
-		`HealthCmd=["CMD","true"]`,
+	assertContains(t, out, `HealthCmd=["CMD","true"]`)
+	assertHTTPProbeArgv(t, out, "HealthStartupCmd", "", "http://127.0.0.1:8080/")
+	assertHealthTiming(t, out,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
-		`HealthStartupCmd=["CMD","curl","-fsS","-o","/dev/null","http://127.0.0.1:8080/"]`,
 		"HealthStartupInterval=10s",
 		"HealthStartupTimeout=1s",
 		"HealthStartupRetries=3",

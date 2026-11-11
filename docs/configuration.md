@@ -188,10 +188,12 @@ Both handlers render the command in podman's JSON exec form, written verbatim as
 | Probe handler | Quadlet output |
 |---|---|
 | `exec` | `HealthCmd=["CMD", <command...>]` |
-| `httpGet` | `HealthCmd=["CMD","curl","-fsS","-o","/dev/null", <flags>, "<scheme>://<host>:<port><path>"]` |
+| `httpGet` | `HealthCmd=["CMD","sh","-c",<script>,"q8s-probe",<insecure>,<url>,<headers...>]` |
 
-- `exec` keeps argument boundaries: `["sh","-c","wget -qO- http://x"]` stays one argument list instead of being joined with spaces. An empty command is an error. A literal `%` in a command is written as `%%`, because systemd expands specifiers in the generated `ExecStart=` line.
-- `httpGet` uses `127.0.0.1` unless `host` is set to an IP literal; a hostname is an error because q8s does not resolve names in a probe. An empty `path` becomes `/`. `scheme: HTTPS` adds `-k` (the probe does not verify certificates, matching Kubernetes' default), and each `httpHeaders` entry adds `-H "Name: value"`. Header names must be HTTP tokens and values may not contain CR, LF or NUL. The image must contain `curl`.
+In every health command, a literal `$` is written as `$$` and a literal `%` as `%%`, so systemd does not expand variables or specifiers on the host before podman hands the command to the container.
+
+- `exec` keeps argument boundaries: `["sh","-c","wget -qO- http://x"]` stays one argument list instead of being joined with spaces. An empty command is an error.
+- `httpGet` runs a POSIX `sh` script inside the container that uses the first HTTP client the image provides: `curl`, else `wget`, else `python3`. Each `httpHeaders` entry is passed as a separate `Name: value` argument. `scheme: HTTPS` sets the insecure flag: curl gets `-k`, wget gets `--no-check-certificate`, and python3 uses an unverified SSL context (the probe does not verify certificates, matching Kubernetes' default). `127.0.0.1` is used unless `host` is set to an IP literal; a hostname is an error because q8s does not resolve names in a probe. An empty `path` becomes `/`. Header names must be HTTP tokens and values may not contain CR, LF or NUL. The image needs `/bin/sh`; if it has none of curl, wget or python3, the check fails with a clear message. Distroless images (no shell) cannot use an httpGet probe, so use an `exec` probe there. The script sets no timeout of its own; `HealthTimeout=` bounds the check. All variable data (URL, headers and the insecure flag) is passed as positional arguments, never spliced into the script text.
 - `tcpSocket` and `grpc` are rejected (422 at the API) instead of being ignored; use an `exec` probe instead.
 - A named httpGet port is resolved against the container's ports; an unknown name is an error.
 

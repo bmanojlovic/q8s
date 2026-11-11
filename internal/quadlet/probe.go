@@ -24,9 +24,9 @@ const (
 )
 
 // httpTokenRE is RFC 7230's token rule, the only shape an HTTP header name
-// may take. The name is interpolated into a curl argument, so anything
-// outside the token set (whitespace, ':', quotes, control characters) is
-// rejected instead of being passed through.
+// may take. The name is passed to the in-container probe script as part of a
+// "Name: value" argument, so anything outside the token set (whitespace, ':',
+// quotes, control characters) is rejected instead of being passed through.
 var httpTokenRE = regexp.MustCompile("^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$")
 
 // ValidateProbes rejects every probe shape q8s cannot translate faithfully.
@@ -112,10 +112,16 @@ func execProbeHealthCmd(kind string, exec *corev1.ExecAction) (string, error) {
 	return jsonExecCommand(append([]string{"CMD"}, exec.Command...))
 }
 
-// httpProbeHealthCmd renders an httpGet probe as a curl invocation against
-// the container's own loopback address (the container's network namespace).
-// The image must contain curl: q8s cannot inject a client into an arbitrary
-// image.
+// httpProbeHealthCmd renders an httpGet probe as a POSIX sh script that runs
+// inside the container and uses the first HTTP client the image provides:
+// curl, else wget, else python3. Nothing is interpolated into the script text:
+// the insecure flag, the URL and the headers arrive as positional arguments,
+// so a header value cannot break the shell command. An image with none of the
+// three clients fails the check with a clear message. An image without
+// /bin/sh (distroless) is not supported and needs an exec probe.
+//
+// The URL points at the container's own network namespace. HTTPS sets the
+// insecure flag because Kubernetes does not verify probe certificates.
 func httpProbeHealthCmd(c corev1.Container, kind string, get *corev1.HTTPGetAction) (string, error) {
 	port, err := resolveProbePort(c, get.Port)
 	if err != nil {
@@ -148,9 +154,13 @@ func httpProbeHealthCmd(c corev1.Container, kind string, get *corev1.HTTPGetActi
 		return "", err
 	}
 
-	args := []string{"CMD", "curl", "-fsS", "-o", "/dev/null"}
+	insecure := ""
 	if scheme == "https" {
-		args = append(args, "-k")
+		insecure = "1"
+	}
+	args := []string{
+		"CMD", "sh", "-c", httpProbeScript, "q8s-probe",
+		insecure, fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path),
 	}
 	for _, header := range get.HTTPHeaders {
 		if !httpTokenRE.MatchString(header.Name) {
@@ -159,14 +169,50 @@ func httpProbeHealthCmd(c corev1.Container, kind string, get *corev1.HTTPGetActi
 		if err := noControlChars(kind+" httpHeader value", header.Value); err != nil {
 			return "", err
 		}
-		args = append(args, "-H", header.Name+": "+header.Value)
+		args = append(args, header.Name+": "+header.Value)
 	}
-	args = append(args, fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path))
 	return jsonExecCommand(args)
 }
 
-// probeScheme maps a Kubernetes URI scheme to the curl URL scheme. An unset
-// scheme is HTTP, as in Kubernetes.
+// httpProbePythonProgram is the python3 fallback used by httpProbeScript. It
+// receives the insecure flag, the URL and the "Name: value" headers as argv,
+// adds each header, uses an unverified SSL context when the flag is non-empty,
+// and lets urllib raise on an HTTP status of 400 or more so the process exits
+// non-zero. The script single-quotes it, so it contains no single quote and no
+// percent sign.
+const httpProbePythonProgram = `import sys,ssl,urllib.request
+k=sys.argv[1]; u=sys.argv[2]
+r=urllib.request.Request(u)
+for h in sys.argv[3:]:
+ n,v=h.split(": ",1)
+ r.add_header(n,v)
+if k:
+ c=ssl._create_unverified_context()
+else:
+ c=None
+urllib.request.urlopen(r,context=c)`
+
+// httpProbeScript is the in-container health check for an httpGet probe. It
+// uses the first client the image provides and exits with that client's status
+// through exec. podman's HealthTimeout bounds the check, so the script sets no
+// timeout of its own. All variable data (the insecure flag, the URL and the
+// headers) is passed in as positional arguments; only $0 is fixed.
+const httpProbeScript = `k=$1; u=$2; shift 2
+if command -v curl >/dev/null 2>&1; then
+  n=$#; for h do set -- "$@" -H "$h"; done; shift "$n"
+  exec curl -fsS -o /dev/null ${k:+-k} "$@" "$u"
+elif command -v wget >/dev/null 2>&1; then
+  n=$#; for h do set -- "$@" --header "$h"; done; shift "$n"
+  exec wget -q -O /dev/null ${k:+--no-check-certificate} "$@" "$u"
+elif command -v python3 >/dev/null 2>&1; then
+  exec python3 -c '` + httpProbePythonProgram + `' "$k" "$u" "$@"
+else
+  echo "q8s probe: the image has no curl, wget or python3; use an exec probe" >&2
+  exit 1
+fi`
+
+// probeScheme maps a Kubernetes URI scheme to the URL scheme used by the
+// in-container probe script. An unset scheme is HTTP, as in Kubernetes.
 func probeScheme(s corev1.URIScheme) (string, error) {
 	switch strings.ToUpper(string(s)) {
 	case "", "HTTP":
@@ -269,14 +315,19 @@ func writeHealthCheck(b *strings.Builder, c corev1.Container) error {
 // reads these values itself: it strips one surrounding pair of double quotes
 // but does not decode C escapes, so a JSON exec array must be written
 // verbatim. Quoting it systemd-style would leave the backslashes in podman's
-// --health-cmd argument and corrupt the command. The one systemd
-// transformation that still happens is specifier expansion in the generated
-// ExecStart, so a literal percent is doubled here.
+// --health-cmd argument and corrupt the command. The transformations that
+// still happen in the generated ExecStart are systemd's variable expansion
+// (${NAME}, $NAME) and specifier expansion (%s and friends), so every literal
+// dollar becomes $$ and every literal percent becomes %%. This also protects
+// an exec probe whose command text contains a shell variable: systemd must not
+// expand it on the host, the container's shell has to see it unchanged.
 func healthCmdLine(directive, cmd string) (string, error) {
 	if err := noControlChars(directive+" value", cmd); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s=%s\n", directive, strings.ReplaceAll(cmd, "%", "%%")), nil
+	escaped := strings.ReplaceAll(cmd, "$", "$$")
+	escaped = strings.ReplaceAll(escaped, "%", "%%")
+	return fmt.Sprintf("%s=%s\n", directive, escaped), nil
 }
 
 // writeProbeTiming emits the interval/timeout/retries/start-period keys shared
