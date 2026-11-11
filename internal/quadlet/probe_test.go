@@ -57,7 +57,7 @@ func TestHTTPProbeHealthCmdHTTP(t *testing.T) {
 		t.Fatalf("httpProbeHealthCmd: %v", err)
 	}
 	want := []string{
-		"CMD", "sh", "-c", httpProbeScript, "q8s-probe", "",
+		"sh", "-c", httpProbeScript, "q8s-probe", "",
 		"http://127.0.0.1:8080/healthz",
 	}
 	if got := probeCmdArgv(t, cmd); !reflect.DeepEqual(got, want) {
@@ -83,7 +83,7 @@ func TestHTTPProbeHealthCmdHTTPSHeaders(t *testing.T) {
 		t.Fatalf("httpProbeHealthCmd: %v", err)
 	}
 	want := []string{
-		"CMD", "sh", "-c", httpProbeScript, "q8s-probe", "1",
+		"sh", "-c", httpProbeScript, "q8s-probe", "1",
 		"https://192.0.2.5:8443/healthz",
 		"X-Token: secret", "Accept: application/json",
 	}
@@ -123,11 +123,11 @@ func TestHTTPProbeScriptNoUnsafeText(t *testing.T) {
 // TestHealthCmdLineEscapesSystemdVars: a dollar and a percent in an exec
 // probe reach the container's shell unchanged.
 func TestHealthCmdLineEscapesSystemdVars(t *testing.T) {
-	line, err := healthCmdLine("HealthCmd", `["CMD","sh","-c","echo ${HOME} 100%"]`)
+	line, err := healthCmdLine("HealthCmd", `["sh","-c","echo ${HOME} 100%"]`)
 	if err != nil {
 		t.Fatalf("healthCmdLine: %v", err)
 	}
-	want := `HealthCmd=["CMD","sh","-c","echo $${HOME} 100%%"]` + "\n"
+	want := `HealthCmd=["sh","-c","echo $${HOME} 100%%"]` + "\n"
 	if line != want {
 		t.Errorf("expected %q, got %q", want, line)
 	}

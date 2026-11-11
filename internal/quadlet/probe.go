@@ -69,7 +69,7 @@ func ValidateProbes(c corev1.Container) error {
 }
 
 // probeHealthCmd validates one probe handler and renders the command podman
-// should run, in the JSON exec form (["CMD", ...]). exec commands keep their
+// should run, as a JSON argv array (no "CMD" keyword, see execProbeHealthCmd). exec commands keep their
 // argument boundaries this way: joining them with spaces turns
 // ["sh", "-c", "wget -qO- http://x"] into a different command.
 func probeHealthCmd(c corev1.Container, p *corev1.Probe, kind string) (string, error) {
@@ -99,7 +99,14 @@ func probeHealthCmd(c corev1.Container, p *corev1.Probe, kind string) (string, e
 	return httpProbeHealthCmd(c, kind, h.HTTPGet)
 }
 
-// execProbeHealthCmd renders an exec probe as ["CMD", <command...>].
+// execProbeHealthCmd renders an exec probe as a plain JSON argv array,
+// [<command...>], without the "CMD" keyword. podman 5.4 does not handle a
+// leading "CMD": it either keeps the whole JSON text as one shell string or
+// re-splits the arguments on whitespace, so every check fails (and a
+// livenessProbe kills the container in a loop). Without the keyword podman
+// 5.4 and 6 both store the array exactly as ["CMD", <command...>]. A
+// one-element command is the exception: podman runs it through /bin/sh
+// (CMD-SHELL), so such an image needs a shell.
 func execProbeHealthCmd(kind string, exec *corev1.ExecAction) (string, error) {
 	if len(exec.Command) == 0 {
 		return "", fmt.Errorf("%s: exec probe has an empty command", kind)
@@ -109,7 +116,7 @@ func execProbeHealthCmd(kind string, exec *corev1.ExecAction) (string, error) {
 			return "", err
 		}
 	}
-	return jsonExecCommand(append([]string{"CMD"}, exec.Command...))
+	return jsonExecCommand(append([]string(nil), exec.Command...))
 }
 
 // httpProbeHealthCmd renders an httpGet probe as a POSIX sh script that runs
@@ -159,7 +166,7 @@ func httpProbeHealthCmd(c corev1.Container, kind string, get *corev1.HTTPGetActi
 		insecure = "1"
 	}
 	args := []string{
-		"CMD", "sh", "-c", httpProbeScript, "q8s-probe",
+		"sh", "-c", httpProbeScript, "q8s-probe",
 		insecure, fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path),
 	}
 	for _, header := range get.HTTPHeaders {

@@ -526,20 +526,20 @@ func healthCmdArgv(t *testing.T, out, directive string) []string {
 func assertHTTPProbeArgv(t *testing.T, out, directive, insecure, url string, headers ...string) string {
 	t.Helper()
 	argv := healthCmdArgv(t, out, directive)
-	wantLen := 7 + len(headers)
+	wantLen := 6 + len(headers)
 	if len(argv) != wantLen {
 		t.Fatalf("%s: expected %d argv entries, got %d: %v", directive, wantLen, len(argv), argv)
 	}
-	if argv[0] != "CMD" || argv[1] != "sh" || argv[2] != "-c" || argv[4] != "q8s-probe" {
-		t.Errorf("%s: unexpected prefix: %v", directive, argv[:5])
+	if argv[0] != "sh" || argv[1] != "-c" || argv[3] != "q8s-probe" {
+		t.Errorf("%s: unexpected prefix: %v", directive, argv[:4])
 	}
-	if argv[5] != insecure {
-		t.Errorf("%s: insecure flag: expected %q, got %q", directive, insecure, argv[5])
+	if argv[4] != insecure {
+		t.Errorf("%s: insecure flag: expected %q, got %q", directive, insecure, argv[4])
 	}
-	if argv[6] != url {
-		t.Errorf("%s: URL: expected %q, got %q", directive, url, argv[6])
+	if argv[5] != url {
+		t.Errorf("%s: URL: expected %q, got %q", directive, url, argv[5])
 	}
-	got := argv[7:]
+	got := argv[6:]
 	if len(got) != len(headers) {
 		t.Errorf("%s: headers: expected %v, got %v", directive, headers, got)
 	} else {
@@ -549,7 +549,7 @@ func assertHTTPProbeArgv(t *testing.T, out, directive, insecure, url string, hea
 			}
 		}
 	}
-	return argv[3]
+	return argv[2]
 }
 
 // assertHealthTiming checks every health directive except the command lines.
@@ -586,7 +586,7 @@ func TestContainerLivenessExecExact(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	assertHealthLines(t, out,
-		`HealthCmd=["CMD","sh","-c","test -f /tmp/ok && echo fine"]`,
+		`HealthCmd=["sh","-c","test -f /tmp/ok && echo fine"]`,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
@@ -607,7 +607,7 @@ func TestContainerLivenessExecSpecialChars(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	assertHealthLines(t, out,
-		`HealthCmd=["CMD","printf","%%s","a \"quoted\" arg"]`,
+		`HealthCmd=["printf","%%s","a \"quoted\" arg"]`,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
@@ -717,7 +717,7 @@ func TestContainerReadinessExec(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	assertHealthLines(t, out,
-		`HealthCmd=["CMD","cat","/tmp/ready"]`,
+		`HealthCmd=["cat","/tmp/ready"]`,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
@@ -742,7 +742,7 @@ func TestContainerLivenessProbeWinsOverReadiness(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	assertHealthLines(t, out,
-		`HealthCmd=["CMD","cat","/tmp/live"]`,
+		`HealthCmd=["cat","/tmp/live"]`,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
@@ -768,12 +768,12 @@ func TestContainerStartupProbe(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	assertHealthLines(t, out,
-		`HealthCmd=["CMD","test","-f","/tmp/live"]`,
+		`HealthCmd=["test","-f","/tmp/live"]`,
 		"HealthInterval=10s",
 		"HealthTimeout=1s",
 		"HealthRetries=3",
 		"HealthOnFailure=kill",
-		`HealthStartupCmd=["CMD","test","-f","/tmp/started"]`,
+		`HealthStartupCmd=["test","-f","/tmp/started"]`,
 		"HealthStartupInterval=5s",
 		"HealthStartupTimeout=2s",
 		"HealthStartupRetries=30",
@@ -795,7 +795,7 @@ func TestContainerStartupProbeDefaults(t *testing.T) {
 	}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, `HealthCmd=["CMD","true"]`)
+	assertContains(t, out, `HealthCmd=["true"]`)
 	assertHTTPProbeArgv(t, out, "HealthStartupCmd", "", "http://127.0.0.1:8080/")
 	assertHealthTiming(t, out,
 		"HealthInterval=10s",
@@ -822,7 +822,7 @@ func TestContainerLivenessExplicitTiming(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	assertHealthLines(t, out,
-		`HealthCmd=["CMD","true"]`,
+		`HealthCmd=["true"]`,
 		"HealthInterval=7s",
 		"HealthTimeout=2s",
 		"HealthRetries=5",
@@ -1118,7 +1118,7 @@ func TestJobContainerPodTemplateAnnotations(t *testing.T) {
 
 	assertContains(t, out, "Ulimit=memlock=-1:-1")
 	assertContains(t, out, "AddDevice=nvidia.com/gpu=all")
-	assertContains(t, out, `HealthCmd=["CMD","true"]`)
+	assertContains(t, out, `HealthCmd=["true"]`)
 }
 
 func TestJobContainerReadOnlyPVC(t *testing.T) {
