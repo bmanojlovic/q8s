@@ -21,6 +21,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -2171,6 +2172,62 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		s.generateJobQuadlet(created)
 		encode(w, created, http.StatusCreated)
+	case http.MethodPut:
+		// Full-resource replace (kubectl replace / client-go Update()).
+		var job batchv1.Job
+		if !s.decodeOrRespond(w, r, &job) {
+			return
+		}
+		job.APIVersion = "batch/v1"
+		job.Kind = "Job"
+		if job.Namespace == "" {
+			job.Namespace = ns
+		}
+		if job.Name == "" {
+			job.Name = name
+		}
+		if err := validateName("namespace", job.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", job.Name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateSingleContainer("job spec.template.spec", &job.Spec.Template.Spec, false); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodProbes("job spec.template.spec", &job.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePatchedIdentity("job", job.Namespace, job.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		existing, err := s.config.Store.GetJob(ns, name)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		// A Job's pod template is immutable, as in Kubernetes. Only
+		// metadata (labels, annotations) can change through a PUT.
+		if !equality.Semantic.DeepEqual(job.Spec.Template, existing.Spec.Template) {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "job spec.template: field is immutable")
+			return
+		}
+		if job.CreationTimestamp.IsZero() {
+			job.CreationTimestamp = existing.CreationTimestamp
+		}
+		// Status is server-owned: a PUT on the main resource cannot change it.
+		job.Status = existing.Status
+		updated, err := s.config.Store.UpdateJob(&job)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
 		job, err := s.config.Store.GetJob(ns, name)
 		if err != nil {
@@ -2313,6 +2370,57 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		s.generateCronJobQuadlets(created)
 		encode(w, created, http.StatusCreated)
+	case http.MethodPut:
+		// Full-resource replace (kubectl replace / client-go Update()).
+		var cj batchv1.CronJob
+		if !s.decodeOrRespond(w, r, &cj) {
+			return
+		}
+		cj.APIVersion = "batch/v1"
+		cj.Kind = "CronJob"
+		if cj.Namespace == "" {
+			cj.Namespace = ns
+		}
+		if cj.Name == "" {
+			cj.Name = name
+		}
+		if err := validateName("namespace", cj.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", cj.Name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateSingleContainer("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec, false); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodProbes("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePatchedIdentity("cronjob", cj.Namespace, cj.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		existing, err := s.config.Store.GetCronJob(ns, name)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		if cj.CreationTimestamp.IsZero() {
+			cj.CreationTimestamp = existing.CreationTimestamp
+		}
+		// Status is server-owned: a PUT on the main resource cannot change it.
+		cj.Status = existing.Status
+		updated, err := s.config.Store.UpdateCronJob(&cj)
+		if err != nil {
+			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			return
+		}
+		s.generateCronJobQuadlets(updated)
+		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
 		cj, err := s.config.Store.GetCronJob(ns, name)
 		if err != nil {

@@ -1268,6 +1268,60 @@ func TestJobNotFound(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestJobUpdatePutLabels(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp := post(t, ts.URL+"/apis/batch/v1/namespaces/default/jobs", jobBody("default", "label-job"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	body := jobBody("default", "label-job")
+	body["metadata"].(map[string]interface{})["labels"] = map[string]interface{}{"app": "demo-app"}
+	resp = do(t, http.MethodPut, ts.URL+"/apis/batch/v1/namespaces/default/jobs/label-job", body)
+	assertStatus(t, resp, http.StatusOK)
+	m := decodeBody(t, resp)
+	assertKind(t, m, "Job")
+	meta, _ := m["metadata"].(map[string]interface{})
+	labels, _ := meta["labels"].(map[string]interface{})
+	if labels["app"] != "demo-app" {
+		t.Fatalf("expected label app=demo-app in PUT response, got %v", labels)
+	}
+
+	resp = get(t, ts.URL+"/apis/batch/v1/namespaces/default/jobs/label-job")
+	assertStatus(t, resp, http.StatusOK)
+	m = decodeBody(t, resp)
+	meta, _ = m["metadata"].(map[string]interface{})
+	labels, _ = meta["labels"].(map[string]interface{})
+	if labels["app"] != "demo-app" {
+		t.Fatalf("expected persisted label app=demo-app, got %v", labels)
+	}
+}
+
+func TestJobUpdatePutTemplateImmutable(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp := post(t, ts.URL+"/apis/batch/v1/namespaces/default/jobs", jobBody("default", "immutable-job"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	body := jobBody("default", "immutable-job")
+	jobContainer(body)["image"] = "busybox:1.36"
+	resp = do(t, http.MethodPut, ts.URL+"/apis/batch/v1/namespaces/default/jobs/immutable-job", body)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	m := decodeBody(t, resp)
+	msg, _ := m["message"].(string)
+	if !strings.Contains(msg, "job spec.template: field is immutable") {
+		t.Fatalf("expected immutable template message, got %q", msg)
+	}
+
+	resp = get(t, ts.URL+"/apis/batch/v1/namespaces/default/jobs/immutable-job")
+	assertStatus(t, resp, http.StatusOK)
+	m = decodeBody(t, resp)
+	if img := jobContainer(m)["image"]; img != "busybox" {
+		t.Fatalf("rejected PUT changed the stored image to %v", img)
+	}
+}
+
 // --- CronJob ---
 
 func cronJobBody(ns, name, schedule string) map[string]interface{} {
@@ -1325,6 +1379,183 @@ func TestCronJobDuplicate(t *testing.T) {
 
 	resp = post(t, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs", body)
 	assertStatus(t, resp, 409)
+	resp.Body.Close()
+}
+
+func TestCronJobUpdatePut(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := cronJobBody("default", "upd-cron", "0 * * * *")
+	cronJobContainer(body)["env"] = []interface{}{
+		map[string]interface{}{"name": "MODE", "value": "old"},
+	}
+	resp := post(t, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	containerPath := filepath.Join(quadletDir, "default-upd-cron-cron.container")
+	timerPath := filepath.Join(quadletDir, "default-upd-cron-cron.timer")
+	if got := readTestFile(t, containerPath); !strings.Contains(got, "Environment=MODE=old") {
+		t.Fatalf("created container unit missing old env:\n%s", got)
+	}
+	oldTimer := readTestFile(t, timerPath)
+
+	body = cronJobBody("default", "upd-cron", "*/5 * * * *")
+	cronJobContainer(body)["env"] = []interface{}{
+		map[string]interface{}{"name": "MODE", "value": "new"},
+	}
+	resp = do(t, http.MethodPut, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/upd-cron", body)
+	assertStatus(t, resp, http.StatusOK)
+	m := decodeBody(t, resp)
+	assertKind(t, m, "CronJob")
+
+	resp = get(t, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/upd-cron")
+	assertStatus(t, resp, http.StatusOK)
+	m = decodeBody(t, resp)
+	spec, _ := m["spec"].(map[string]interface{})
+	if spec["schedule"] != "*/5 * * * *" {
+		t.Fatalf("expected persisted schedule=*/5 * * * *, got %v", spec["schedule"])
+	}
+	jt, _ := spec["jobTemplate"].(map[string]interface{})
+	jts, _ := jt["spec"].(map[string]interface{})
+	tmpl, _ := jts["template"].(map[string]interface{})
+	podSpec, _ := tmpl["spec"].(map[string]interface{})
+	containers, _ := podSpec["containers"].([]interface{})
+	c, _ := containers[0].(map[string]interface{})
+	env, _ := c["env"].([]interface{})
+	first, _ := env[0].(map[string]interface{})
+	if first["value"] != "new" {
+		t.Fatalf("expected persisted env MODE=new, got %v", first["value"])
+	}
+
+	if got := readTestFile(t, containerPath); !strings.Contains(got, "Environment=MODE=new") {
+		t.Fatalf("updated container unit missing new env:\n%s", got)
+	}
+	newTimer := readTestFile(t, timerPath)
+	if !strings.Contains(newTimer, "OnCalendar=*-*-* *:0/5:00") {
+		t.Fatalf("updated timer unit missing new schedule:\n%s", newTimer)
+	}
+	if newTimer == oldTimer {
+		t.Fatal("timer unit did not change after a schedule update")
+	}
+}
+
+func TestCronJobUpdatePutPreservesServerFields(t *testing.T) {
+	st := store.New()
+	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	resp := post(t, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs", cronJobBody("default", "preserved-cron", "0 * * * *"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	before, err := st.GetCronJob("default", "preserved-cron")
+	if err != nil {
+		t.Fatalf("get created cronjob: %v", err)
+	}
+	uid := before.UID
+	created := before.CreationTimestamp
+	scheduled := metav1.NewTime(time.Unix(1700000000, 0).UTC())
+	before.Status.LastScheduleTime = &scheduled
+	if _, err := st.UpdateCronJob(before); err != nil {
+		t.Fatalf("set stored status: %v", err)
+	}
+
+	resp = do(t, http.MethodPut, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/preserved-cron", cronJobBody("default", "preserved-cron", "*/10 * * * *"))
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	after, err := st.GetCronJob("default", "preserved-cron")
+	if err != nil {
+		t.Fatalf("get updated cronjob: %v", err)
+	}
+	if after.UID != uid {
+		t.Errorf("uid changed from %q to %q", uid, after.UID)
+	}
+	if !after.CreationTimestamp.Equal(&created) {
+		t.Errorf("creationTimestamp changed from %v to %v", created, after.CreationTimestamp)
+	}
+	if after.Status.LastScheduleTime == nil || !after.Status.LastScheduleTime.Equal(&scheduled) {
+		t.Errorf("status was not preserved through PUT: %+v", after.Status)
+	}
+}
+
+func TestCronJobUpdatePutNotFound(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp := do(t, http.MethodPut, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/missing", cronJobBody("default", "missing", "0 * * * *"))
+	assertStatus(t, resp, 404)
+	resp.Body.Close()
+}
+
+func TestCronJobUpdatePutNameMismatch(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp := post(t, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs", cronJobBody("default", "origin-cron", "0 * * * *"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = do(t, http.MethodPut, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/origin-cron", cronJobBody("default", "other-cron", "0 * * * *"))
+	assertStatus(t, resp, http.StatusBadRequest)
+	m := decodeBody(t, resp)
+	msg, _ := m["message"].(string)
+	if !strings.Contains(msg, "namespace and name are immutable") {
+		t.Fatalf("expected immutable identity message, got %q", msg)
+	}
+}
+
+func TestCronJobUpdatePutValidation(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp := post(t, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs", cronJobBody("default", "invalid-cron", "0 * * * *"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	sidecar := cronJobBody("default", "invalid-cron", "0 * * * *")
+	jt := sidecar["spec"].(map[string]interface{})["jobTemplate"].(map[string]interface{})
+	tmpl := jt["spec"].(map[string]interface{})["template"].(map[string]interface{})
+	appendContainer(tmpl["spec"].(map[string]interface{}), "sidecar")
+
+	patchSidecar, err := json.Marshal(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPatch, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/invalid-cron", bytes.NewReader(patchSidecar))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PATCH cronjob: %v", err)
+	}
+	assertStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+
+	resp = do(t, http.MethodPut, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/invalid-cron", sidecar)
+	assertStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+
+	probe := cronJobBody("default", "invalid-cron", "0 * * * *")
+	cronJobContainer(probe)["livenessProbe"] = map[string]interface{}{
+		"grpc": map[string]interface{}{"port": 50051},
+	}
+	patchProbe, err := json.Marshal(probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ = http.NewRequest(http.MethodPatch, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/invalid-cron", bytes.NewReader(patchProbe))
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PATCH cronjob: %v", err)
+	}
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	resp = do(t, http.MethodPut, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs/invalid-cron", probe)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 	resp.Body.Close()
 }
 
@@ -4339,6 +4570,19 @@ func podContainer(body map[string]interface{}) map[string]interface{} {
 
 func deploymentContainer(body map[string]interface{}) map[string]interface{} {
 	tmpl := body["spec"].(map[string]interface{})["template"].(map[string]interface{})
+	spec := tmpl["spec"].(map[string]interface{})
+	return spec["containers"].([]interface{})[0].(map[string]interface{})
+}
+
+func jobContainer(body map[string]interface{}) map[string]interface{} {
+	tmpl := body["spec"].(map[string]interface{})["template"].(map[string]interface{})
+	spec := tmpl["spec"].(map[string]interface{})
+	return spec["containers"].([]interface{})[0].(map[string]interface{})
+}
+
+func cronJobContainer(body map[string]interface{}) map[string]interface{} {
+	jt := body["spec"].(map[string]interface{})["jobTemplate"].(map[string]interface{})
+	tmpl := jt["spec"].(map[string]interface{})["template"].(map[string]interface{})
 	spec := tmpl["spec"].(map[string]interface{})
 	return spec["containers"].([]interface{})[0].(map[string]interface{})
 }

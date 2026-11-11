@@ -28,8 +28,11 @@ Every pod spec q8s accepts must contain exactly one container; specs with additi
 
 | Resource | kubectl verbs | Notes |
 |---|---|---|
-| `jobs` | get, list, create, patch, delete | `Restart=no`, oneshot |
-| `cronjobs` | get, list, create, patch, delete | `.container` + `.timer` unit |
+| `jobs` | get, list, create, update, patch, delete | `Restart=no`, oneshot; pod template is immutable |
+| `cronjobs` | get, list, create, update, patch, delete | `.container` + `.timer` unit |
+
+A Job's pod template is immutable: a PUT that changes `spec.template` is
+rejected with 422, matching Kubernetes.
 
 ## networking.k8s.io/v1
 
