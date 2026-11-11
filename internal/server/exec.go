@@ -1,16 +1,24 @@
 package server
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -31,12 +39,35 @@ const (
 // comfortably under common 30–60s idle windows. See tic-c767.
 const wsKeepaliveInterval = 20 * time.Second
 
+// wsReadTimeout is how long the server waits for any frame from an exec client
+// before treating it as gone. Every frame resets the deadline; a live client
+// answers the 20s server pings with pongs, so it never trips this.
+const wsReadTimeout = 3 * wsKeepaliveInterval
+
 // Channel numbers defined by v4/v5.channel.k8s.io.
 const (
 	chanStdin  = byte(0)
 	chanStdout = byte(1)
 	chanStderr = byte(2)
 	chanError  = byte(3)
+	// chanClose is the v5 close signal: a binary frame [chanClose, stream]
+	// tells the server that the client will send nothing more on that stream.
+	chanClose = byte(255)
+)
+
+// execSessionEnv is set in the environment of every process of an exec
+// session. Children inherit it, so a /proc scan can find all of them, which is
+// what lets us stop the container processes when the client goes away.
+const execSessionEnv = "Q8S_EXEC_SESSION"
+
+const (
+	// execKillGrace is how long a marked process gets to exit after SIGTERM
+	// before it is SIGKILLed.
+	execKillGrace = 5 * time.Second
+	execKillPoll  = 100 * time.Millisecond
+	// hostProcRoot is the procfs mount point; a variable so tests can point
+	// the PID scan at a fake directory.
+	hostProcRoot = "/proc"
 )
 
 // wsConn serialises writes to the hijacked WebSocket connection.
@@ -136,6 +167,144 @@ func readFrame(r io.Reader) (op byte, payload []byte, err error) {
 	return
 }
 
+// newExecSessionMarker returns a random 16 hex character session marker.
+func newExecSessionMarker() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail on Linux; fall back to a unique-enough
+		// value instead of failing the exec request.
+		return fmt.Sprintf("%016x", uint64(time.Now().UnixNano()))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// findMarkedPIDs returns the host PIDs whose /proc/<pid>/environ contains the
+// exact NUL separated entry marker (for example "Q8S_EXEC_SESSION=abc"). Exact
+// matching matters: "Q8S_EXEC_SESSION=abc" must not match the entry
+// "Q8S_EXEC_SESSION=abcd". Unreadable and already-vanished pids are skipped.
+func findMarkedPIDs(procRoot, marker string) []int {
+	if marker == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(procRoot, e.Name(), "environ"))
+		if err != nil {
+			continue
+		}
+		for _, entry := range bytes.Split(data, []byte{0}) {
+			if string(entry) == marker {
+				pids = append(pids, pid)
+				break
+			}
+		}
+	}
+	sort.Ints(pids)
+	return pids
+}
+
+// signalMarked sends sig to every process carrying the session marker.
+func signalMarked(procRoot, marker string, sig syscall.Signal) {
+	for _, pid := range findMarkedPIDs(procRoot, marker) {
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		_ = p.Signal(sig)
+	}
+}
+
+// terminateExecSession stops every process of an exec session whose client has
+// gone away. Killing the podman exec client does NOT stop the process inside
+// the container (it is a child of a separate conmon), so the container side is
+// signalled directly, using the session marker to find it. The podman exec
+// client is killed last so the stdout/stderr pipes close and the handler
+// returns.
+func terminateExecSession(cmd *exec.Cmd, procRoot, marker string) {
+	signalMarked(procRoot, marker, syscall.SIGTERM)
+
+	deadline := time.Now().Add(execKillGrace)
+	for time.Now().Before(deadline) {
+		if len(findMarkedPIDs(procRoot, marker)) == 0 {
+			break
+		}
+		time.Sleep(execKillPoll)
+	}
+	if len(findMarkedPIDs(procRoot, marker)) > 0 {
+		signalMarked(procRoot, marker, syscall.SIGKILL)
+	}
+
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+}
+
+// serveClientFrames reads client frames until the client goes away. It returns
+// clientGone=true when the client closed the stream or the connection failed
+// (including a read that hit the liveness deadline). The process stdin is
+// closed on every return path, at most once. stdin may be nil when the exec
+// request did not ask for stdin; channel 0 data is then dropped. setDeadline,
+// when not nil, is called before every frame read to refresh the liveness
+// deadline on the underlying connection.
+func serveClientFrames(r io.Reader, setDeadline func(), stdin io.WriteCloser, ws *wsConn) (clientGone bool) {
+	var closeOnce sync.Once
+	closeStdin := func() {
+		if stdin == nil {
+			return
+		}
+		closeOnce.Do(func() { stdin.Close() })
+	}
+	defer closeStdin()
+
+	for {
+		if setDeadline != nil {
+			setDeadline()
+		}
+		op, payload, err := readFrame(r)
+		if err != nil {
+			return true
+		}
+		switch op {
+		case wsOpClose:
+			return true
+		case wsOpBinary:
+			if len(payload) == 0 {
+				continue
+			}
+			switch payload[0] {
+			case chanStdin:
+				if stdin != nil {
+					if _, err := stdin.Write(payload[1:]); err != nil {
+						return true
+					}
+				}
+			case chanClose:
+				// v5.channel.k8s.io: [255, stream] closes that stream. Only
+				// stdin is meaningful here, and reading must continue because
+				// pings and a later close frame still matter.
+				if len(payload) >= 2 && payload[1] == chanStdin {
+					closeStdin()
+				}
+			}
+			// Channel 4 (resize) and unknown channels are ignored.
+		case wsOpPing:
+			// Answer a client keepalive so bidirectional idle pings don't
+			// stall waiting for a pong.
+			ws.pong(payload)
+		case wsOpPong:
+			// Response to our own ping; the deadline is already refreshed.
+		}
+	}
+}
+
 func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name string) {
 	q := r.URL.Query()
 	commands := q["command"]
@@ -210,7 +379,10 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 	// are accepted but silently ignored — the initial size is Podman's default.
 	containerName := s.podContainerName(ns, name, q.Get("container"))
 	wantTTY := q.Get("tty") == "true"
-	podmanArgs := []string{"exec", "-i"}
+	// The session marker is inherited by every process podman starts for this
+	// exec, so we can find and stop them all if the client goes away.
+	marker := execSessionEnv + "=" + newExecSessionMarker()
+	podmanArgs := []string{"exec", "-i", "-e", marker}
 	if wantTTY {
 		podmanArgs = append(podmanArgs, "-t")
 	}
@@ -275,33 +447,47 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 		pipe(ws, chanStderr, stderrR)
 	}()
 
-	// channel 0 → stdin (read WebSocket frames from client)
-	if wantStdin {
-		go func() {
-			defer stdinW.Close()
-			for {
-				op, payload, err := readFrame(rw.Reader)
-				if err != nil || op == wsOpClose {
-					return
-				}
-				switch op {
-				case wsOpBinary:
-					if len(payload) > 0 && payload[0] == chanStdin {
-						stdinW.Write(payload[1:])
-					}
-					// channel 4 = resize — ignored (no PTY)
-				case wsOpPing:
-					// Answer a client keepalive so bidirectional idle
-					// pings don't stall waiting for a pong.
-					ws.pong(payload)
-				case wsOpPong:
-					// Response to our own ping — nothing to do.
-				}
-			}
-		}()
-	}
+	// Client frames are always read, even without stdin: a v5 close frame, a
+	// close frame or a dead connection must be noticed in every mode. Every
+	// frame also refreshes the read deadline, which is the client liveness
+	// check. stdinW is nil when the request did not ask for stdin.
+	framesDone := make(chan bool, 1)
+	go func() {
+		framesDone <- serveClientFrames(rw.Reader, func() {
+			_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		}, stdinW, ws)
+	}()
 
-	wg.Wait()
+	// Wait for the stdout/stderr pipes to close (which happens when the
+	// command exits) or for the client to go away. A client that disappears
+	// while the command still runs is a genuine disconnect: stop the session.
+	// Once the pipes are done the command has exited on its own, so a reader
+	// that ends later (because the handler closes the connection) must not
+	// terminate anything.
+	cmdDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(cmdDone)
+	}()
+
+	select {
+	case <-cmdDone:
+	case gone := <-framesDone:
+		if gone {
+			select {
+			case <-cmdDone:
+				// The command exited at the same time; nothing to clean up.
+			default:
+				// A dead peer can leave an output goroutine blocked in
+				// conn.Write (holding the frame mutex) once the TCP send
+				// buffer fills; make further writes fail at once so the
+				// pipes drain and the handler can return.
+				_ = conn.SetWriteDeadline(time.Now())
+				terminateExecSession(cmd, hostProcRoot, marker)
+			}
+		}
+		<-cmdDone
+	}
 	close(keepaliveDone)
 	exitErr := cmd.Wait()
 
