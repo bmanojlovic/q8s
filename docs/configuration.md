@@ -50,6 +50,15 @@ sudo loginctl enable-linger $USER
 
 `q8s status` warns when lingering is off.
 
+Rootful on a host with firewalld: `q8s install` also enables
+`netavark-firewalld-reload.service`. firewalld drops netavark's runtime bridge
+rules on `firewall-cmd --reload`, which cuts pod DNS and ingress until
+`podman network reload --all` is run; the reload service listens for the
+firewalld `Reloaded` signal and puts the rules back. If the unit is not
+installed, install prints a warning instead of failing, and `q8s doctor` says
+so. Rootless networks live inside the rootless network namespace and are not
+affected.
+
 ## Commands
 
 ```sh

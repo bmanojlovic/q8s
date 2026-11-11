@@ -419,6 +419,12 @@ func Install(cfg InstallConfig) error {
 		enableLinger()
 	}
 
+	// Rootful pod networks live in the host firewall; firewalld drops their
+	// runtime rules on reload. Netavark's reload service re-adds them.
+	if cfg.Rootful {
+		ensureFirewallReload()
+	}
+
 	// Restart service if certs were regenerated (so it picks up the new cert)
 	if certsRegenerated {
 		systemctlArgs := []string{"--user"}
@@ -786,6 +792,64 @@ func LingerEnabled() (bool, error) {
 		return false, fmt.Errorf("loginctl show-user: %w", err)
 	}
 	return strings.TrimSpace(string(out)) == "yes", nil
+}
+
+// firewallReloadService restores netavark's runtime firewall rules when
+// firewalld reloads. Distribution packages install it disabled.
+const firewallReloadService = "netavark-firewalld-reload.service"
+
+// commandRunner runs a command and returns its stdout. The output is available
+// even when the command exits non-zero: systemctl is-active writes the unit
+// state to stdout and exits 3 for an inactive unit, so the output is the real
+// signal there.
+type commandRunner func(name string, args ...string) ([]byte, error)
+
+// unitFileListed reports whether `systemctl list-unit-files --no-legend`
+// output contains a line for unit.
+func unitFileListed(output []byte, unit string) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == unit {
+			return true
+		}
+	}
+	return false
+}
+
+// configureFirewallReload makes pod networking survive `firewall-cmd --reload`
+// on a rootful host with firewalld. A firewalld reload drops netavark's runtime
+// bridge rules, so pods lose DNS and ingress until `podman network reload
+// --all` is run; netavark-firewalld-reload.service listens for the D-Bus
+// "Reloaded" signal and puts the rules back. Nothing here is fatal: without
+// firewalld there is nothing to do, and a host without the unit still works
+// until someone reloads the firewall.
+func configureFirewallReload(run commandRunner, w io.Writer) {
+	if _, err := run("systemctl", "is-active", "--quiet", "firewalld.service"); err != nil {
+		return // firewalld not active (or not installed): no runtime rules to restore
+	}
+
+	units, _ := run("systemctl", "list-unit-files", "--no-legend", firewallReloadService)
+	if !unitFileListed(units, firewallReloadService) {
+		fmt.Fprintf(w, "Warning: firewalld is active but %s is not installed.\n", firewallReloadService)
+		fmt.Fprintln(w, "Without it, firewall-cmd --reload cuts pod networking until podman network reload --all is run.")
+		return
+	}
+
+	if _, err := run("systemctl", "enable", "--now", firewallReloadService); err != nil {
+		fmt.Fprintf(w, "Warning: could not enable %s: %v\n", firewallReloadService, err)
+		fmt.Fprintf(w, "Run it by hand: sudo systemctl enable --now %s\n", firewallReloadService)
+		return
+	}
+	fmt.Fprintf(w, "Enabled %s (pod networking survives firewall-cmd --reload).\n", firewallReloadService)
+}
+
+// ensureFirewallReload wires configureFirewallReload to the real systemctl and
+// stdout. It never returns an error: a missing prerequisite is a warning, not a
+// failed install.
+func ensureFirewallReload() {
+	configureFirewallReload(func(name string, args ...string) ([]byte, error) {
+		return exec.Command(name, args...).Output()
+	}, os.Stdout)
 }
 
 // enableLinger turns on lingering for the current user so rootless q8s keeps

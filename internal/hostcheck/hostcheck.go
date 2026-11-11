@@ -1,7 +1,8 @@
 // Package hostcheck inspects what the local host gives q8s workloads and
 // reports it in plain words. The checks are read-only: every host access goes
 // through Env, and the only external commands they may run are podman version,
-// podman info and (rootless) loginctl via install.LingerEnabled.
+// podman info, systemctl (rootful, for firewalld state) and (rootless) loginctl
+// via install.LingerEnabled.
 //
 // The one writer is EnsureContainersRange, which appends the subordinate id
 // range podman's --userns=auto needs. Rootful `q8s serve` calls it before
@@ -153,6 +154,11 @@ func Run(env Env) Report {
 
 	r.Checks = append(r.Checks, checkCgroups(env))
 	r.Checks = append(r.Checks, checkNetwork(env))
+	// Rootless bridge networks live inside the rootless network namespace, so
+	// firewalld on the host cannot drop their rules; the check is rootful only.
+	if env.Rootful {
+		r.Checks = append(r.Checks, checkFirewallReload(env))
+	}
 	certCheck, certInfo := checkCertificates(env)
 	r.Checks = append(r.Checks, certCheck)
 	r.Checks = append(r.Checks, checkTraefikDir(env))
@@ -576,6 +582,69 @@ func checkNetwork(env Env) Check {
 	}
 	c.Status = StatusInfo
 	c.Detail = cmd
+	return c
+}
+
+const firewallReloadService = "netavark-firewalld-reload.service"
+
+// unitListed reports whether `systemctl list-unit-files --no-legend` output
+// contains a line for unit.
+func unitListed(output []byte, unit string) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == unit {
+			return true
+		}
+	}
+	return false
+}
+
+// checkFirewallReload reports whether pod networking survives a firewalld
+// reload. Rootful only: rootless bridge networks are not in the host firewall.
+// systemctl is-active exits non-zero for an inactive unit, so the stdout text is
+// the signal, not the error.
+func checkFirewallReload(env Env) Check {
+	c := Check{ID: "firewall-reload", Title: "firewall reload"}
+	out, err := env.command("systemctl", "is-active", "firewalld.service")
+	state := strings.TrimSpace(string(out))
+	if state == "" && err != nil {
+		// systemctl is unavailable (no systemd, no D-Bus) or failed to answer.
+		c.Status = StatusInfo
+		c.Detail = "unknown"
+		return c
+	}
+	if state != "active" {
+		c.Status = StatusOK
+		c.Detail = "firewalld is not active"
+		return c
+	}
+
+	reloadOut, _ := env.command("systemctl", "is-active", firewallReloadService)
+	if strings.TrimSpace(string(reloadOut)) == "active" {
+		c.Status = StatusOK
+		c.Detail = firewallReloadService + " is active"
+		c.Gain = "pod networking survives firewall-cmd --reload"
+		return c
+	}
+
+	units, unitsErr := env.command("systemctl", "list-unit-files", "--no-legend", firewallReloadService)
+	if unitsErr != nil && strings.TrimSpace(string(units)) == "" {
+		c.Status = StatusInfo
+		c.Detail = "unknown"
+		return c
+	}
+	if !unitListed(units, firewallReloadService) {
+		c.Status = StatusWarn
+		c.Detail = "firewalld is active and " + firewallReloadService + " is not installed"
+		c.Loss = "pods lose bridge networking and DNS until podman network reload --all is run after a firewall-cmd --reload"
+		c.Fix = "run 'podman network reload --all' after every firewall-cmd --reload (" + firewallReloadService + " is not installed)"
+		return c
+	}
+
+	c.Status = StatusWarn
+	c.Detail = "pod networking breaks on firewall-cmd --reload"
+	c.Loss = "pods lose bridge networking and DNS until podman network reload --all is run"
+	c.Fix = "sudo systemctl enable --now " + firewallReloadService
 	return c
 }
 

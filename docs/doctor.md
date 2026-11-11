@@ -5,8 +5,9 @@ the operator: what does this machine give my workloads, and what does it not?
 
 The command never writes a file, starts a container, runs `podman run`, or
 changes a setting. The only external commands it runs are `podman version`,
-`podman info`, and (rootless only) `loginctl` through `install.LingerEnabled`.
-Everything else is a read of an existing file or a `statfs` call.
+`podman info`, `systemctl` (rootful only, for firewalld state), and (rootless
+only) `loginctl` through `install.LingerEnabled`. Everything else is a read of
+an existing file or a `statfs` call.
 
 ```sh
 q8s doctor          # human report
@@ -153,6 +154,34 @@ socket-activated Traefik pod still uses the kernel path.
 
 Rootful is ok: published ports use kernel NAT and client IPs are preserved.
 
+### `firewall-reload`
+
+Rootful only. Rootless bridge networks live inside the rootless network
+namespace, not in the host firewall, so this check is not emitted there.
+
+It first asks `systemctl is-active firewalld.service`. If firewalld is not
+active, the check is ok (`firewalld is not active`), because there is no
+runtime firewall state to lose.
+
+When firewalld is active, it asks for
+`systemctl is-active netavark-firewalld-reload.service`. An active reload
+service is ok: pod networking survives `firewall-cmd --reload`.
+
+A firewalld reload drops netavark's runtime bridge rules. If the reload unit is
+installed but not active, the check warns that pod networking breaks on
+`firewall-cmd --reload` and that pods lose bridge networking and DNS until
+`podman network reload --all` is run. The fix is
+`sudo systemctl enable --now netavark-firewalld-reload.service`.
+
+If `systemctl list-unit-files --no-legend netavark-firewalld-reload.service`
+shows no line for the unit, it is not installed at all. That is also a warn,
+and the fix says to run `podman network reload --all` after every
+`firewall-cmd --reload`. Rootful `q8s install` enables the unit when it is
+present.
+
+If `systemctl` cannot answer at all, the check is informational and reports
+`unknown`.
+
 ### `certificates`
 
 Parses `<data dir>/certs/server.crt` and lists the certificate SANs and the
@@ -186,4 +215,4 @@ optional `gain`, `loss`, and `fix` fields. The ids are stable and safe to match
 in scripts:
 
 `podman`, `kernel`, `userns`, `idmap`, `linger` (rootless only), `cgroups`,
-`network`, `certificates`, `traefik-dir`.
+`network`, `firewall-reload` (rootful only), `certificates`, `traefik-dir`.

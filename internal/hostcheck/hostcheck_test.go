@@ -117,10 +117,9 @@ func newFake(t *testing.T, rootful bool) *fake {
 			if !ok {
 				return nil, fmt.Errorf("unexpected command: %s", key)
 			}
-			if r.err != nil {
-				return nil, r.err
-			}
-			return []byte(r.out), nil
+			// systemctl is-active writes the state to stdout and exits
+			// non-zero for an inactive unit, so keep the output on error.
+			return []byte(r.out), r.err
 		},
 		FSType: func(path string) (string, error) {
 			fs, ok := f.fs[path]
@@ -587,10 +586,78 @@ func TestLingerCheck(t *testing.T) {
 	})
 }
 
+func TestFirewallReloadCheck(t *testing.T) {
+	notActive := fmt.Errorf("exit status 3")
+
+	t.Run("firewalld not active", func(t *testing.T) {
+		f := newFake(t, true)
+		f.setCmd("inactive\n", notActive, "systemctl", "is-active", "firewalld.service")
+		c := getCheck(t, Run(f.env), "firewall-reload")
+		if c.Status != StatusOK || c.Detail != "firewalld is not active" {
+			t.Fatalf("check = %+v, want ok with firewalld not active", c)
+		}
+	})
+	t.Run("reload service active", func(t *testing.T) {
+		f := newFake(t, true)
+		f.setCmd("active\n", nil, "systemctl", "is-active", "firewalld.service")
+		f.setCmd("active\n", nil, "systemctl", "is-active", "netavark-firewalld-reload.service")
+		c := getCheck(t, Run(f.env), "firewall-reload")
+		if c.Status != StatusOK {
+			t.Fatalf("status = %q, want ok", c.Status)
+		}
+		if !strings.Contains(c.Detail, "netavark-firewalld-reload.service is active") {
+			t.Errorf("detail %q should name the active reload service", c.Detail)
+		}
+	})
+	t.Run("unit installed but not active", func(t *testing.T) {
+		f := newFake(t, true)
+		f.setCmd("active\n", nil, "systemctl", "is-active", "firewalld.service")
+		f.setCmd("inactive\n", notActive, "systemctl", "is-active", "netavark-firewalld-reload.service")
+		f.setCmd("netavark-firewalld-reload.service disabled\n", nil, "systemctl", "list-unit-files", "--no-legend", "netavark-firewalld-reload.service")
+		c := getCheck(t, Run(f.env), "firewall-reload")
+		if c.Status != StatusWarn {
+			t.Fatalf("status = %q, want warn", c.Status)
+		}
+		if !strings.Contains(c.Detail, "pod networking breaks on firewall-cmd --reload") {
+			t.Errorf("detail %q should describe the breakage", c.Detail)
+		}
+		if !strings.Contains(c.Loss, "bridge networking and DNS") || !strings.Contains(c.Loss, "podman network reload --all") {
+			t.Errorf("loss %q should explain the loss and the manual fix", c.Loss)
+		}
+		if !strings.Contains(c.Fix, "sudo systemctl enable --now netavark-firewalld-reload.service") {
+			t.Errorf("fix %q should enable the unit", c.Fix)
+		}
+	})
+	t.Run("unit not installed", func(t *testing.T) {
+		f := newFake(t, true)
+		f.setCmd("active\n", nil, "systemctl", "is-active", "firewalld.service")
+		f.setCmd("inactive\n", notActive, "systemctl", "is-active", "netavark-firewalld-reload.service")
+		f.setCmd("", nil, "systemctl", "list-unit-files", "--no-legend", "netavark-firewalld-reload.service")
+		c := getCheck(t, Run(f.env), "firewall-reload")
+		if c.Status != StatusWarn {
+			t.Fatalf("status = %q, want warn", c.Status)
+		}
+		if !strings.Contains(c.Detail, "not installed") {
+			t.Errorf("detail %q should say the unit is missing", c.Detail)
+		}
+		if !strings.Contains(c.Fix, "podman network reload --all") || !strings.Contains(c.Fix, "not installed") {
+			t.Errorf("fix %q should point at the manual reload", c.Fix)
+		}
+	})
+	t.Run("systemctl unavailable", func(t *testing.T) {
+		f := newFake(t, true)
+		f.setCmd("", fmt.Errorf("exec: systemctl: not found"), "systemctl", "is-active", "firewalld.service")
+		c := getCheck(t, Run(f.env), "firewall-reload")
+		if c.Status != StatusInfo || c.Detail != "unknown" {
+			t.Fatalf("check = %+v, want info with unknown detail", c)
+		}
+	})
+}
+
 func TestCheckOrderAndRootfulSkipsLinger(t *testing.T) {
 	rootful := newFake(t, true)
 	got := checkIDs(Run(rootful.env))
-	want := []string{"podman", "kernel", "userns", "idmap", "cgroups", "network", "certificates", "traefik-dir"}
+	want := []string{"podman", "kernel", "userns", "idmap", "cgroups", "network", "firewall-reload", "certificates", "traefik-dir"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rootful check ids = %v, want %v", got, want)
 	}

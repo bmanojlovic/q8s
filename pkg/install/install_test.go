@@ -1,11 +1,14 @@
 package install
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -216,4 +219,158 @@ func TestInvalidPersistedSANIsNotARegenReason(t *testing.T) {
 	if !sameStrings(merged.ExtraSANDNS, existing.ExtraSANDNS) {
 		t.Fatalf("existing after filter = %v, want [a.example]", existing.ExtraSANDNS)
 	}
+}
+
+// --- firewall reload prerequisite ---
+
+type fakeCmd struct {
+	out string
+	err error
+}
+
+type fakeCall struct {
+	name string
+	args []string
+}
+
+func newFakeRunner(t *testing.T, calls *[]fakeCall, responses map[string]fakeCmd) commandRunner {
+	t.Helper()
+	return func(name string, args ...string) ([]byte, error) {
+		*calls = append(*calls, fakeCall{name: name, args: args})
+		key := strings.Join(append([]string{name}, args...), " ")
+		r, ok := responses[key]
+		if !ok {
+			t.Fatalf("unexpected command: %s", key)
+		}
+		return []byte(r.out), r.err
+	}
+}
+
+func TestConfigureFirewallReload(t *testing.T) {
+	const (
+		firewalld = "systemctl is-active --quiet firewalld.service"
+		listUnits = "systemctl list-unit-files --no-legend netavark-firewalld-reload.service"
+		enable    = "systemctl enable --now netavark-firewalld-reload.service"
+	)
+	notActive := fakeCmd{out: "inactive\n", err: fmt.Errorf("exit status 3")}
+
+	t.Run("firewalld not active", func(t *testing.T) {
+		var calls []fakeCall
+		var out bytes.Buffer
+		run := newFakeRunner(t, &calls, map[string]fakeCmd{firewalld: notActive})
+		configureFirewallReload(run, &out)
+		if out.Len() != 0 {
+			t.Errorf("output = %q, want nothing", out.String())
+		}
+		if len(calls) != 1 {
+			t.Errorf("calls = %v, want only the firewalld probe", calls)
+		}
+	})
+
+	t.Run("firewalld unavailable", func(t *testing.T) {
+		var calls []fakeCall
+		var out bytes.Buffer
+		run := newFakeRunner(t, &calls, map[string]fakeCmd{
+			firewalld: {err: fmt.Errorf("exec: systemctl: not found")},
+		})
+		configureFirewallReload(run, &out)
+		if out.Len() != 0 {
+			t.Errorf("output = %q, want nothing", out.String())
+		}
+	})
+
+	t.Run("unit not installed", func(t *testing.T) {
+		var calls []fakeCall
+		var out bytes.Buffer
+		run := newFakeRunner(t, &calls, map[string]fakeCmd{
+			firewalld: {out: "active\n"},
+			listUnits: {},
+		})
+		configureFirewallReload(run, &out)
+		got := out.String()
+		for _, want := range []string{
+			"Warning: firewalld is active but netavark-firewalld-reload.service is not installed.",
+			"firewall-cmd --reload",
+			"podman network reload --all",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output %q should contain %q", got, want)
+			}
+		}
+		for _, c := range calls {
+			if strings.Join(append([]string{c.name}, c.args...), " ") == enable {
+				t.Error("must not try to enable a unit that is not installed")
+			}
+		}
+	})
+
+	t.Run("enables the service", func(t *testing.T) {
+		var calls []fakeCall
+		var out bytes.Buffer
+		run := newFakeRunner(t, &calls, map[string]fakeCmd{
+			firewalld: {out: "active\n"},
+			listUnits: {out: "netavark-firewalld-reload.service enabled\n"},
+			enable:    {},
+		})
+		configureFirewallReload(run, &out)
+		want := "Enabled netavark-firewalld-reload.service (pod networking survives firewall-cmd --reload).\n"
+		if out.String() != want {
+			t.Errorf("output = %q, want %q", out.String(), want)
+		}
+		if len(calls) != 3 {
+			t.Errorf("calls = %v, want probe, list and enable", calls)
+		}
+	})
+
+	t.Run("enable failure is a warning", func(t *testing.T) {
+		var calls []fakeCall
+		var out bytes.Buffer
+		run := newFakeRunner(t, &calls, map[string]fakeCmd{
+			firewalld: {out: "active\n"},
+			listUnits: {out: "netavark-firewalld-reload.service disabled\n"},
+			enable:    {err: fmt.Errorf("unit is masked")},
+		})
+		configureFirewallReload(run, &out)
+		got := out.String()
+		for _, want := range []string{
+			"Warning: could not enable netavark-firewalld-reload.service",
+			"unit is masked",
+			"Run it by hand: sudo systemctl enable --now netavark-firewalld-reload.service",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output %q should contain %q", got, want)
+			}
+		}
+	})
+
+	t.Run("repeated install is harmless", func(t *testing.T) {
+		var calls []fakeCall
+		var out bytes.Buffer
+		run := newFakeRunner(t, &calls, map[string]fakeCmd{
+			firewalld: {out: "active\n"},
+			listUnits: {out: "netavark-firewalld-reload.service enabled\n"},
+			enable:    {},
+		})
+		configureFirewallReload(run, &out)
+		configureFirewallReload(run, &out)
+		if strings.Count(out.String(), "Enabled netavark-firewalld-reload.service") != 2 {
+			t.Errorf("output = %q, want two success lines", out.String())
+		}
+		if len(calls) != 6 {
+			t.Errorf("calls = %v, want two full runs", calls)
+		}
+	})
+
+	t.Run("list output for another unit means not installed", func(t *testing.T) {
+		var calls []fakeCall
+		var out bytes.Buffer
+		run := newFakeRunner(t, &calls, map[string]fakeCmd{
+			firewalld: {out: "active\n"},
+			listUnits: {out: "other.service enabled\n"},
+		})
+		configureFirewallReload(run, &out)
+		if !strings.Contains(out.String(), "is not installed") {
+			t.Errorf("output = %q, want a missing-unit warning", out.String())
+		}
+	})
 }
