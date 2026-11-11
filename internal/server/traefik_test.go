@@ -634,13 +634,16 @@ func TestIngressRouteTCPRenderingAndPodChurn(t *testing.T) {
       service: default-smtp-0
       tls:
         passthrough: true
+  serversTransports:
+    default-smtp-0:
+      proxyProtocol:
+        version: 2
   services:
     default-smtp-0:
       loadBalancer:
-        proxyProtocol:
-          version: 2
         servers:
         - address: mail-0.default:2525
+        serversTransport: default-smtp-0
 `
 	if got := readTraefikFile(t, dir, "tcp-default-smtp.yaml"); got != want {
 		t.Fatalf("rendered TCP file:\n%s\nwant:\n%s", got, want)

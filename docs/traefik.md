@@ -195,14 +195,21 @@ tcp:
       service: default-smtp-0
       tls:
         passthrough: true
+  serversTransports:
+    default-smtp-0:
+      proxyProtocol:
+        version: 2
   services:
     default-smtp-0:
       loadBalancer:
-        proxyProtocol:
-          version: 2
         servers:
         - address: mail-0.default:25
+        serversTransport: default-smtp-0
 ```
+
+`proxyProtocol` on the IngressRouteTCP service is rendered as a TCP
+`serversTransport` of the same name, which the load balancer references.
+Traefik v3 deprecates `proxyProtocol` directly on the load balancer.
 
 Backends are resolved exactly like Ingress backends: the Service selector
 selects the pods, the Service port resolves to its `targetPort`, and every

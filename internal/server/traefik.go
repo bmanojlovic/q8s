@@ -447,8 +447,16 @@ type tcpDocument struct {
 }
 
 type tcpConfig struct {
-	Routers  map[string]tcpRouter  `json:"routers"`
-	Services map[string]tcpService `json:"services"`
+	Routers           map[string]tcpRouter           `json:"routers"`
+	Services          map[string]tcpService          `json:"services"`
+	ServersTransports map[string]tcpServersTransport `json:"serversTransports,omitempty"`
+}
+
+// tcpServersTransport carries the PROXY protocol setting for a TCP service.
+// Traefik v3 deprecates loadBalancer.proxyProtocol in favour of a
+// serversTransport that the service references.
+type tcpServersTransport struct {
+	ProxyProtocol *traefik.ProxyProtocol `json:"proxyProtocol,omitempty"`
 }
 
 type tcpRouter struct {
@@ -467,8 +475,8 @@ type tcpService struct {
 }
 
 type tcpLoadBalancer struct {
-	ProxyProtocol *traefik.ProxyProtocol `json:"proxyProtocol,omitempty"`
-	Servers       []tcpServer            `json:"servers"`
+	ServersTransport string      `json:"serversTransport,omitempty"`
+	Servers          []tcpServer `json:"servers"`
 }
 
 type tcpServer struct {
@@ -542,7 +550,14 @@ func (s *Server) generateTCPConfig(irt *traefik.IngressRouteTCP) {
 				portName = backend.Port.StrVal
 			}
 			if backend.ProxyProtocol != nil {
-				svc.LoadBalancer.ProxyProtocol = backend.ProxyProtocol
+				// The IngressRouteTCP field stays as Traefik's CRD defines
+				// it; the file provider gets the non-deprecated form, a
+				// serversTransport of the same name in this file.
+				if doc.TCP.ServersTransports == nil {
+					doc.TCP.ServersTransports = make(map[string]tcpServersTransport)
+				}
+				doc.TCP.ServersTransports[name] = tcpServersTransport{ProxyProtocol: backend.ProxyProtocol}
+				svc.LoadBalancer.ServersTransport = name
 			}
 			for _, address := range s.tcpBackendAddresses(irt.Namespace, backend.Name, svcPort, portName) {
 				svc.LoadBalancer.Servers = append(svc.LoadBalancer.Servers, tcpServer{Address: address})
