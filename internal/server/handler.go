@@ -3224,9 +3224,13 @@ func (s *Server) ReconcileQuadlets() {
 	}
 
 	for _, job := range s.config.Store.AllJobs() {
+		// Existing Job units are re-rendered too, so an upgrade that changes
+		// rendering (e.g. the UserNS size) reaches them; only a missing unit
+		// is started.
 		f := fmt.Sprintf("%s/%s-%s-job.container", quadletDir, job.Namespace, job.Name)
-		if !missing(f) {
-			continue
+		jobUnit := ""
+		if missing(f) {
+			jobUnit = fmt.Sprintf("%s-%s-job.service", job.Namespace, job.Name)
 		}
 		resolved, envFile, err := s.resolvedJobEnv(job)
 		if err != nil {
@@ -3238,8 +3242,7 @@ func (s *Server) ReconcileQuadlets() {
 			fmt.Printf("reconcile job %s/%s: %v\n", job.Namespace, job.Name, err)
 			continue
 		}
-		write(quadletDir, fmt.Sprintf("%s-%s-job.container", job.Namespace, job.Name), content,
-			fmt.Sprintf("%s-%s-job.service", job.Namespace, job.Name))
+		write(quadletDir, fmt.Sprintf("%s-%s-job.container", job.Namespace, job.Name), content, jobUnit)
 	}
 
 	timerDir := s.config.SystemdDir
@@ -3249,8 +3252,11 @@ func (s *Server) ReconcileQuadlets() {
 	for _, cj := range s.config.Store.AllCronJobs() {
 		cf := fmt.Sprintf("%s/%s-%s-cron.container", quadletDir, cj.Namespace, cj.Name)
 		tf := fmt.Sprintf("%s/%s-%s-cron.timer", timerDir, cj.Namespace, cj.Name)
-		regen := false
-		if missing(cf) {
+		// Like pods, existing CronJob units are re-rendered so a q8s upgrade
+		// reaches them; the next run uses the new unit, nothing is restarted.
+		// The timer is started only when one of its files was missing.
+		regen := missing(cf) || missing(tf)
+		{
 			resolved, envFile, err := s.resolvedCronJobEnv(cj)
 			if err != nil {
 				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
@@ -3261,19 +3267,15 @@ func (s *Server) ReconcileQuadlets() {
 				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
 				continue
 			}
-			if write(quadletDir, fmt.Sprintf("%s-%s-cron.container", cj.Namespace, cj.Name), content, "") {
-				regen = true
-			}
+			write(quadletDir, fmt.Sprintf("%s-%s-cron.container", cj.Namespace, cj.Name), content, "")
 		}
-		if missing(tf) {
+		{
 			content, err := quadlet.CronTimer(cj.Name, cj)
 			if err != nil {
 				fmt.Printf("reconcile cronjob %s/%s timer: %v\n", cj.Namespace, cj.Name, err)
 				continue
 			}
-			if write(timerDir, fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name), content, "") {
-				regen = true
-			}
+			write(timerDir, fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name), content, "")
 		}
 		if regen && !cronJobSuspended(cj) {
 			startUnits = append(startUnits, fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name))

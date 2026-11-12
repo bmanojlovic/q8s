@@ -23,6 +23,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -5028,5 +5029,56 @@ func TestDeploymentUpdateRejectsUnsupportedProbe(t *testing.T) {
 	c := dep.Spec.Template.Spec.Containers[0]
 	if c.LivenessProbe != nil || c.ReadinessProbe != nil {
 		t.Error("unsupported probe was persisted by the update")
+	}
+}
+
+// TestReconcileRerendersExistingCronJobAndJobUnits: like pod units, an
+// existing CronJob or Job unit is re-rendered at startup, so an upgrade that
+// changes rendering (for example the user namespace size) reaches a CronJob
+// nobody has touched since.
+func TestReconcileRerendersExistingCronJobAndJobUnits(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	tmpl := corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+		RestartPolicy: corev1.RestartPolicyNever,
+		Containers:    []corev1.Container{{Name: "task", Image: "alpine:3"}},
+	}}
+	if _, err := st.CreateCronJob(&batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "export", Namespace: "default"},
+		Spec: batchv1.CronJobSpec{
+			Schedule:    "0 4 * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{Template: tmpl}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateCronJob: %v", err)
+	}
+	if _, err := st.CreateJob(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "once", Namespace: "default"},
+		Spec:       batchv1.JobSpec{Template: tmpl},
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	stale := "[Container]\nImage=alpine:3\n"
+	units := []string{
+		filepath.Join(quadletDir, "default-export-cron.container"),
+		filepath.Join(quadletDir, "default-once-job.container"),
+	}
+	for _, u := range units {
+		if err := os.WriteFile(u, []byte(stale), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	srv.ReconcileQuadlets()
+
+	for _, u := range units {
+		got, err := os.ReadFile(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) == stale || !strings.Contains(string(got), "ContainerName=") {
+			t.Fatalf("%s was not re-rendered:\n%s", filepath.Base(u), got)
+		}
 	}
 }
