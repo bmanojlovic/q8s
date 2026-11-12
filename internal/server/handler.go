@@ -264,7 +264,8 @@ func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Req
 		obj PI
 	}
 	seen := make(map[string]entry)
-	for _, o := range listFn() {
+	initial := listFn()
+	for _, o := range initial {
 		seen[key(o)] = entry{rv: o.GetResourceVersion(), obj: o}
 	}
 
@@ -294,6 +295,20 @@ func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Req
 		}
 		flusher.Flush()
 		return true
+	}
+
+	// resourceVersion=0 means "start at any version": kube-apiserver then
+	// sends the current state as synthetic ADDED events first, and kubectl
+	// get -w relies on that: it drops the first watch event as the copy of
+	// the object it just printed. Without the replay it dropped the first
+	// real change instead (a pod's ready=false after a restart went missing).
+	// Other values (an informer's list resourceVersion) start from now.
+	if r.URL.Query().Get("resourceVersion") == "0" {
+		for _, o := range initial {
+			if !write("ADDED", o) {
+				return
+			}
+		}
 	}
 
 	ctx := r.Context()
