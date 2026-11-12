@@ -10,14 +10,15 @@ import (
 
 // nextRecheck returns how long to wait before the next readiness recheck when
 // at least one running pod has a container that is not ready yet and carries a
-// readinessProbe or startupProbe. It reports false when no such pod exists, so
-// the sync loop can stay idle instead of running an extra timer.
+// probe that becomes a podman health check (liveness, readiness or startup).
+// It reports false when no such pod exists, so the sync loop can stay idle
+// instead of running an extra timer.
 //
 // containers is the live Podman info reconcileOnce already fetched, keyed by
 // namespace/name. A container contributes only while Kubernetes could still
 // be waiting for its probe: until its start time plus initialDelaySeconds plus
-// failureThreshold probe periods. With both probes, a startupProbe's window is
-// added to the readinessProbe's window because Kubernetes runs them one after
+// failureThreshold probe periods. With a startupProbe, its window is added to
+// the main health check's window because Kubernetes runs them one after
 // the other. The result is the shortest period among the contributing
 // containers, so a pod becoming ready is noticed on the probe's own cadence
 // rather than at the next 30s resync tick.
@@ -30,19 +31,25 @@ func nextRecheck(pods []*corev1.Pod, containers map[string][]podman.ContainerInf
 		}
 		infos := containers[pod.Namespace+"/"+pod.Name]
 		for _, c := range pod.Spec.Containers {
-			if c.ReadinessProbe == nil && c.StartupProbe == nil {
+			// Ready follows podman's single health check, which the
+			// livenessProbe owns when present, else the readinessProbe
+			// (see quadlet.writeHealthCheck); a startupProbe runs first.
+			probe := c.LivenessProbe
+			if probe == nil {
+				probe = c.ReadinessProbe
+			}
+			if probe == nil && c.StartupProbe == nil {
 				continue
 			}
 			if containerReady(pod, c.Name) {
 				continue
 			}
-			probe := c.ReadinessProbe
 			if probe == nil {
 				probe = c.StartupProbe
 			}
 			period := probePeriod(probe)
 			budget := probeBudget(probe)
-			if c.ReadinessProbe != nil && c.StartupProbe != nil {
+			if probe != c.StartupProbe && c.StartupProbe != nil {
 				budget += probeBudget(c.StartupProbe)
 			}
 			start, ok := containerStart(pod, infos, c.Name)

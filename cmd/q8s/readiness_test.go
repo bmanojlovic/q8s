@@ -205,6 +205,30 @@ func TestNextRecheckTable(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name: "liveness-only probe owns the health check",
+			pods: []*corev1.Pod{
+				recheckTestPod("default", "app", running, map[string]bool{"app": false},
+					corev1.Container{Name: "app", LivenessProbe: probe(30, 3, 20)}),
+			},
+			containers: map[string][]podman.ContainerInfo{
+				"default/app": recheckTestInfo("default", "app", "app", start),
+			},
+			want:   30 * time.Second,
+			wantOK: true,
+		},
+		{
+			name: "liveness period wins over readiness period",
+			pods: []*corev1.Pod{
+				recheckTestPod("default", "app", running, map[string]bool{"app": false},
+					corev1.Container{Name: "app", LivenessProbe: probe(20, 3, 0), ReadinessProbe: probe(5, 3, 0)}),
+			},
+			containers: map[string][]podman.ContainerInfo{
+				"default/app": recheckTestInfo("default", "app", "app", start),
+			},
+			want:   20 * time.Second,
+			wantOK: true,
+		},
+		{
 			name: "no podman start time gets no recheck",
 			pods: []*corev1.Pod{
 				recheckTestPod("default", "app", running, map[string]bool{"app": false},
