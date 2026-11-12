@@ -24,8 +24,8 @@ const (
 )
 
 // Exported probe defaults for callers outside this package, such as the
-// reconcile loop's readiness recheck. They stay aliases of the values above so
-// the generated health check and the recheck cadence cannot drift apart.
+// reconcile loop's health check watch window. They stay aliases of the values
+// above so the generated health check and the watch window cannot drift apart.
 const (
 	DefaultProbePeriodSeconds    = defaultProbePeriodSeconds
 	DefaultProbeFailureThreshold = defaultProbeFailureThreshold

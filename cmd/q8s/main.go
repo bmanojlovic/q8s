@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -1025,7 +1026,8 @@ func boolPtr(b bool) *bool { return &b }
 // k8s controllers use around their informers).
 //
 // It returns the live Podman containers it found, keyed by namespace/name, so
-// the sync loop can schedule a readiness recheck without another podman call.
+// the sync loop can update its health check watch set without another podman
+// call.
 func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.ContainerInfo {
 	live := reconcilePodmanPods(st, mgr)
 	for _, pod := range st.AllPods() {
@@ -1129,6 +1131,30 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+// syncUnitMatcher builds the WatchUnits match func: q8s's own quadlet units
+// always match, and a podman health check unit matches while its container is
+// in the watched set. The set is read atomically because WatchUnits calls the
+// matcher from its D-Bus goroutine while the sync loop replaces the set after
+// every reconcile. When no container is still inside its probe window the set
+// is empty, so ready pods add no traffic at all.
+func syncUnitMatcher(quadletDir string, ids *atomic.Pointer[map[string]struct{}]) func(string) bool {
+	return func(unit string) bool {
+		if isQ8sUnit(quadletDir, unit) {
+			return true
+		}
+		id, ok := healthCheckContainerID(unit)
+		if !ok {
+			return false
+		}
+		current := ids.Load()
+		if current == nil {
+			return false
+		}
+		_, watched := (*current)[id]
+		return watched
+	}
+}
+
 // syncLoop reacts to systemd unit property changes instead of polling on a
 // fixed interval, so pod status/restart-info/orphan-detection update
 // immediately instead of up to 30s late. The trigger says only that a unit
@@ -1143,25 +1169,12 @@ func fileExists(path string) bool {
 // process is started and the journal is never read, so a host with a large
 // journal costs q8s nothing extra.
 func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string, backendsChanged func(ns string)) {
-	// A pod whose probe is still starting is rechecked on the probe's own
-	// period. The timer is stopped and re-armed after every pass, and stays
-	// idle (nil channel) when no pod is in that window. No goroutine and no
-	// cached state are involved.
-	var recheckTimer *time.Timer
-	var recheckC <-chan time.Time
-	stopRecheck := func() {
-		if recheckTimer == nil {
-			return
-		}
-		if !recheckTimer.Stop() {
-			select {
-			case <-recheckTimer.C:
-			default:
-			}
-		}
-		recheckC = nil
-	}
-	defer stopRecheck()
+	// Podman runs each health check as a transient systemd unit whose name
+	// carries the container ID (see healthCheckContainerID). Which containers
+	// are worth watching is recomputed after every reconcile pass, because it
+	// changes as pods become ready or their probe window closes. The callback
+	// runs on the D-Bus goroutine, so the set is swapped atomically.
+	var watchedHealth atomic.Pointer[map[string]struct{}]
 
 	// reconcile updates pod status and then refreshes the Traefik backends of
 	// every namespace whose set of servable pods changed. Backends are read
@@ -1169,20 +1182,13 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 	// (e.g. at boot, from the phases stored at shutdown) stays empty until
 	// some API object changes.
 	reconcile := func() {
-		stopRecheck()
 		before := servablePods(st.AllPods())
 		live := reconcileOnce(st, mgr)
 		after := st.AllPods()
+		ids := watchedHealthIDs(after, live, time.Now())
+		watchedHealth.Store(&ids)
 		for _, ns := range changedNamespaces(before, servablePods(after)) {
 			backendsChanged(ns)
-		}
-		if d, ok := nextRecheck(after, live, time.Now()); ok {
-			if recheckTimer == nil {
-				recheckTimer = time.NewTimer(d)
-			} else {
-				recheckTimer.Reset(d)
-			}
-			recheckC = recheckTimer.C
 		}
 	}
 
@@ -1194,9 +1200,7 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 		}
 	}
 
-	go systemd.WatchUnits(ctx, mode, func(unit string) bool {
-		return isQ8sUnit(quadletDir, unit)
-	}, func(string) {
+	go systemd.WatchUnits(ctx, mode, syncUnitMatcher(quadletDir, &watchedHealth), func(string) {
 		notify()
 	})
 
@@ -1221,8 +1225,6 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 			}
 			reconcile()
 		case <-ticker.C:
-			reconcile()
-		case <-recheckC:
 			reconcile()
 		}
 	}

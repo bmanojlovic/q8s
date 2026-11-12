@@ -17,6 +17,7 @@ const cmdTimeout = 10 * time.Second
 
 // ContainerInfo holds the fields we care about from `podman ps --format json`.
 type ContainerInfo struct {
+	ID        string            `json:"Id"`
 	Names     []string          `json:"Names"`
 	State     string            `json:"State"`
 	Status    string            `json:"Status"`

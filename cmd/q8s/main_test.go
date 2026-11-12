@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -287,6 +289,47 @@ func TestIsQ8sUnit(t *testing.T) {
 func TestIsQ8sUnitMissingQuadletDir(t *testing.T) {
 	if isQ8sUnit(filepath.Join(t.TempDir(), "does-not-exist"), "demo-app.service") {
 		t.Error("isQ8sUnit() = true for a unit with no quadlet source")
+	}
+}
+
+func TestSyncUnitMatcher(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "demo-app.container"), []byte("[Container]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	watched := strings.Repeat("a", 64)
+	unwatched := strings.Repeat("b", 64)
+	ids := map[string]struct{}{watched: {}}
+	var current atomic.Pointer[map[string]struct{}]
+	current.Store(&ids)
+	match := syncUnitMatcher(dir, &current)
+
+	tests := []struct {
+		unit string
+		want bool
+	}{
+		{"demo-app.service", true},
+		{watched + "-2bc0f6a9870abb7b.service", true},
+		{unwatched + "-2bc0f6a9870abb7b.service", false},
+		{unwatched + "-2bc0f6a9870abb7b.timer", false},
+		{"demo-app.container", false},
+	}
+	for _, tc := range tests {
+		if got := match(tc.unit); got != tc.want {
+			t.Errorf("syncUnitMatcher(%q) = %v, want %v", tc.unit, got, tc.want)
+		}
+	}
+
+	// An empty set means no container is inside its probe window. Health
+	// check units then cost nothing, while q8s units keep matching.
+	empty := map[string]struct{}{}
+	current.Store(&empty)
+	if match(watched + "-2bc0f6a9870abb7b.service") {
+		t.Error("health check unit matched after the watch set was emptied")
+	}
+	if !match("demo-app.service") {
+		t.Error("q8s unit stopped matching after the watch set was emptied")
 	}
 }
 
