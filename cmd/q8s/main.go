@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -770,7 +771,7 @@ func cmdServe() {
 	if mgr != nil {
 		syncCtx, stopSync := context.WithCancel(context.Background())
 		defer stopSync()
-		go syncLoop(syncCtx, st, mgr, mode, d.quadletDir)
+		go syncLoop(syncCtx, st, mgr, mode, d.quadletDir, srv.RegenerateIngressConfigs)
 	}
 
 	daemon.SdNotify(false, daemon.SdNotifyReady)
@@ -1137,7 +1138,20 @@ func fileExists(path string) bool {
 // Unit changes arrive over a dedicated D-Bus connection to systemd: no child
 // process is started and the journal is never read, so a host with a large
 // journal costs q8s nothing extra.
-func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string) {
+func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string, backendsChanged func(ns string)) {
+	// reconcile updates pod status and then refreshes the Traefik backends of
+	// every namespace whose set of servable pods changed. Backends are read
+	// from pod status, so without this a file rendered while pods were down
+	// (e.g. at boot, from the phases stored at shutdown) stays empty until
+	// some API object changes.
+	reconcile := func() {
+		before := servablePods(st.AllPods())
+		reconcileOnce(st, mgr)
+		for _, ns := range changedNamespaces(before, servablePods(st.AllPods())) {
+			backendsChanged(ns)
+		}
+	}
+
 	trigger := make(chan struct{}, 1)
 	notify := func() {
 		select {
@@ -1171,9 +1185,9 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 					break drain
 				}
 			}
-			reconcileOnce(st, mgr)
+			reconcile()
 		case <-ticker.C:
-			reconcileOnce(st, mgr)
+			reconcile()
 		}
 	}
 }
@@ -1268,4 +1282,53 @@ func podmanStateToPhase(state string, exitCode int) corev1.PodPhase {
 	default:
 		return corev1.PodPending
 	}
+}
+
+// servablePods maps namespace -> names of pods that can be a backend: the
+// same rule serviceBackendTargets applies (a terminal pod is out of rotation).
+func servablePods(pods []*corev1.Pod) map[string]map[string]bool {
+	out := make(map[string]map[string]bool)
+	for _, p := range pods {
+		if p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded {
+			continue
+		}
+		if out[p.Namespace] == nil {
+			out[p.Namespace] = make(map[string]bool)
+		}
+		out[p.Namespace][p.Name] = true
+	}
+	return out
+}
+
+// changedNamespaces lists, sorted, the namespaces whose servable pod set
+// differs between before and after.
+func changedNamespaces(before, after map[string]map[string]bool) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(ns string) {
+		if !seen[ns] {
+			seen[ns] = true
+			out = append(out, ns)
+		}
+	}
+	for ns, b := range before {
+		a := after[ns]
+		if len(a) != len(b) {
+			add(ns)
+			continue
+		}
+		for name := range b {
+			if !a[name] {
+				add(ns)
+				break
+			}
+		}
+	}
+	for ns := range after {
+		if _, ok := before[ns]; !ok {
+			add(ns)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

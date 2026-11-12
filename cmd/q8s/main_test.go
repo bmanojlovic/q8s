@@ -289,3 +289,27 @@ func TestIsQ8sUnitMissingQuadletDir(t *testing.T) {
 		t.Error("isQ8sUnit() = true for a unit with no quadlet source")
 	}
 }
+
+func TestChangedNamespacesForBackends(t *testing.T) {
+	pod := func(ns, name string, phase corev1.PodPhase) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}, Status: corev1.PodStatus{Phase: phase}}
+	}
+	// At boot the store still has the phases written at shutdown.
+	before := servablePods([]*corev1.Pod{
+		pod("mail", "stalwart-0", corev1.PodFailed),
+		pod("default", "traefik-0", corev1.PodRunning),
+		pod("web", "app-0", corev1.PodRunning),
+	})
+	after := servablePods([]*corev1.Pod{
+		pod("mail", "stalwart-0", corev1.PodRunning),
+		pod("default", "traefik-0", corev1.PodRunning),
+		pod("web", "app-0", corev1.PodSucceeded),
+	})
+	got := changedNamespaces(before, after)
+	if len(got) != 2 || got[0] != "mail" || got[1] != "web" {
+		t.Fatalf("changedNamespaces = %v, want [mail web]", got)
+	}
+	if got := changedNamespaces(after, after); len(got) != 0 {
+		t.Fatalf("unchanged state reported %v", got)
+	}
+}

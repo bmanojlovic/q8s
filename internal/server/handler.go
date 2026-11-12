@@ -2943,6 +2943,13 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 	fmt.Printf("traefik config: wrote %s\n", filename)
 }
 
+// RegenerateIngressConfigs rewrites the Traefik files of one namespace (only
+// files whose content changed are written). The sync loop calls it when the
+// set of pods that can serve a namespace's Services changes.
+func (s *Server) RegenerateIngressConfigs(ns string) {
+	s.regenerateIngressConfigs(ns)
+}
+
 // ReconcileIngressConfigs regenerates the Traefik file of every Ingress at
 // startup, so files rendered by an older q8s pick up the current backend
 // rules. It used to run at the end of ReconcileQuadlets, which skips its tail
