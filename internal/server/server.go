@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -38,9 +40,13 @@ type Config struct {
 // Server is the k8s-compatible API server.
 type Server struct {
 	httpServer *http.Server
-	config     Config
-	mux        *http.ServeMux
-	auth       *AuthMiddleware
+	// errorLog is shared by every TLS-terminating http.Server so handshake
+	// noise from scanners is counted and summarized in one place instead of
+	// filling the journal.
+	errorLog *log.Logger
+	config   Config
+	mux      *http.ServeMux
+	auth     *AuthMiddleware
 	// handler is mux wrapped in the auth middleware, built once. Wrapping
 	// per request allocated a new middleware closure on every call.
 	handler http.Handler
@@ -69,10 +75,11 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to set up client-cert auth: %w", err)
 	}
 	s := &Server{
-		config:  cfg,
-		mux:     http.NewServeMux(),
-		auth:    auth,
-		network: &networkState{subnets: make(map[string]string)},
+		config:   cfg,
+		mux:      http.NewServeMux(),
+		auth:     auth,
+		errorLog: newErrorLogger(os.Stderr, time.Now),
+		network:  &networkState{subnets: make(map[string]string)},
 	}
 	if cfg.Manager != nil {
 		s.network.ops = podmanNetworkOps{manager: cfg.Manager}
@@ -95,6 +102,7 @@ func New(cfg Config) (*Server, error) {
 			MinVersion:   tls.VersionTLS12,
 		},
 		ReadHeaderTimeout: 10 * time.Second,
+		ErrorLog:          s.errorLog,
 	}
 
 	return s, nil
@@ -117,6 +125,7 @@ func (s *Server) StartTLS(listeners []net.Listener) error {
 		unixSrv := &http.Server{
 			Handler:   s,
 			TLSConfig: s.httpServer.TLSConfig,
+			ErrorLog:  s.errorLog,
 		}
 		tlsListener2 := tls.NewListener(listeners[1], s.httpServer.TLSConfig)
 		go func() {

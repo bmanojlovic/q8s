@@ -176,7 +176,7 @@ func respondList[Item any, PI watchItem[Item], List runtime.Object](
 		}
 	}
 	if r.URL.Query().Get("watch") == "true" {
-		serveWatch(w, r, s, listFn)
+		serveWatch(w, r, s, listFn, toTable)
 		return
 	}
 	items := listFn()
@@ -241,7 +241,12 @@ func respondListMerged[Item any, PI watchItem[Item], List runtime.Object](
 // would race with concurrent requests touching the same stored object. Every
 // create handler already sets APIVersion/Kind before storing, so encoding o
 // as-is is enough.
-func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Request, s *Server, listFn func() []PI) {
+//
+// When the client asked for a Table (isTableRequest), each event's object is
+// a meta.k8s.io/v1 Table built from toTable, matching kube-apiserver: the
+// first event carries columnDefinitions and later events only rows, so
+// kubectl keeps the header it learned from the first one.
+func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Request, s *Server, listFn func() []PI, toTable func([]PI, string) *table) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "streaming not supported")
@@ -263,13 +268,28 @@ func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Req
 	}
 
 	enc := json.NewEncoder(w)
+	tableWatch := isTableRequest(r) && toTable != nil
+	wroteColumns := false
 	write := func(evType string, o PI) bool {
-		raw, err := json.Marshal(o)
+		var raw []byte
+		var err error
+		if tableWatch {
+			t := toTable([]PI{o}, o.GetResourceVersion())
+			if wroteColumns {
+				t.ColumnDefinitions = nil
+			}
+			raw, err = json.Marshal(t)
+		} else {
+			raw, err = json.Marshal(o)
+		}
 		if err != nil {
 			return true
 		}
 		if err := enc.Encode(metav1.WatchEvent{Type: evType, Object: runtime.RawExtension{Raw: raw}}); err != nil {
 			return false
+		}
+		if tableWatch {
+			wroteColumns = true
 		}
 		flusher.Flush()
 		return true

@@ -24,7 +24,7 @@ type table struct {
 	Kind              string            `json:"kind"`
 	APIVersion        string            `json:"apiVersion"`
 	Metadata          map[string]string `json:"metadata"`
-	ColumnDefinitions []columnDef       `json:"columnDefinitions"`
+	ColumnDefinitions []columnDef       `json:"columnDefinitions,omitempty"`
 	Rows              []tableRow        `json:"rows"`
 }
 

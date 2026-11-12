@@ -493,6 +493,202 @@ func TestPodWatch(t *testing.T) {
 	}
 }
 
+// watchTestEvent is one decoded event from a watch stream.
+type watchTestEvent struct {
+	Type   string
+	Object map[string]interface{}
+}
+
+// startWatch opens a watch request and returns a channel of its events. The
+// stream is closed and the request cancelled when the test finishes.
+func startWatch(t *testing.T, url, accept string) <-chan watchTestEvent {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("watch %s: %v", url, err)
+	}
+	assertStatus(t, resp, http.StatusOK)
+	t.Cleanup(func() { resp.Body.Close() })
+
+	events := make(chan watchTestEvent, 16)
+	go func() {
+		defer close(events)
+		dec := json.NewDecoder(resp.Body)
+		for {
+			var raw struct {
+				Type   string                 `json:"type"`
+				Object map[string]interface{} `json:"object"`
+			}
+			if err := dec.Decode(&raw); err != nil {
+				return
+			}
+			events <- watchTestEvent{Type: raw.Type, Object: raw.Object}
+		}
+	}()
+	return events
+}
+
+func nextWatchEvent(t *testing.T, events <-chan watchTestEvent) watchTestEvent {
+	t.Helper()
+	select {
+	case ev, ok := <-events:
+		if !ok {
+			t.Fatal("watch stream closed early")
+		}
+		return ev
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for a watch event")
+	}
+	return watchTestEvent{}
+}
+
+func tableColumnNames(t *testing.T, object map[string]interface{}) []string {
+	t.Helper()
+	defs, _ := object["columnDefinitions"].([]interface{})
+	names := make([]string, 0, len(defs))
+	for _, def := range defs {
+		m, _ := def.(map[string]interface{})
+		name, _ := m["name"].(string)
+		names = append(names, name)
+	}
+	return names
+}
+
+func TestPodWatchTable(t *testing.T) {
+	ts, st := newTestServer(t)
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", podBody("default", "watched", "nginx:latest"))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	events := startWatch(t, ts.URL+"/api/v1/pods?watch=true", "application/json;as=Table;g=meta.k8s.io;v=v1")
+	// Let serveWatch take its initial snapshot so the pod is pre-existing and
+	// the first event is the phase change, not an ADDED from creation.
+	time.Sleep(150 * time.Millisecond)
+
+	st.UpdatePodPhase("default", "watched", corev1.PodRunning, "")
+	time.Sleep(100 * time.Millisecond)
+	st.UpdatePodPhase("default", "watched", corev1.PodSucceeded, "")
+
+	first := nextWatchEvent(t, events)
+	if first.Type != "MODIFIED" {
+		t.Fatalf("first event type = %q, want MODIFIED", first.Type)
+	}
+	if got := first.Object["kind"]; got != "Table" {
+		t.Fatalf("first event kind = %v, want Table", got)
+	}
+	cols := tableColumnNames(t, first.Object)
+	if len(cols) == 0 {
+		t.Fatalf("first event has no columnDefinitions: %v", first.Object)
+	}
+
+	second := nextWatchEvent(t, events)
+	if second.Type != "MODIFIED" {
+		t.Fatalf("second event type = %q, want MODIFIED", second.Type)
+	}
+	if got := second.Object["kind"]; got != "Table" {
+		t.Fatalf("second event kind = %v, want Table", got)
+	}
+	if defs, ok := second.Object["columnDefinitions"]; ok {
+		t.Fatalf("second event must omit columnDefinitions, got %v", defs)
+	}
+	rows, _ := second.Object["rows"].([]interface{})
+	if len(rows) != 1 {
+		t.Fatalf("second event rows = %d, want 1", len(rows))
+	}
+	row, _ := rows[0].(map[string]interface{})
+	cells, _ := row["cells"].([]interface{})
+	if len(cells) != len(cols) {
+		t.Fatalf("second event cells = %d, want %d (columns %v)", len(cells), len(cols), cols)
+	}
+	wantCols := map[string]bool{"Ready": false, "Status": false, "Restarts": false}
+	for _, name := range cols {
+		if _, ok := wantCols[name]; ok {
+			wantCols[name] = true
+		}
+	}
+	for name, found := range wantCols {
+		if !found {
+			t.Fatalf("table columns %v missing %q", cols, name)
+		}
+	}
+	if got, _ := cells[1].(string); got == "" {
+		t.Fatalf("Ready cell is empty: %v", cells)
+	}
+	if got, _ := cells[2].(string); got == "" {
+		t.Fatalf("Status cell is empty: %v", cells)
+	}
+	if _, ok := cells[3].(float64); !ok {
+		t.Fatalf("Restarts cell is not a number: %v", cells[3])
+	}
+	if got := nested(nested(row, "object"), "metadata")["name"]; got != "watched" {
+		t.Fatalf("row object name = %v, want watched", got)
+	}
+}
+
+func TestPodWatchWithoutTableStaysRaw(t *testing.T) {
+	ts, st := newTestServer(t)
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", podBody("default", "watched", "nginx:latest"))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	events := startWatch(t, ts.URL+"/api/v1/pods?watch=true", "")
+	time.Sleep(150 * time.Millisecond)
+	st.UpdatePodPhase("default", "watched", corev1.PodRunning, "")
+
+	ev := nextWatchEvent(t, events)
+	if ev.Type != "MODIFIED" {
+		t.Fatalf("event type = %q, want MODIFIED", ev.Type)
+	}
+	if got := ev.Object["kind"]; got != "Pod" {
+		t.Fatalf("event kind = %v, want Pod", got)
+	}
+	meta, _ := ev.Object["metadata"].(map[string]interface{})
+	if got := meta["name"]; got != "watched" {
+		t.Fatalf("event object name = %v, want watched", got)
+	}
+}
+
+func TestPodWatchTableDeleted(t *testing.T) {
+	ts, st := newTestServer(t)
+
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/pods", podBody("default", "gone", "nginx:latest"))
+	assertStatus(t, resp, 201)
+	resp.Body.Close()
+
+	events := startWatch(t, ts.URL+"/api/v1/pods?watch=true", "application/json;as=Table;g=meta.k8s.io;v=v1")
+	time.Sleep(150 * time.Millisecond)
+	if err := st.DeletePod("default", "gone"); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := nextWatchEvent(t, events)
+	if ev.Type != "DELETED" {
+		t.Fatalf("event type = %q, want DELETED", ev.Type)
+	}
+	if got := ev.Object["kind"]; got != "Table" {
+		t.Fatalf("event kind = %v, want Table", got)
+	}
+	rows, _ := ev.Object["rows"].([]interface{})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	row, _ := rows[0].(map[string]interface{})
+	if got := nested(nested(row, "object"), "metadata")["name"]; got != "gone" {
+		t.Fatalf("deleted row name = %v, want gone", got)
+	}
+}
+
 // --- Service ---
 
 func svcBody(ns, name string) map[string]interface{} {
