@@ -23,6 +23,14 @@ const (
 	defaultProbeSuccessThreshold = 1
 )
 
+// Exported probe defaults for callers outside this package, such as the
+// reconcile loop's readiness recheck. They stay aliases of the values above so
+// the generated health check and the recheck cadence cannot drift apart.
+const (
+	DefaultProbePeriodSeconds    = defaultProbePeriodSeconds
+	DefaultProbeFailureThreshold = defaultProbeFailureThreshold
+)
+
 // httpTokenRE is RFC 7230's token rule, the only shape an HTTP header name
 // may take. The name is passed to the in-container probe script as part of a
 // "Name: value" argument, so anything outside the token set (whitespace, ':',

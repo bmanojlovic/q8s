@@ -1023,7 +1023,10 @@ func boolPtr(b bool) *bool { return &b }
 // immediately by systemd unit property changes, with a slow ticker kept only
 // as a correctness backstop (same "push + periodic full resync" shape real
 // k8s controllers use around their informers).
-func reconcileOnce(st *store.Store, mgr *systemd.Manager) {
+//
+// It returns the live Podman containers it found, keyed by namespace/name, so
+// the sync loop can schedule a readiness recheck without another podman call.
+func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.ContainerInfo {
 	live := reconcilePodmanPods(st, mgr)
 	for _, pod := range st.AllPods() {
 		infos := live[pod.Namespace+"/"+pod.Name]
@@ -1096,6 +1099,7 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) {
 		}
 		st.UpdateJobStatus(job.Namespace, job.Name, active, succeeded, failed)
 	}
+	return live
 }
 
 // isQ8sUnit reports whether unit is a systemd service generated from a
@@ -1139,16 +1143,46 @@ func fileExists(path string) bool {
 // process is started and the journal is never read, so a host with a large
 // journal costs q8s nothing extra.
 func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string, backendsChanged func(ns string)) {
+	// A pod whose probe is still starting is rechecked on the probe's own
+	// period. The timer is stopped and re-armed after every pass, and stays
+	// idle (nil channel) when no pod is in that window. No goroutine and no
+	// cached state are involved.
+	var recheckTimer *time.Timer
+	var recheckC <-chan time.Time
+	stopRecheck := func() {
+		if recheckTimer == nil {
+			return
+		}
+		if !recheckTimer.Stop() {
+			select {
+			case <-recheckTimer.C:
+			default:
+			}
+		}
+		recheckC = nil
+	}
+	defer stopRecheck()
+
 	// reconcile updates pod status and then refreshes the Traefik backends of
 	// every namespace whose set of servable pods changed. Backends are read
 	// from pod status, so without this a file rendered while pods were down
 	// (e.g. at boot, from the phases stored at shutdown) stays empty until
 	// some API object changes.
 	reconcile := func() {
+		stopRecheck()
 		before := servablePods(st.AllPods())
-		reconcileOnce(st, mgr)
-		for _, ns := range changedNamespaces(before, servablePods(st.AllPods())) {
+		live := reconcileOnce(st, mgr)
+		after := st.AllPods()
+		for _, ns := range changedNamespaces(before, servablePods(after)) {
 			backendsChanged(ns)
+		}
+		if d, ok := nextRecheck(after, live, time.Now()); ok {
+			if recheckTimer == nil {
+				recheckTimer = time.NewTimer(d)
+			} else {
+				recheckTimer.Reset(d)
+			}
+			recheckC = recheckTimer.C
 		}
 	}
 
@@ -1187,6 +1221,8 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 			}
 			reconcile()
 		case <-ticker.C:
+			reconcile()
+		case <-recheckC:
 			reconcile()
 		}
 	}
