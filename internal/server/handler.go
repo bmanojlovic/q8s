@@ -3010,6 +3010,7 @@ func (s *Server) ReconcileQuadlets() {
 
 	needReload := false
 	var startUnits []string
+	var cronJobsToEnsure []*batchv1.CronJob
 	var socketUnitsToStart []string
 
 	// Sweep stale legacy *.socket files left by old q8s versions before
@@ -3223,9 +3224,10 @@ func (s *Server) ReconcileQuadlets() {
 				regen = true
 			}
 		}
-		if regen {
+		if regen && !cronJobSuspended(cj) {
 			startUnits = append(startUnits, fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name))
 		}
+		cronJobsToEnsure = append(cronJobsToEnsure, cj)
 	}
 
 	mgr := s.config.Manager
@@ -3244,6 +3246,21 @@ func (s *Server) ReconcileQuadlets() {
 	for _, unit := range startUnits {
 		if err := mgr.StartUnit(unit); err != nil {
 			fmt.Printf("reconcile: start %s: %v\n", unit, err)
+		}
+	}
+	// Timers written by older q8s versions were started but never enabled,
+	// so they did not come back after a reboot. Enable every non-suspended
+	// CronJob's timer and start it (a no-op when already active; Persistent=
+	// catches up a run missed while it was down); stop and disable suspended
+	// ones.
+	for _, cj := range cronJobsToEnsure {
+		s.setCronTimerEnabled(cj)
+		if cronJobSuspended(cj) {
+			continue
+		}
+		timer := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
+		if err := mgr.StartUnit(timer); err != nil {
+			fmt.Printf("reconcile: start %s: %v\n", timer, err)
 		}
 	}
 	for _, unit := range restartIfActive {
@@ -3527,7 +3544,41 @@ func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
 		return
 	}
 	timerFile := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
-	s.deployUnit(timerDir, timerFile, timerContent, timerFile)
+	if cronJobSuspended(cj) {
+		s.deployUnit(timerDir, timerFile, timerContent, "")
+	} else {
+		s.deployUnit(timerDir, timerFile, timerContent, timerFile)
+	}
+	s.setCronTimerEnabled(cj)
+}
+
+// cronJobSuspended reports spec.suspend.
+func cronJobSuspended(cj *batchv1.CronJob) bool {
+	return cj.Spec.Suspend != nil && *cj.Spec.Suspend
+}
+
+// setCronTimerEnabled makes the CronJob's timer survive a reboot, or not:
+// a started timer only lasts for the current boot, so a non-suspended
+// CronJob's timer is enabled (timers.target wants it), and a suspended one
+// is stopped and disabled. Both calls are idempotent.
+func (s *Server) setCronTimerEnabled(cj *batchv1.CronJob) {
+	mgr := s.config.Manager
+	if mgr == nil {
+		return
+	}
+	timer := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
+	if cronJobSuspended(cj) {
+		if err := mgr.StopUnit(timer); err != nil {
+			fmt.Printf("cronjob %s/%s: stop %s: %v\n", cj.Namespace, cj.Name, timer, err)
+		}
+		if err := mgr.DisableUnit(timer); err != nil {
+			fmt.Printf("cronjob %s/%s: disable %s: %v\n", cj.Namespace, cj.Name, timer, err)
+		}
+		return
+	}
+	if err := mgr.EnableUnit(timer); err != nil {
+		fmt.Printf("cronjob %s/%s: enable %s: %v\n", cj.Namespace, cj.Name, timer, err)
+	}
 }
 
 func (s *Server) removeCronJobQuadlets(cj *batchv1.CronJob) {
@@ -3540,7 +3591,10 @@ func (s *Server) removeCronJobQuadlets(cj *batchv1.CronJob) {
 		timerDir = quadletDir
 	}
 	if mgr := s.config.Manager; mgr != nil {
-		mgr.StopUnit(fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name))
+		timer := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
+		mgr.StopUnit(timer)
+		// Remove the timers.target.wants link before the file goes away.
+		mgr.DisableUnit(timer)
 	}
 	s.reloadAfterRemove(
 		fmt.Sprintf("%s/%s-%s-cron.container", quadletDir, cj.Namespace, cj.Name),
