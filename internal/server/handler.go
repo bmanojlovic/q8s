@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -449,18 +450,20 @@ func templateHashFromContent(content []byte) string {
 	return ""
 }
 
-// sameTemplateHash reports whether path already holds content with the same
-// template hash. A missing or unhashed file never matches.
+// sameTemplateHash reports whether path already holds exactly this content.
+// The template-hash label alone is not enough: a file edited by hand keeps its
+// old label, and comparing only the label would leave the edit in place for
+// good. Comparing the bytes repairs it, and an unchanged file is still left
+// alone. A missing or unhashed file never matches.
 func sameTemplateHash(path string, content []byte) bool {
-	want := templateHashFromContent(content)
-	if want == "" {
+	if templateHashFromContent(content) == "" {
 		return false
 	}
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
-	return templateHashFromContent(existing) == want
+	return bytes.Equal(existing, content)
 }
 
 // filenameSet turns a rendered file map into the keep set for stale cleanup.

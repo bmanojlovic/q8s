@@ -5081,4 +5081,26 @@ func TestReconcileRerendersExistingCronJobAndJobUnits(t *testing.T) {
 			t.Fatalf("%s was not re-rendered:\n%s", filepath.Base(u), got)
 		}
 	}
+
+	// A hand edit keeps the old template-hash label; startup still restores
+	// the rendered content.
+	rendered, err := os.ReadFile(units[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := strings.Replace(string(rendered), "Image=alpine:3", "Image=alpine:3\nEnvironment=HAND=edit", 1)
+	if edited == string(rendered) {
+		t.Fatalf("test setup: no Image line to edit:\n%s", rendered)
+	}
+	if err := os.WriteFile(units[0], []byte(edited), 0644); err != nil {
+		t.Fatal(err)
+	}
+	srv.ReconcileQuadlets()
+	got, err := os.ReadFile(units[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(rendered) {
+		t.Fatalf("hand-edited unit was not restored:\n%s", got)
+	}
 }
