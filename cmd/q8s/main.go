@@ -1060,6 +1060,16 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 			}
 			continue
 		}
+		// live is nil when the podman listing failed: then an empty infos
+		// says nothing, and only the unit state counts.
+		if state.Active != "active" || (live != nil && len(infos) == 0) {
+			// Between a container's exit and systemd's restart (RestartSec)
+			// the unit is deactivating/activating and podman lists no
+			// container, yet the phase stays Running. Without a container
+			// the pod is not ready, health check or not, so report it as
+			// down instead of leaving ready=true until the restart.
+			health = containerDown
+		}
 		st.UpdatePodPhase(pod.Namespace, pod.Name, unitStateToPhase(state), health)
 		st.UpdatePodRestartInfo(pod.Namespace, pod.Name, int32(state.NRestarts), int32(state.ExitCode), state.Result != "")
 	}
@@ -1229,6 +1239,11 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 		}
 	}
 }
+
+// containerDown is passed as the health of a pod whose container is not
+// running right now; any health other than "" or "healthy" makes the store
+// report the container as not ready.
+const containerDown = "down"
 
 func unitStateToPhase(s *systemd.UnitState) corev1.PodPhase {
 	switch s.Active {
