@@ -129,17 +129,38 @@ All API traffic uses mutual TLS (mTLS). No certificate = 401. Certificates are E
 
 Rootful q8s runs every pod in its own user namespace, the podman equivalent of
 Kubernetes `pod.spec.hostUsers: false` (KEP-127). Standalone containers, Jobs
-and CronJobs get `UserNS=auto` in their `[Container]` section; a multi-container
-pod gets it once in its `[Pod]` section, because podman rejects a user namespace
-on a container that joins a pod and members inherit the pod's namespace.
+and CronJobs get `UserNS=auto:size=65536` in their `[Container]` section; a
+multi-container pod gets it once in its `[Pod]` section, because podman rejects
+a user namespace on a container that joins a pod and members inherit the pod's
+namespace.
 
 `UserNS=auto` makes podman allocate a fresh, unprivileged host uid range for the
 pod from the `containers` entry in `/etc/subuid` and `/etc/subgid`. Root inside
 the container is therefore not host root, and two containers using the same uid
-no longer share a host identity. On startup rootful `q8s serve` ensures that
-range exists (`containers:2147483647:2147483648`) by appending it when missing.
-The choice is deliberately high so it cannot collide with ordinary login users,
-and existing lines are never rewritten.
+no longer share a host identity. `size=65536` asks for 65536 ids per pod. The
+size is explicit because podman's auto sizing otherwise takes the highest uid
+and gid in the image's `/etc/passwd` and `/etc/group` with a minimum of 1024, so
+a small image such as `python:alpine` gets only 1024 ids and a job that chowns a
+shared volume file to uid 2000 fails with `EINVAL`.
+
+On startup rootful `q8s serve` ensures the range exists
+(`containers:2147483647:2147483648`) by appending it when missing. The choice is
+deliberately high so it cannot collide with ordinary login users, and existing
+lines are never rewritten. The pool holds 2^31 ids, so 65536 per pod costs
+nothing in practice.
+
+Override the size with the `q8s.io/userns-size` annotation on the pod (for
+Deployments, Jobs and CronJobs, on the pod template metadata):
+
+```yaml
+metadata:
+  annotations:
+    q8s.io/userns-size: "200000"
+```
+
+The value must be a decimal integer between 1024 and 16777216. The default is
+65536, and the API rejects an invalid value instead of silently using the
+default.
 
 Every `Volume=` line of a unit in a user namespace gets the `idmap` mount option
 (named volumes, hostpath binds, ConfigMap and Secret binds, with or without
@@ -155,7 +176,9 @@ Two exceptions stay in the host user namespace:
 - `hostNetwork: true` pods. A user namespace with the host network namespace
   gains no isolation and cannot bind host ports below 1024.
 - `hostUsers: true` pods, the Kubernetes opt-out. `hostUsers: false` is the
-  same as leaving it unset: the pod gets a user namespace.
+  same as leaving it unset: the pod gets a user namespace. This is the way to
+  opt out completely; the `q8s.io/userns-size` annotation only changes the
+  size.
 
 Rootless mode is unchanged: rootless podman containers already run inside the
 user's subordinate uid range.

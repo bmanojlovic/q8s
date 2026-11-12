@@ -657,7 +657,7 @@ func cmdServe() {
 		}
 		if hostcheck.UserNSAvailable(hostcheck.Env{Rootful: true, ReadFile: os.ReadFile}) {
 			quadlet.SetUserNS(true)
-			fmt.Println("user namespaces: on (UserNS=auto, idmap volumes)")
+			fmt.Println("user namespaces: on (UserNS=auto:size=65536, idmap volumes)")
 		} else {
 			reason := "no usable 'containers' range in /etc/subuid and /etc/subgid"
 			if ensureErr != nil {

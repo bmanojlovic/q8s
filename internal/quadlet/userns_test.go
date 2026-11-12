@@ -87,7 +87,7 @@ func TestUserNSStandaloneContainerAndVolumes(t *testing.T) {
 	}
 	out := string(b)
 
-	assertContains(t, out, "UserNS=auto")
+	assertContains(t, out, "UserNS=auto:size=65536\n")
 	for _, want := range []string{
 		"Volume=default-data.volume:/data:Z,idmap",
 		"Volume=default-data-ro.volume:/data-ro:ro,Z,idmap",
@@ -159,7 +159,7 @@ func TestUserNSMultiContainerPod(t *testing.T) {
 	}
 
 	podOut := string(files["default-multi.pod"])
-	assertContains(t, podOut, "UserNS=auto")
+	assertContains(t, podOut, "UserNS=auto:size=65536\n")
 
 	webOut := string(files["default-multi-web.container"])
 	assertNotContains(t, webOut, "UserNS")
@@ -215,7 +215,7 @@ func TestUserNSHostUsersOptOut(t *testing.T) {
 			pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch"}}
 			out := mustContainer(t, pod, "")
 			if tc.wantNS {
-				assertContains(t, out, "UserNS=auto")
+				assertContains(t, out, "UserNS=auto:size=65536\n")
 				assertContains(t, out, "Volume=scratch:/scratch:idmap")
 			} else {
 				assertNotContains(t, out, "UserNS")
@@ -257,7 +257,7 @@ func TestUserNSJobContainer(t *testing.T) {
 		t.Fatalf("JobContainer: %v", err)
 	}
 	out := string(b)
-	assertContains(t, out, "UserNS=auto")
+	assertContains(t, out, "UserNS=auto:size=65536\n")
 	assertContains(t, out, "Volume=ns-data.volume:/data:Z,idmap")
 }
 
@@ -289,7 +289,7 @@ func TestUserNSCronContainer(t *testing.T) {
 		t.Fatalf("CronContainer: %v", err)
 	}
 	out := string(b)
-	assertContains(t, out, "UserNS=auto")
+	assertContains(t, out, "UserNS=auto:size=65536\n")
 	assertContains(t, out, "Volume=scratch:/scratch:idmap")
 }
 
@@ -312,4 +312,99 @@ func TestUserNSJobHostNetworkOptOut(t *testing.T) {
 	}
 	assertNotContains(t, string(b), "UserNS")
 	assertNotContains(t, string(b), "idmap")
+}
+
+func TestUserNSSizeAnnotationOverride(t *testing.T) {
+	restore := quadlet.SetUserNS(true)
+	defer restore()
+
+	annotations := map[string]string{quadlet.AnnotationUserNSSize: "200000"}
+
+	pod := simplePod("default", "app", "myimage")
+	pod.Annotations = annotations
+	assertContains(t, mustContainer(t, pod, ""), "UserNS=auto:size=200000\n")
+
+	multi := multiPod()
+	multi.Annotations = annotations
+	files, err := quadlet.PodUnits(multi.Name, multi, "/run/q8s/configmaps", nil, nil, "", nil)
+	if err != nil {
+		t.Fatalf("PodUnits: %v", err)
+	}
+	assertContains(t, string(files["default-multi.pod"]), "UserNS=auto:size=200000\n")
+	for name, content := range files {
+		if strings.Contains(name, ".container") {
+			assertNotContains(t, string(content), "UserNS")
+		}
+	}
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "j", Namespace: "ns"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Annotations: annotations},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+		}},
+	}
+	b, err := quadlet.JobContainer(job.Name, job, "", nil, "")
+	if err != nil {
+		t.Fatalf("JobContainer: %v", err)
+	}
+	assertContains(t, string(b), "UserNS=auto:size=200000\n")
+
+	cj := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "* * * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Annotations: annotations},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+				},
+			}},
+		},
+	}
+	b, err = quadlet.CronContainer(cj.Name, cj, "", nil, "")
+	if err != nil {
+		t.Fatalf("CronContainer: %v", err)
+	}
+	assertContains(t, string(b), "UserNS=auto:size=200000\n")
+}
+
+// An annotation value that bypassed API validation must never reach the unit
+// file: the generator falls back to the default size.
+func TestUserNSSizeInvalidAnnotationFallsBack(t *testing.T) {
+	restore := quadlet.SetUserNS(true)
+	defer restore()
+
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "not a number", value: "abc"},
+		{name: "zero", value: "0"},
+		{name: "below minimum", value: "1023"},
+		{name: "above maximum", value: "16777217"},
+		{name: "newline", value: "1024\n"},
+		{name: "empty", value: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := simplePod("default", "app", "myimage")
+			pod.Annotations = map[string]string{quadlet.AnnotationUserNSSize: tt.value}
+			out := mustContainer(t, pod, "")
+			assertContains(t, out, "UserNS=auto:size=65536\n")
+		})
+	}
+}
+
+func TestValidateUserNSSize(t *testing.T) {
+	for _, value := range []string{"1024", "65536", "16777216"} {
+		if err := quadlet.ValidateUserNSSize(value); err != nil {
+			t.Errorf("ValidateUserNSSize(%q) = %v, want nil", value, err)
+		}
+	}
+	for _, value := range []string{"", "abc", "0", "1023", "16777217", "-1024", "+1024", " 1024", "1024 "} {
+		if err := quadlet.ValidateUserNSSize(value); err == nil {
+			t.Errorf("ValidateUserNSSize(%q) = nil, want an error", value)
+		}
+	}
 }

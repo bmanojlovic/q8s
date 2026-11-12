@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"q8s/internal/quadlet"
 )
 
 func TestValidateSingleContainer(t *testing.T) {
@@ -73,5 +74,21 @@ func TestValidateSingleContainer(t *testing.T) {
 				t.Fatalf("expected error %q, got %q", tt.wantErr, err.Error())
 			}
 		})
+	}
+}
+
+func TestValidateUserNSSizeAnnotation(t *testing.T) {
+	for _, value := range []string{"1024", "65536", "16777216"} {
+		if err := validateUserNSSizeAnnotation("pod", map[string]string{quadlet.AnnotationUserNSSize: value}); err != nil {
+			t.Errorf("valid value %q was rejected: %v", value, err)
+		}
+	}
+	for _, value := range []string{"", "abc", "0", "1023", "16777217", "1024\n"} {
+		if err := validateUserNSSizeAnnotation("pod", map[string]string{quadlet.AnnotationUserNSSize: value}); err == nil {
+			t.Errorf("invalid value %q was accepted", value)
+		}
+	}
+	if err := validateUserNSSizeAnnotation("pod", nil); err != nil {
+		t.Errorf("missing annotation was rejected: %v", err)
 	}
 }

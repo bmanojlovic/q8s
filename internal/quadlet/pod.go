@@ -143,7 +143,7 @@ func renderPod(name string, pod *corev1.Pod, serviceAliases []string, networks [
 	// rejects UserNS= on a container that joins a pod, and members inherit
 	// the pod's namespace. Their Volume= lines still get idmap.
 	if podUsesUserNS(pod.Spec) {
-		b.WriteString("UserNS=auto\n")
+		writeUserNS(&b, pod.Annotations)
 	}
 
 	// Network: host networking when requested, otherwise the namespace
@@ -277,7 +277,7 @@ func renderContainer(r containerRender) ([]byte, error) {
 	if r.podUnit != "" {
 		b.WriteString(fmt.Sprintf("Pod=%s\n", r.podUnit))
 	} else if podUsesUserNS(pod.Spec) {
-		b.WriteString("UserNS=auto\n")
+		writeUserNS(&b, pod.Annotations)
 	}
 
 	// Exec: combine command (entrypoint override) and args

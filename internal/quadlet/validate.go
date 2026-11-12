@@ -19,6 +19,49 @@ import (
 // regardless of which handler (Pod, Job, CronJob, Deployment instance,
 // startup reconciliation) constructed the spec.
 
+// The ids podman allocates for a rootful pod's user namespace
+// (UserNS=auto:size=N). The default is large enough for any uid or gid an
+// image or workload is likely to use, and small compared to the 2^31 ids q8s
+// provides through the containers subordinate range. The bounds keep a
+// mistyped annotation from exhausting that range or asking podman for an
+// unusable namespace.
+const (
+	UserNSSizeDefault = 65536
+	UserNSSizeMin     = 1024
+	UserNSSizeMax     = 16777216
+)
+
+// userNSSizeRE matches a plain decimal integer. Anything else (sign,
+// whitespace, newline) is rejected before Atoi, so a value can never add a
+// line to the generated unit file.
+var userNSSizeRE = regexp.MustCompile(`^[0-9]+$`)
+
+// parseUserNSSize parses and bounds-checks a q8s.io/userns-size value.
+func parseUserNSSize(value string) (int, error) {
+	if len(value) == 0 || len(value) > 10 || !userNSSizeRE.MatchString(value) {
+		return 0, invalidUserNSSize(value)
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < UserNSSizeMin || n > UserNSSizeMax {
+		return 0, invalidUserNSSize(value)
+	}
+	return n, nil
+}
+
+func invalidUserNSSize(value string) error {
+	return fmt.Errorf("annotation %s: value %q is invalid: must be a decimal integer between %d and %d",
+		AnnotationUserNSSize, value, UserNSSizeMin, UserNSSizeMax)
+}
+
+// ValidateUserNSSize reports whether a q8s.io/userns-size annotation value is
+// a decimal integer in the range podman can size a user namespace from. The
+// API calls it so a bad value is rejected with 422 instead of being stored
+// and silently replaced by the default at render time.
+func ValidateUserNSSize(value string) error {
+	_, err := parseUserNSSize(value)
+	return err
+}
+
 // imageRE is a conservative superset of valid OCI/Docker image references
 // (registry/repo:tag@digest) — permissive enough for real image names,
 // strict enough to exclude whitespace, quotes, and control characters.

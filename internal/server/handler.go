@@ -2234,6 +2234,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateUserNSSizeAnnotation("job spec.template", job.Spec.Template.Annotations); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateJob(&job)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -2268,6 +2272,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		if err := validatePodProbes("job spec.template.spec", &job.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateUserNSSizeAnnotation("job spec.template", job.Spec.Template.Annotations); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2343,6 +2351,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		if err := validatePodProbes("job spec.template.spec", &patched.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateUserNSSizeAnnotation("job spec.template", patched.Spec.Template.Annotations); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2433,6 +2445,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateUserNSSizeAnnotation("cronjob spec.jobTemplate.spec.template", cj.Spec.JobTemplate.Spec.Template.Annotations); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateCronJob(&cj)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -2467,6 +2483,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			return
 		}
 		if err := validatePodProbes("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateUserNSSizeAnnotation("cronjob spec.jobTemplate.spec.template", cj.Spec.JobTemplate.Spec.Template.Annotations); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2537,6 +2557,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			return
 		}
 		if err := validatePodProbes("cronjob spec.jobTemplate.spec.template.spec", &patched.Spec.JobTemplate.Spec.Template.Spec); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateUserNSSizeAnnotation("cronjob spec.jobTemplate.spec.template", patched.Spec.JobTemplate.Spec.Template.Annotations); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}

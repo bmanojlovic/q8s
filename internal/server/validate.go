@@ -328,11 +328,30 @@ func validatePodProbes(kind string, spec *corev1.PodSpec) error {
 	return nil
 }
 
+// validateUserNSSizeAnnotation rejects a malformed q8s.io/userns-size value.
+// Pods, Deployments, Jobs and CronJobs all read it from their pod (template)
+// metadata, so every create, update and patch path calls this before storing
+// the object. The generator has its own fallback for objects that bypass the
+// API (reconciliation, label imports).
+func validateUserNSSizeAnnotation(kind string, annotations map[string]string) error {
+	v, ok := annotations[quadlet.AnnotationUserNSSize]
+	if !ok {
+		return nil
+	}
+	if err := quadlet.ValidateUserNSSize(v); err != nil {
+		return fmt.Errorf("%s: %w", kind, err)
+	}
+	return nil
+}
+
 // validatePodAnnotations rejects q8s pod annotations that cannot be honored
 // by the requested shape. replicas is 0 for a bare Pod. Probe handlers are
 // checked here too, because Pods and Deployments share this choke point and
 // an unsupported probe is the same kind of unrepresentable spec.
 func validatePodAnnotations(kind string, spec *corev1.PodSpec, annotations map[string]string, replicas int32) error {
+	if err := validateUserNSSizeAnnotation(kind, annotations); err != nil {
+		return err
+	}
 	if err := validatePodProbes(kind, spec); err != nil {
 		return err
 	}

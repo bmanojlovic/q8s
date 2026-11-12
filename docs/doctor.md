@@ -78,8 +78,9 @@ tolerated. This check is always informational.
 
 ### `userns`
 
-Decides whether pods can get their own user namespace (`UserNS=auto`), which
-needs a subordinate uid and gid range.
+Decides whether pods can get their own user namespace
+(`UserNS=auto:size=65536`, or the size from the `q8s.io/userns-size`
+annotation), which needs a subordinate uid and gid range.
 
 Rootful: looks for a `containers` entry in both `/etc/subuid` and
 `/etc/subgid` with at least 65536 ids. With it, root inside a container is an

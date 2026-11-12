@@ -217,6 +217,32 @@ func podUsesUserNS(spec corev1.PodSpec) bool {
 	return spec.HostUsers == nil || !*spec.HostUsers
 }
 
+// writeUserNS emits the UserNS= line for a pod that owns its user namespace.
+// The size is part of the line because podman's auto sizing reads the image's
+// /etc/passwd and /etc/group, so a small image (for example python:alpine)
+// would otherwise get only 1024 ids and a chown to a higher uid would fail.
+// The annotation override is re-validated here: the generator also runs on
+// pods imported from container labels and startup reconciliation, which never
+// pass through the API validation. An invalid value falls back to the default
+// rather than reaching the unit file.
+func writeUserNS(b *strings.Builder, annotations map[string]string) {
+	b.WriteString(fmt.Sprintf("UserNS=auto:size=%d\n", userNSSize(annotations)))
+}
+
+// userNSSize returns the validated size override, or the default when the
+// annotation is absent or invalid.
+func userNSSize(annotations map[string]string) int {
+	raw, ok := annotations[AnnotationUserNSSize]
+	if !ok || raw == "" {
+		return UserNSSizeDefault
+	}
+	n, err := parseUserNSSize(raw)
+	if err != nil {
+		return UserNSSizeDefault
+	}
+	return n
+}
+
 // SetCgroupOverride forces the memory/cpu controller flags for testing.
 // It returns a function that restores the original values.
 func SetCgroupOverride(memory, cpu bool) func() {
@@ -348,7 +374,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 	writeImageAndPull(&b, spec.Containers[0])
 	b.WriteString(fmt.Sprintf("ContainerName=%s-%s-job\n", ns, name))
 	if userNS {
-		b.WriteString("UserNS=auto\n")
+		writeUserNS(&b, job.Spec.Template.Annotations)
 	}
 
 	if cmd := append(spec.Containers[0].Command, spec.Containers[0].Args...); len(cmd) > 0 {
@@ -501,7 +527,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 	writeImageAndPull(&b, spec.Containers[0])
 	b.WriteString(fmt.Sprintf("ContainerName=%s\n", cronruns.ContainerName(ns, name)))
 	if userNS {
-		b.WriteString("UserNS=auto\n")
+		writeUserNS(&b, cj.Spec.JobTemplate.Spec.Template.Annotations)
 	}
 
 	if cmd := append(spec.Containers[0].Command, spec.Containers[0].Args...); len(cmd) > 0 {
@@ -777,6 +803,12 @@ const (
 	// items on a pod or pod template, for example
 	// "memlock=-1:-1,nofile=65536".
 	AnnotationUlimits = "q8s.io/ulimits"
+
+	// AnnotationUserNSSize overrides the number of ids podman allocates for
+	// the pod's user namespace (UserNS=auto:size=N). A pod or pod template
+	// carries it; the value must be a decimal integer between UserNSSizeMin
+	// and UserNSSizeMax.
+	AnnotationUserNSSize = "q8s.io/userns-size"
 )
 
 // pvcStorageClass returns the effective storage class for a PVC, defaulting

@@ -4237,6 +4237,95 @@ func TestAnnotationValidation422(t *testing.T) {
 	}
 }
 
+// TestUserNSSizeAnnotationValidation422 checks that a malformed
+// q8s.io/userns-size value is rejected for every workload kind and never
+// stored. Pods and Deployments read it from pod metadata, Jobs and CronJobs
+// from the pod template metadata.
+func TestUserNSSizeAnnotationValidation422(t *testing.T) {
+	annotateTemplate := func(tmpl map[string]interface{}, key, value string) {
+		meta, ok := tmpl["metadata"].(map[string]interface{})
+		if !ok {
+			meta = map[string]interface{}{}
+			tmpl["metadata"] = meta
+		}
+		ann, ok := meta["annotations"].(map[string]interface{})
+		if !ok {
+			ann = map[string]interface{}{}
+			meta["annotations"] = ann
+		}
+		ann[key] = value
+	}
+
+	annotateCronJobTemplate := func(body map[string]interface{}, key, value string) {
+		jobTemplate := body["spec"].(map[string]interface{})["jobTemplate"].(map[string]interface{})
+		tmpl := jobTemplate["spec"].(map[string]interface{})["template"].(map[string]interface{})
+		annotateTemplate(tmpl, key, value)
+	}
+
+	tests := []struct {
+		name string
+		path string
+		body func() map[string]interface{}
+		list func(*store.Store) int
+	}{
+		{
+			name: "pod invalid userns size",
+			path: "/api/v1/namespaces/default/pods",
+			body: func() map[string]interface{} {
+				b := podBody("default", "bad-userns", "nginx")
+				annotate(b, quadlet.AnnotationUserNSSize, "1023")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Pods("default")) },
+		},
+		{
+			name: "deployment invalid userns size",
+			path: "/apis/apps/v1/namespaces/default/deployments",
+			body: func() map[string]interface{} {
+				b := deployBody("default", "bad-userns", "nginx")
+				annotateTemplate(b["spec"].(map[string]interface{})["template"].(map[string]interface{}), quadlet.AnnotationUserNSSize, "abc")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Deployments("default")) },
+		},
+		{
+			name: "job invalid userns size",
+			path: "/apis/batch/v1/namespaces/default/jobs",
+			body: func() map[string]interface{} {
+				b := jobBody("default", "bad-userns")
+				annotateTemplate(b["spec"].(map[string]interface{})["template"].(map[string]interface{}), quadlet.AnnotationUserNSSize, "0")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.Jobs("default")) },
+		},
+		{
+			name: "cronjob invalid userns size",
+			path: "/apis/batch/v1/namespaces/default/cronjobs",
+			body: func() map[string]interface{} {
+				b := cronJobBody("default", "bad-userns", "* * * * *")
+				annotateCronJobTemplate(b, quadlet.AnnotationUserNSSize, "16777217")
+				return b
+			},
+			list: func(st *store.Store) int { return len(st.CronJobs("default")) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := store.New()
+			srv := newTestServerWithQuadletDir(t, st, t.TempDir())
+			ts := httptest.NewServer(srv)
+			t.Cleanup(ts.Close)
+
+			resp := post(t, ts.URL+tt.path, tt.body())
+			assertStatus(t, resp, http.StatusUnprocessableEntity)
+			resp.Body.Close()
+			if n := tt.list(st); n != 0 {
+				t.Fatalf("rejected object was stored: %d entries", n)
+			}
+		})
+	}
+}
+
 func TestPodPatchRejectsInvalidSocketActivation(t *testing.T) {
 	st := store.New()
 	srv := newTestServerWithQuadletDir(t, st, t.TempDir())
