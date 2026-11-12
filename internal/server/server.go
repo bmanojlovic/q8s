@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"q8s/internal/cronruns"
 	"q8s/internal/store"
 	"q8s/internal/systemd"
 )
@@ -25,6 +26,9 @@ type Config struct {
 	TraefikDir string // Traefik dynamic config dir for Ingress routing
 	Mode       systemd.Mode
 	Manager    *systemd.Manager
+	// CronRuns, when set, derives CronJob run Jobs and Pods from the systemd
+	// journal. Nil disables the synthetic objects entirely.
+	CronRuns *cronruns.Source
 	// Port is used only for the /api discovery hint (serverAddressByClientCIDRs);
 	// it doesn't affect what the server actually listens on. Defaults to 6443
 	// if zero.

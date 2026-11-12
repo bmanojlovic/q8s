@@ -191,6 +191,42 @@ func respondList[Item any, PI watchItem[Item], List runtime.Object](
 	encode(w, makeList(plain), http.StatusOK)
 }
 
+// respondListMerged is respondList with synthetic objects appended to the
+// plain-list/table snapshot. extra is nil when the resource has none. A
+// watch request always goes through listFn alone: a watch relists on every
+// store change and sync tick, and runs must never be read on a timer.
+func respondListMerged[Item any, PI watchItem[Item], List runtime.Object](
+	w http.ResponseWriter,
+	r *http.Request,
+	s *Server,
+	listFn func() []PI,
+	extra func() []PI,
+	toTable func([]PI, string) *table,
+	makeList func([]Item) List,
+) {
+	if extra == nil || r.URL.Query().Get("watch") == "true" {
+		respondList(w, r, s, listFn, toTable, makeList)
+		return
+	}
+	merged := func() []PI {
+		items := listFn()
+		seen := make(map[string]bool, len(items))
+		for _, o := range items {
+			seen[o.GetNamespace()+"/"+o.GetName()] = true
+		}
+		for _, o := range extra() {
+			key := o.GetNamespace() + "/" + o.GetName()
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			items = append(items, o)
+		}
+		return items
+	}
+	respondList(w, r, s, merged, toTable, makeList)
+}
+
 // serveWatch streams ADDED/MODIFIED/DELETED WatchEvents for a resource
 // collection. q8s has no per-object event log, so it diffs successive
 // snapshots taken each time Store.Changed() fires (any mutation, or the 5s
@@ -595,15 +631,19 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		return
 	}
 
+	if s.rejectCronRunPodWrite(w, r, ns, name) {
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
-			respondList(w, r, s, func() []*corev1.Pod { return s.config.Store.Pods(ns) }, podsToTable,
+			respondListMerged(w, r, s, func() []*corev1.Pod { return s.config.Store.Pods(ns) }, s.cronRunPodsExtra(r.Context(), ns), podsToTable,
 				func(items []corev1.Pod) *corev1.PodList {
 					return &corev1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}, Items: items}
 				})
 		} else {
-			pod, err := s.config.Store.GetPod(ns, name)
+			pod, err := s.getPod(r.Context(), ns, name)
 			if err != nil {
 				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 				return
@@ -792,6 +832,12 @@ func (s *Server) podContainerName(ns, podName, requested string) string {
 }
 
 func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if _, err := s.config.Store.GetPod(ns, name); err != nil {
+		if pod, ok := s.cronRunFindPod(r.Context(), ns, name); ok {
+			s.handleCronRunPodLogs(w, r, pod)
+			return
+		}
+	}
 	q := r.URL.Query()
 	containerName := s.podContainerName(ns, name, q.Get("container"))
 
@@ -1828,7 +1874,7 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, resource string) {
 	switch resource {
 	case "pods":
-		respondList(w, r, s, s.config.Store.AllPods, podsToTable,
+		respondListMerged(w, r, s, s.config.Store.AllPods, s.cronRunPodsExtra(r.Context(), ""), podsToTable,
 			func(items []corev1.Pod) *corev1.PodList {
 				return &corev1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}, Items: items}
 			})
@@ -2103,12 +2149,12 @@ func (s *Server) handleBatchNamespaced(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBatchClusterList(w http.ResponseWriter, r *http.Request, resource string) {
 	switch resource {
 	case "jobs":
-		respondList(w, r, s, s.config.Store.AllJobs, jobsToTable,
+		respondListMerged(w, r, s, s.config.Store.AllJobs, s.cronRunJobsExtra(r.Context(), ""), jobsToTable,
 			func(items []batchv1.Job) *batchv1.JobList {
 				return &batchv1.JobList{TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1", Kind: "JobList"}, Items: items}
 			})
 	case "cronjobs":
-		respondList(w, r, s, s.config.Store.AllCronJobs, cronJobsToTable,
+		s.respondListCronJobs(w, r, s.config.Store.AllCronJobs, cronJobsToTable,
 			func(items []batchv1.CronJob) *batchv1.CronJobList {
 				return &batchv1.CronJobList{TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1", Kind: "CronJobList"}, Items: items}
 			})
@@ -2120,15 +2166,18 @@ func (s *Server) handleBatchClusterList(w http.ResponseWriter, r *http.Request, 
 // --- Jobs ---
 
 func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if s.rejectCronRunJobWrite(w, r, ns, name) {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
-			respondList(w, r, s, func() []*batchv1.Job { return s.config.Store.Jobs(ns) }, jobsToTable,
+			respondListMerged(w, r, s, func() []*batchv1.Job { return s.config.Store.Jobs(ns) }, s.cronRunJobsExtra(r.Context(), ns), jobsToTable,
 				func(items []batchv1.Job) *batchv1.JobList {
 					return &batchv1.JobList{TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1", Kind: "JobList"}, Items: items}
 				})
 		} else {
-			job, err := s.config.Store.GetJob(ns, name)
+			job, err := s.getJob(r.Context(), ns, name)
 			if err != nil {
 				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 				return
@@ -2321,7 +2370,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
-			respondList(w, r, s, func() []*batchv1.CronJob { return s.config.Store.CronJobs(ns) }, cronJobsToTable,
+			s.respondListCronJobs(w, r, func() []*batchv1.CronJob { return s.config.Store.CronJobs(ns) }, cronJobsToTable,
 				func(items []batchv1.CronJob) *batchv1.CronJobList {
 					return &batchv1.CronJobList{TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1", Kind: "CronJobList"}, Items: items}
 				})
@@ -2331,6 +2380,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 				return
 			}
+			s.fillCronJobRunStatus(r.Context(), cj)
 			if isTableRequest(r) {
 				encodeTable(w, cronJobsToTable([]*batchv1.CronJob{cj}, s.rv()))
 				return

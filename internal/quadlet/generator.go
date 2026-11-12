@@ -11,6 +11,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"q8s/internal/cronruns"
 )
 
 const (
@@ -498,7 +499,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 		return nil, err
 	}
 	writeImageAndPull(&b, spec.Containers[0])
-	b.WriteString(fmt.Sprintf("ContainerName=%s-%s-cron\n", ns, name))
+	b.WriteString(fmt.Sprintf("ContainerName=%s\n", cronruns.ContainerName(ns, name)))
 	if userNS {
 		b.WriteString("UserNS=auto\n")
 	}

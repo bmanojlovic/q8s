@@ -22,6 +22,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/cronruns"
 	"q8s/internal/hostcheck"
 	"q8s/internal/podman"
 	"q8s/internal/quadlet"
@@ -615,6 +616,20 @@ users:
 
 // --- Server ---
 
+// runJournalStream starts journalctl for a follow request and returns its
+// stdout plus the wait function that reaps it once the client goes away.
+func runJournalStream(ctx context.Context, name string, args ...string) (io.ReadCloser, func() error, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, err
+	}
+	return out, cmd.Wait, nil
+}
+
 func cmdServe() {
 	rootful := os.Getuid() == 0
 	mode := systemd.ModeRootless
@@ -701,7 +716,15 @@ func cmdServe() {
 		TraefikDir: d.dataDir + "/traefik",
 		Mode:       mode,
 		Manager:    mgr,
-		Port:       resolvePort(d),
+		CronRuns: &cronruns.Source{
+			Rootful: rootful,
+			Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				return exec.CommandContext(ctx, name, args...).Output()
+			},
+			Stream: runJournalStream,
+			Now:    time.Now,
+		},
+		Port: resolvePort(d),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create server: %v\n", err)

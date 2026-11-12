@@ -306,6 +306,12 @@ func serveClientFrames(r io.Reader, setDeadline func(), stdin io.WriteCloser, ws
 }
 
 func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if _, err := s.config.Store.GetPod(ns, name); err != nil {
+		if _, ok := s.cronRunFindPod(r.Context(), ns, name); ok {
+			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "CronJob runs cannot be exec'd (the container is gone)")
+			return
+		}
+	}
 	q := r.URL.Query()
 	commands := q["command"]
 	if len(commands) == 0 {

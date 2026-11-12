@@ -8,7 +8,7 @@ Every pod spec q8s accepts must contain exactly one container; specs with additi
 |---|---|---|
 | `nodes` | get, list | Synthetic single node with real machine stats |
 | `namespaces` | get, list, create, patch, delete | Creates a `q8s-{ns}.network` Podman network; patch updates labels and annotations |
-| `pods` | get, list, create, patch, delete | Writes a `.container` Quadlet; patch rewrites and restarts |
+| `pods` | get, list, create, patch, delete | Writes a `.container` Quadlet; patch rewrites and restarts; also lists derived CronJob runs |
 | `services` | get, list, create, patch, delete | Selector + port map: DNS aliases (NetworkAlias) and ingress backend resolution; never binds a host port |
 | `persistentvolumeclaims` | get, list, create, patch, delete | Named Podman volume; storageClass selects mount mode |
 | `configmaps` | get, list, create, update, patch, delete | Files at `{configDir}/{ns}/{name}/` |
@@ -28,11 +28,24 @@ Every pod spec q8s accepts must contain exactly one container; specs with additi
 
 | Resource | kubectl verbs | Notes |
 |---|---|---|
-| `jobs` | get, list, create, update, patch, delete | `Restart=no`, oneshot; pod template is immutable |
-| `cronjobs` | get, list, create, update, patch, delete | `.container` + `.timer` unit |
+| `jobs` | get, list, create, update, patch, delete | `Restart=no`, oneshot; pod template is immutable; also lists derived CronJob runs |
+| `cronjobs` | get, list, create, update, patch, delete | `.container` + `.timer` unit; every run appears as a derived Job and Pod |
 
 A Job's pod template is immutable: a PUT that changes `spec.template` is
 rejected with 422, matching Kubernetes.
+
+A CronJob run appears as a Job named `<cronjob>-<start unix minutes>` and a
+Pod named `<job name>-run`; older runs in the same minute get a `-2`, `-3`
+suffix. Nothing new is stored: both objects are derived from the systemd
+journal on every request. `successfulJobsHistoryLimit` (default 3) and
+`failedJobsHistoryLimit` (default 1) select how many finished runs are
+listed, and running runs are always shown. `kubectl logs job/<name>` reads
+the run's output from the journal, which needs Podman's journald log driver
+(the default under systemd). Deleting or updating a run is not implemented
+and answers 405; delete the CronJob itself instead. Runs that started before
+the CronJob was created (an earlier CronJob with the same name) are not
+shown. Runs are never part of a
+watch response.
 
 ## networking.k8s.io/v1
 
