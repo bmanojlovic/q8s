@@ -358,11 +358,13 @@ func jobsToTable(jobs []*batchv1.Job, rv string) *table {
 		completions := fmt.Sprintf("%d/1", j.Status.Succeeded)
 		dur := ""
 		if j.Status.StartTime != nil {
-			end := time.Now()
+			now := time.Now()
+			end := now
 			if j.Status.CompletionTime != nil {
 				end = j.Status.CompletionTime.Time
 			}
-			dur = age(end.Add(-end.Sub(j.Status.StartTime.Time)))
+			// age() formats now-t, so pass now minus the run's duration.
+			dur = age(now.Add(-end.Sub(j.Status.StartTime.Time)))
 		}
 		t.Rows = append(t.Rows, tableRow{
 			Cells:  []interface{}{j.Name, completions, dur, age(j.CreationTimestamp.Time)},

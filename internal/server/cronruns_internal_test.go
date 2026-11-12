@@ -24,3 +24,21 @@ func TestCronRunsBeforeCreationHidden(t *testing.T) {
 		t.Fatalf("runsSince = %+v", got)
 	}
 }
+
+// The DURATION column is completion minus start, not the job's age.
+func TestJobsTableDurationIsRunTime(t *testing.T) {
+	start := time.Now().Add(-20 * time.Minute)
+	end := start.Add(2 * time.Second)
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "j", CreationTimestamp: metav1.Time{Time: start}},
+		Status: batchv1.JobStatus{
+			StartTime:      &metav1.Time{Time: start},
+			CompletionTime: &metav1.Time{Time: end},
+			Succeeded:      1,
+		},
+	}
+	row := jobsToTable([]*batchv1.Job{job}, "1").Rows[0]
+	if got := row.Cells[2]; got != "2s" {
+		t.Fatalf("duration = %v, want 2s (age is %v)", got, row.Cells[3])
+	}
+}
