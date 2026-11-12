@@ -237,3 +237,55 @@ func TestRestoreLegacySecretSelfHealsOnLoad(t *testing.T) {
 		}
 	}
 }
+
+// --- isQ8sUnit ---
+
+func TestIsQ8sUnit(t *testing.T) {
+	dir := t.TempDir()
+	// One quadlet of every shape q8s writes. Only the file names matter;
+	// isQ8sUnit never reads them.
+	for _, name := range []string{
+		"demo-app.container",
+		"default-demo-0.container",
+		"demo-multi.pod",
+		"demo-multi-web.container",
+		"default-demo-cron.container",
+		"q8s-default.network",
+		"demo-data.volume",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("[Container]\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		unit string
+		want bool
+	}{
+		{"demo-app.service", true},
+		{"default-demo-0.service", true},
+		{"demo-multi-web.service", true},
+		{"demo-multi-pod.service", true},    // from demo-multi.pod
+		{"default-demo-cron.service", true}, // CronJob container
+		{"other.service", false},            // no quadlet source
+		{"demo-multi.service", false},       // pod unit is <base>-pod.service
+		{"demo-app.container", false},       // not a service
+		{"demo-multi-pod.timer", false},
+		{"demo-app.socket", false},
+		{"q8s-default.service", false}, // .network has no service
+		{"demo-data.service", false},   // .volume has no service
+		{"-pod.service", false},
+		{"", false},
+	}
+	for _, tc := range tests {
+		if got := isQ8sUnit(dir, tc.unit); got != tc.want {
+			t.Errorf("isQ8sUnit(%q) = %v, want %v", tc.unit, got, tc.want)
+		}
+	}
+}
+
+func TestIsQ8sUnitMissingQuadletDir(t *testing.T) {
+	if isQ8sUnit(filepath.Join(t.TempDir(), "does-not-exist"), "demo-app.service") {
+		t.Error("isQ8sUnit() = true for a unit with no quadlet source")
+	}
+}

@@ -768,7 +768,9 @@ func cmdServe() {
 	reconcilePodmanPods(st, mgr)
 
 	if mgr != nil {
-		go syncLoop(st, mgr)
+		syncCtx, stopSync := context.WithCancel(context.Background())
+		defer stopSync()
+		go syncLoop(syncCtx, st, mgr, mode, d.quadletDir)
 	}
 
 	daemon.SdNotify(false, daemon.SdNotifyReady)
@@ -1017,9 +1019,9 @@ func boolPtr(b bool) *bool { return &b }
 // reconcileOnce runs a full reconciliation pass: import/prune pods from live
 // Podman state, then refresh pod/deployment/job status from systemd. This is
 // the same work syncLoop used to run on every 5s tick; it's now triggered
-// immediately by podman events, with a slow ticker kept only as a
-// correctness backstop (same "push + periodic full resync" shape real k8s
-// controllers use around their informers).
+// immediately by systemd unit property changes, with a slow ticker kept only
+// as a correctness backstop (same "push + periodic full resync" shape real
+// k8s controllers use around their informers).
 func reconcileOnce(st *store.Store, mgr *systemd.Manager) {
 	live := reconcilePodmanPods(st, mgr)
 	for _, pod := range st.AllPods() {
@@ -1095,15 +1097,47 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) {
 	}
 }
 
-// syncLoop reacts to live podman container events (create/start/die/remove
-// for q8s-owned containers) instead of polling on a fixed interval, so pod
-// status/restart-info/orphan-detection update immediately instead of up to
-// 5s late. A burst of related events for one container transition (create,
-// init, start, attach all fire within milliseconds of each other) is
+// isQ8sUnit reports whether unit is a systemd service generated from a
+// quadlet file q8s writes in quadletDir. The check is one stat per candidate
+// file and no D-Bus call, so it is cheap enough to run for every unit signal.
+//
+// Quadlet derives the service name from the file name: foo.container becomes
+// foo.service, foo.pod becomes foo-pod.service, and q8s renders a CronJob as
+// <ns>-<name>-cron.container, so its unit is <ns>-<name>-cron.service (already
+// covered by the .container rule).
+func isQ8sUnit(quadletDir, unit string) bool {
+	base, ok := strings.CutSuffix(unit, ".service")
+	if !ok || base == "" {
+		return false
+	}
+	if fileExists(filepath.Join(quadletDir, base+".container")) {
+		return true
+	}
+	if pod, isPod := strings.CutSuffix(base, "-pod"); isPod && pod != "" {
+		return fileExists(filepath.Join(quadletDir, pod+".pod"))
+	}
+	return false
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// syncLoop reacts to systemd unit property changes instead of polling on a
+// fixed interval, so pod status/restart-info/orphan-detection update
+// immediately instead of up to 30s late. The trigger says only that a unit
+// changed; the reconcile pass itself still reads authoritative unit state and
+// live Podman containers. A burst of related changes for one transition
+// (start, stop, restart all fire within milliseconds of each other) is
 // debounced into a single reconcile pass. A slow ticker remains as a
-// correctness backstop in case an event is ever missed (e.g. during a
-// `podman events` reconnect window).
-func syncLoop(st *store.Store, mgr *systemd.Manager) {
+// correctness backstop in case a signal is ever missed (e.g. during a bus
+// reconnect window).
+//
+// Unit changes arrive over a dedicated D-Bus connection to systemd: no child
+// process is started and the journal is never read, so a host with a large
+// journal costs q8s nothing extra.
+func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string) {
 	trigger := make(chan struct{}, 1)
 	notify := func() {
 		select {
@@ -1112,10 +1146,10 @@ func syncLoop(st *store.Store, mgr *systemd.Manager) {
 		}
 	}
 
-	go podman.WatchEvents(context.Background(), func(e podman.Event) {
-		if e.Type == "container" && e.PodNamespace() != "" && e.PodName() != "" {
-			notify()
-		}
+	go systemd.WatchUnits(ctx, mode, func(unit string) bool {
+		return isQ8sUnit(quadletDir, unit)
+	}, func(string) {
+		notify()
 	})
 
 	ticker := time.NewTicker(30 * time.Second)

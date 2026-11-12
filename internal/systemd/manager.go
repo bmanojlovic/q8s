@@ -87,28 +87,11 @@ func NewManager(mode Mode) (*Manager, error) {
 	if mode == ModeRootful {
 		conn, err = dbus.NewSystemConnectionContext(context.Background())
 	} else {
-		// Build a proper unix:path= address so dbus can connect regardless of env format.
-		busPath := ""
-		if xdgRuntime := os.Getenv("XDG_RUNTIME_DIR"); xdgRuntime != "" {
-			busPath = filepath.Join(xdgRuntime, "bus")
-		}
-		if busPath == "" {
-			return nil, fmt.Errorf("XDG_RUNTIME_DIR not set; cannot locate user D-Bus socket")
-		}
+		// Build a proper unix:path= address so dbus can connect regardless
+		// of env format; userBusPath owns that knowledge for the signal
+		// subscription too.
 		conn, err = dbus.NewConnection(func() (*godbus.Conn, error) {
-			c, dialErr := godbus.Dial("unix:path=" + busPath)
-			if dialErr != nil {
-				return nil, dialErr
-			}
-			if authErr := c.Auth(nil); authErr != nil {
-				c.Close()
-				return nil, authErr
-			}
-			if helloErr := c.Hello(); helloErr != nil {
-				c.Close()
-				return nil, helloErr
-			}
-			return c, nil
+			return dialBus(ModeRootless)
 		})
 	}
 	if err != nil {

@@ -61,11 +61,11 @@ hack/
 
   systemd/
     manager.go    D-Bus Manager: start/stop/enable/disable/reload units
+    watch.go      D-Bus PropertiesChanged subscription: triggers the sync loop
     activation.go Socket activation (LISTEN_FDS) and default listeners
 
   podman/
     podman.go     Thin wrapper around `podman ps --format json`
-    events.go     Podman event stream (all container lifecycle events, with reconnect backoff)
 
 pkg/
   install/
@@ -80,7 +80,7 @@ On startup q8s also re-renders the quadlet file of every stored Pod and Deployme
 
 ## Sync loop
 
-A background goroutine reconciles state from Podman/systemd every 30 seconds, plus immediately on container events (with 200ms debounce):
+A background goroutine reconciles state from Podman/systemd every 30 seconds, plus immediately when systemd reports a unit property change. Those changes arrive as `PropertiesChanged` D-Bus signals from the systemd manager, on a dedicated connection that subscribes with a narrow match rule (unit objects only); no child process is spawned and the journal is never read. Only units whose quadlet source exists in the quadlet directory trigger a pass, and a 200 ms debounce collapses the burst of changes one container transition produces. The 30 s ticker stays as a correctness backstop in case a signal is missed (for example during a bus reconnect).
 
 | systemd `ActiveState` | Pod phase |
 |---|---|
