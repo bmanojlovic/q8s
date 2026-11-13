@@ -850,13 +850,18 @@ func restoreConfigMapFiles(configDir string, st *store.Store) {
 		return
 	}
 	for _, cm := range st.ConfigMapFiles() {
-		dir := configDir + "/" + cm.Namespace + "/" + cm.Name
+		dir := filepath.Join(configDir, cm.Namespace, cm.Name)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Printf("restore configmap %s/%s: mkdir: %v\n", cm.Namespace, cm.Name, err)
 			continue
 		}
 		for key, val := range cm.Data {
-			if err := os.WriteFile(dir+"/"+key, []byte(val), 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, key), []byte(val), 0644); err != nil {
+				fmt.Printf("restore configmap %s/%s key %s: %v\n", cm.Namespace, cm.Name, key, err)
+			}
+		}
+		for key, val := range cm.BinaryData {
+			if err := os.WriteFile(filepath.Join(dir, key), val, 0644); err != nil {
 				fmt.Printf("restore configmap %s/%s key %s: %v\n", cm.Namespace, cm.Name, key, err)
 			}
 		}

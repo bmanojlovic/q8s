@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -273,6 +274,42 @@ func TestRestoreLegacySecretSelfHealsOnLoad(t *testing.T) {
 		if string(got) != want {
 			t.Errorf("legacy secret %s = %q, want %q — restart did not self-heal", name, got, want)
 		}
+	}
+}
+
+// --- restoreConfigMapFiles ---
+
+// TestRestoreConfigMapFilesWritesDataAndBinaryData proves the restart path
+// rewrites both ConfigMap data sources, including binaryData keys whose bytes
+// are not valid UTF-8.
+func TestRestoreConfigMapFilesWritesDataAndBinaryData(t *testing.T) {
+	dir := t.TempDir()
+	st := store.New()
+	binary := []byte{0x50, 0x4b, 0x03, 0x04, 0xff, 0x00}
+	if _, err := st.CreateConfigMap(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "app-config", Namespace: "default"},
+		Data:       map[string]string{"app.conf": "MODE=prod"},
+		BinaryData: map[string][]byte{"package.whl": binary},
+	}); err != nil {
+		t.Fatalf("CreateConfigMap: %v", err)
+	}
+
+	restoreConfigMapFiles(dir, st)
+
+	gotData, err := os.ReadFile(filepath.Join(dir, "default", "app-config", "app.conf"))
+	if err != nil {
+		t.Fatalf("reading restored app.conf: %v", err)
+	}
+	if string(gotData) != "MODE=prod" {
+		t.Errorf("restored app.conf = %q, want %q", gotData, "MODE=prod")
+	}
+
+	gotBinary, err := os.ReadFile(filepath.Join(dir, "default", "app-config", "package.whl"))
+	if err != nil {
+		t.Fatalf("reading restored package.whl: %v", err)
+	}
+	if !bytes.Equal(gotBinary, binary) {
+		t.Errorf("restored package.whl = %v, want %v", gotBinary, binary)
 	}
 }
 
