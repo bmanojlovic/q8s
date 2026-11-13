@@ -436,10 +436,15 @@ type middlewareHTTP struct {
 }
 
 type middlewareBody struct {
-	IPAllowList    *traefik.IPAllowList    `json:"ipAllowList,omitempty"`
-	RedirectRegex  *traefik.RedirectRegex  `json:"redirectRegex,omitempty"`
-	RedirectScheme *traefik.RedirectScheme `json:"redirectScheme,omitempty"`
-	Headers        *traefik.Headers        `json:"headers,omitempty"`
+	IPAllowList      *traefik.IPAllowList      `json:"ipAllowList,omitempty"`
+	RedirectRegex    *traefik.RedirectRegex    `json:"redirectRegex,omitempty"`
+	RedirectScheme   *traefik.RedirectScheme   `json:"redirectScheme,omitempty"`
+	Headers          *traefik.Headers          `json:"headers,omitempty"`
+	ReplacePath      *traefik.ReplacePath      `json:"replacePath,omitempty"`
+	ReplacePathRegex *traefik.ReplacePathRegex `json:"replacePathRegex,omitempty"`
+	StripPrefix      *traefik.StripPrefix      `json:"stripPrefix,omitempty"`
+	StripPrefixRegex *traefik.StripPrefixRegex `json:"stripPrefixRegex,omitempty"`
+	AddPrefix        *traefik.AddPrefix        `json:"addPrefix,omitempty"`
 }
 
 type tcpDocument struct {
@@ -499,10 +504,15 @@ func (s *Server) generateMiddlewareConfig(mw *traefik.Middleware) {
 		return
 	}
 	body := middlewareBody{
-		IPAllowList:    mw.Spec.IPAllowList,
-		RedirectRegex:  mw.Spec.RedirectRegex,
-		RedirectScheme: mw.Spec.RedirectScheme,
-		Headers:        mw.Spec.Headers,
+		IPAllowList:      mw.Spec.IPAllowList,
+		RedirectRegex:    mw.Spec.RedirectRegex,
+		RedirectScheme:   mw.Spec.RedirectScheme,
+		Headers:          mw.Spec.Headers,
+		ReplacePath:      mw.Spec.ReplacePath,
+		ReplacePathRegex: mw.Spec.ReplacePathRegex,
+		StripPrefix:      mw.Spec.StripPrefix,
+		StripPrefixRegex: mw.Spec.StripPrefixRegex,
+		AddPrefix:        mw.Spec.AddPrefix,
 	}
 	doc := middlewareDocument{HTTP: middlewareHTTP{
 		Middlewares: map[string]middlewareBody{

@@ -43,6 +43,21 @@ func (in *MiddlewareSpec) DeepCopy() *MiddlewareSpec {
 	if in.Headers != nil {
 		out.Headers = in.Headers.DeepCopy()
 	}
+	if in.ReplacePath != nil {
+		out.ReplacePath = in.ReplacePath.DeepCopy()
+	}
+	if in.ReplacePathRegex != nil {
+		out.ReplacePathRegex = in.ReplacePathRegex.DeepCopy()
+	}
+	if in.StripPrefix != nil {
+		out.StripPrefix = in.StripPrefix.DeepCopy()
+	}
+	if in.StripPrefixRegex != nil {
+		out.StripPrefixRegex = in.StripPrefixRegex.DeepCopy()
+	}
+	if in.AddPrefix != nil {
+		out.AddPrefix = in.AddPrefix.DeepCopy()
+	}
 	return out
 }
 
@@ -91,6 +106,62 @@ func (in *RedirectScheme) DeepCopy() *RedirectScheme {
 		return nil
 	}
 	out := new(RedirectScheme)
+	*out = *in
+	return out
+}
+
+// DeepCopy returns a deep copy of the ReplacePath.
+func (in *ReplacePath) DeepCopy() *ReplacePath {
+	if in == nil {
+		return nil
+	}
+	out := new(ReplacePath)
+	*out = *in
+	return out
+}
+
+// DeepCopy returns a deep copy of the ReplacePathRegex.
+func (in *ReplacePathRegex) DeepCopy() *ReplacePathRegex {
+	if in == nil {
+		return nil
+	}
+	out := new(ReplacePathRegex)
+	*out = *in
+	return out
+}
+
+// DeepCopy returns a deep copy of the StripPrefix.
+func (in *StripPrefix) DeepCopy() *StripPrefix {
+	if in == nil {
+		return nil
+	}
+	out := new(StripPrefix)
+	*out = *in
+	if in.Prefixes != nil {
+		out.Prefixes = append([]string(nil), in.Prefixes...)
+	}
+	return out
+}
+
+// DeepCopy returns a deep copy of the StripPrefixRegex.
+func (in *StripPrefixRegex) DeepCopy() *StripPrefixRegex {
+	if in == nil {
+		return nil
+	}
+	out := new(StripPrefixRegex)
+	*out = *in
+	if in.Regex != nil {
+		out.Regex = append([]string(nil), in.Regex...)
+	}
+	return out
+}
+
+// DeepCopy returns a deep copy of the AddPrefix.
+func (in *AddPrefix) DeepCopy() *AddPrefix {
+	if in == nil {
+		return nil
+	}
+	out := new(AddPrefix)
 	*out = *in
 	return out
 }

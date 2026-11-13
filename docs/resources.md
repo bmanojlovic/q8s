@@ -57,7 +57,7 @@ watch response.
 
 | Resource | kubectl verbs | Notes |
 |---|---|---|
-| `middlewares` | get, list, create, update, patch, delete | HTTP `ipAllowList`, `redirectRegex`, `redirectScheme` and `headers` subsets; one type per object, rendered as a Traefik file-provider middleware |
+| `middlewares` | get, list, create, update, patch, delete | HTTP `ipAllowList`, `redirectRegex`, `redirectScheme`, `headers`, `replacePath`, `replacePathRegex`, `stripPrefix`, `stripPrefixRegex` and `addPrefix` subsets; one type per object, rendered as a Traefik file-provider middleware |
 | `ingressroutetcps` | get, list, create, update, patch, delete | Catch-all `HostSNI(`*`)` TCP routers with optional PROXY protocol and TLS passthrough; an entrypoint may be owned by only one object |
 
 See [Traefik Middleware and IngressRouteTCP](traefik.md) for the supported

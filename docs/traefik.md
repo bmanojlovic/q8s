@@ -5,7 +5,7 @@ same manifests that work on a real Kubernetes cluster with the Traefik
 Kubernetes provider also work here:
 
 - `Middleware` for the HTTP middlewares needed by web front ends: IP
-  allowlists, redirects and security headers.
+  allowlists, redirects, path rewriting and security headers.
 - `IngressRouteTCP` for TCP entrypoints such as mail ports, including the
   PROXY protocol and TLS passthrough.
 
@@ -118,6 +118,67 @@ spec:
 
 Custom header names must be valid HTTP token characters. Values may not
 contain CR, LF or NUL. `stsSeconds` must not be negative.
+
+### `replacePath`
+
+```yaml
+spec:
+  replacePath:
+    path: /new/path
+```
+
+`path` is required and must start with `/`.
+
+### `replacePathRegex`
+
+```yaml
+spec:
+  replacePathRegex:
+    regex: "^/old/(.*)"
+    replacement: "/new/${1}"
+```
+
+`regex` is required and must compile with Go's `regexp` package.
+`replacement` may be empty.
+
+### `stripPrefix`
+
+```yaml
+spec:
+  stripPrefix:
+    prefixes:
+      - /api
+      - /v1
+```
+
+`prefixes` must contain at least one entry. Every entry must be non-empty and
+start with `/`. `forceSlash` is deprecated in Traefik v3 and is not accepted.
+
+### `stripPrefixRegex`
+
+```yaml
+spec:
+  stripPrefixRegex:
+    regex:
+      - "^/api/v[0-9]+"
+      - "^/legacy"
+```
+
+`regex` must contain at least one entry. Every entry must be non-empty and
+compile with Go's `regexp` package.
+
+### `addPrefix`
+
+```yaml
+spec:
+  addPrefix:
+    prefix: /base
+```
+
+`prefix` is required and must start with `/`.
+
+Path and regex fields may not contain control characters (anything below
+0x20 or 0x7f).
 
 ## Ingress middleware references
 

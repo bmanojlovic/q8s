@@ -417,6 +417,64 @@ func TestTraefikAPIRejectsInvalidObjects(t *testing.T) {
 		{"middleware-nul-header-value", "Middleware", map[string]interface{}{
 			"headers": map[string]interface{}{"customResponseHeaders": map[string]string{"X-Test": "a\x00b"}},
 		}},
+		{"middleware-two-new-types", "Middleware", map[string]interface{}{
+			"replacePath": map[string]interface{}{"path": "/new"},
+			"addPrefix":   map[string]interface{}{"prefix": "/base"},
+		}},
+		{"middleware-replace-path-missing", "Middleware", map[string]interface{}{
+			"replacePath": map[string]interface{}{},
+		}},
+		{"middleware-replace-path-no-slash", "Middleware", map[string]interface{}{
+			"replacePath": map[string]interface{}{"path": "new"},
+		}},
+		{"middleware-replace-path-control-char", "Middleware", map[string]interface{}{
+			"replacePath": map[string]interface{}{"path": "/new\x01"},
+		}},
+		{"middleware-replace-path-regex-missing", "Middleware", map[string]interface{}{
+			"replacePathRegex": map[string]interface{}{"replacement": "/new"},
+		}},
+		{"middleware-replace-path-regex-bad", "Middleware", map[string]interface{}{
+			"replacePathRegex": map[string]interface{}{"regex": "(", "replacement": "/new"},
+		}},
+		{"middleware-replace-path-regex-control-char", "Middleware", map[string]interface{}{
+			"replacePathRegex": map[string]interface{}{"regex": "^/old", "replacement": "/new\x7f"},
+		}},
+		{"middleware-strip-prefix-empty", "Middleware", map[string]interface{}{
+			"stripPrefix": map[string]interface{}{"prefixes": []string{}},
+		}},
+		{"middleware-strip-prefix-missing", "Middleware", map[string]interface{}{
+			"stripPrefix": map[string]interface{}{},
+		}},
+		{"middleware-strip-prefix-no-slash", "Middleware", map[string]interface{}{
+			"stripPrefix": map[string]interface{}{"prefixes": []string{"api"}},
+		}},
+		{"middleware-strip-prefix-empty-entry", "Middleware", map[string]interface{}{
+			"stripPrefix": map[string]interface{}{"prefixes": []string{"/api", ""}},
+		}},
+		{"middleware-strip-prefix-control-char", "Middleware", map[string]interface{}{
+			"stripPrefix": map[string]interface{}{"prefixes": []string{"/api\x01"}},
+		}},
+		{"middleware-strip-prefix-regex-empty", "Middleware", map[string]interface{}{
+			"stripPrefixRegex": map[string]interface{}{"regex": []string{}},
+		}},
+		{"middleware-strip-prefix-regex-missing", "Middleware", map[string]interface{}{
+			"stripPrefixRegex": map[string]interface{}{},
+		}},
+		{"middleware-strip-prefix-regex-bad", "Middleware", map[string]interface{}{
+			"stripPrefixRegex": map[string]interface{}{"regex": []string{"("}},
+		}},
+		{"middleware-strip-prefix-regex-empty-entry", "Middleware", map[string]interface{}{
+			"stripPrefixRegex": map[string]interface{}{"regex": []string{"^/api", ""}},
+		}},
+		{"middleware-strip-prefix-regex-control-char", "Middleware", map[string]interface{}{
+			"stripPrefixRegex": map[string]interface{}{"regex": []string{"^/api\x7f"}},
+		}},
+		{"middleware-add-prefix-missing", "Middleware", map[string]interface{}{
+			"addPrefix": map[string]interface{}{},
+		}},
+		{"middleware-add-prefix-no-slash", "Middleware", map[string]interface{}{
+			"addPrefix": map[string]interface{}{"prefix": "base"},
+		}},
 		{"middleware-unknown-type", "Middleware", map[string]interface{}{
 			"ipAllowList": map[string]interface{}{"sourceRange": []string{"10.0.0.0/8"}},
 			"basicAuth":   map[string]interface{}{"secret": "users"},
@@ -584,6 +642,71 @@ func TestMiddlewareRenderingExact(t *testing.T) {
         stsSeconds: 31536000
 `,
 		},
+		{
+			name: "replace-path",
+			spec: map[string]interface{}{"replacePath": map[string]interface{}{
+				"path": "/new/path",
+			}},
+			want: `http:
+  middlewares:
+    default-replace-path:
+      replacePath:
+        path: /new/path
+`,
+		},
+		{
+			name: "replace-path-regex",
+			spec: map[string]interface{}{"replacePathRegex": map[string]interface{}{
+				"regex": "^/old/(.*)", "replacement": "/new/${1}",
+			}},
+			want: `http:
+  middlewares:
+    default-replace-path-regex:
+      replacePathRegex:
+        regex: ^/old/(.*)
+        replacement: /new/${1}
+`,
+		},
+		{
+			name: "strip-prefix",
+			spec: map[string]interface{}{"stripPrefix": map[string]interface{}{
+				"prefixes": []string{"/api", "/v1"},
+			}},
+			want: `http:
+  middlewares:
+    default-strip-prefix:
+      stripPrefix:
+        prefixes:
+        - /api
+        - /v1
+`,
+		},
+		{
+			name: "strip-prefix-regex",
+			spec: map[string]interface{}{"stripPrefixRegex": map[string]interface{}{
+				"regex": []string{"^/api/v[0-9]+", "^/legacy"},
+			}},
+			want: `http:
+  middlewares:
+    default-strip-prefix-regex:
+      stripPrefixRegex:
+        regex:
+        - ^/api/v[0-9]+
+        - ^/legacy
+`,
+		},
+		{
+			name: "add-prefix",
+			spec: map[string]interface{}{"addPrefix": map[string]interface{}{
+				"prefix": "/base",
+			}},
+			want: `http:
+  middlewares:
+    default-add-prefix:
+      addPrefix:
+        prefix: /base
+`,
+		},
 	}
 
 	for _, tc := range cases {
@@ -596,6 +719,53 @@ func TestMiddlewareRenderingExact(t *testing.T) {
 				t.Fatalf("rendered file:\n%s\nwant:\n%s", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestApplyMiddlewareReplacePathRegex(t *testing.T) {
+	ts, dir := ingressTestServer(t)
+	url := ts.URL + "/apis/traefik.io/v1alpha1/namespaces/default/middlewares/applied-replace-path-regex"
+
+	body := `apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: applied-replace-path-regex
+  namespace: default
+  labels:
+    app: demo
+spec:
+  replacePathRegex:
+    regex: ^/old/(.*)
+    replacement: /new/${1}
+`
+	resp := applyPatch(t, url, body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = get(t, url)
+	assertStatus(t, resp, http.StatusOK)
+	created := decodeBody(t, resp)
+	spec, _ := created["spec"].(map[string]interface{})
+	replace, _ := spec["replacePathRegex"].(map[string]interface{})
+	if replace["regex"] != "^/old/(.*)" || replace["replacement"] != "/new/${1}" {
+		t.Fatalf("apply create spec = %v", spec)
+	}
+
+	body = strings.Replace(body, "/new/${1}", "/latest/${1}", 1)
+	resp = applyPatch(t, url+"?fieldManager=Terraform&force=false", body)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp = get(t, url)
+	assertStatus(t, resp, http.StatusOK)
+	updated := decodeBody(t, resp)
+	spec, _ = updated["spec"].(map[string]interface{})
+	replace, _ = spec["replacePathRegex"].(map[string]interface{})
+	if replace["replacement"] != "/latest/${1}" {
+		t.Fatalf("apply update spec = %v", spec)
+	}
+	if cfg := readTraefikFile(t, dir, "middleware-default-applied-replace-path-regex.yaml"); !strings.Contains(cfg, "/latest/${1}") {
+		t.Fatalf("apply update did not rewrite the file:\n%s", cfg)
 	}
 }
 

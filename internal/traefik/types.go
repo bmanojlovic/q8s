@@ -31,10 +31,15 @@ type Middleware struct {
 // MiddlewareSpec holds exactly one middleware configuration. The API rejects
 // an object that sets zero or more than one of the supported types.
 type MiddlewareSpec struct {
-	IPAllowList    *IPAllowList    `json:"ipAllowList,omitempty"`
-	RedirectRegex  *RedirectRegex  `json:"redirectRegex,omitempty"`
-	RedirectScheme *RedirectScheme `json:"redirectScheme,omitempty"`
-	Headers        *Headers        `json:"headers,omitempty"`
+	IPAllowList      *IPAllowList      `json:"ipAllowList,omitempty"`
+	RedirectRegex    *RedirectRegex    `json:"redirectRegex,omitempty"`
+	RedirectScheme   *RedirectScheme   `json:"redirectScheme,omitempty"`
+	Headers          *Headers          `json:"headers,omitempty"`
+	ReplacePath      *ReplacePath      `json:"replacePath,omitempty"`
+	ReplacePathRegex *ReplacePathRegex `json:"replacePathRegex,omitempty"`
+	StripPrefix      *StripPrefix      `json:"stripPrefix,omitempty"`
+	StripPrefixRegex *StripPrefixRegex `json:"stripPrefixRegex,omitempty"`
+	AddPrefix        *AddPrefix        `json:"addPrefix,omitempty"`
 }
 
 // IPAllowList limits allowed requests based on the client IP.
@@ -62,6 +67,33 @@ type RedirectScheme struct {
 	Scheme    string `json:"scheme,omitempty"`
 	Port      string `json:"port,omitempty"`
 	Permanent bool   `json:"permanent,omitempty"`
+}
+
+// ReplacePath replaces the request path with a fixed path.
+type ReplacePath struct {
+	Path string `json:"path,omitempty"`
+}
+
+// ReplacePathRegex replaces the request path using regex matching and
+// replacement.
+type ReplacePathRegex struct {
+	Regex       string `json:"regex,omitempty"`
+	Replacement string `json:"replacement,omitempty"`
+}
+
+// StripPrefix removes matching path prefixes from the request.
+type StripPrefix struct {
+	Prefixes []string `json:"prefixes,omitempty"`
+}
+
+// StripPrefixRegex removes path prefixes matching any of the regexes.
+type StripPrefixRegex struct {
+	Regex []string `json:"regex,omitempty"`
+}
+
+// AddPrefix prepends a path prefix to the request.
+type AddPrefix struct {
+	Prefix string `json:"prefix,omitempty"`
 }
 
 // Headers manages request and response headers.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -34,8 +35,23 @@ func validateMiddleware(mw *traefik.Middleware) error {
 	if mw.Spec.Headers != nil {
 		set++
 	}
+	if mw.Spec.ReplacePath != nil {
+		set++
+	}
+	if mw.Spec.ReplacePathRegex != nil {
+		set++
+	}
+	if mw.Spec.StripPrefix != nil {
+		set++
+	}
+	if mw.Spec.StripPrefixRegex != nil {
+		set++
+	}
+	if mw.Spec.AddPrefix != nil {
+		set++
+	}
 	if set != 1 {
-		return fmt.Errorf("spec must set exactly one of ipAllowList, redirectRegex, redirectScheme or headers, got %d", set)
+		return fmt.Errorf("spec must set exactly one of ipAllowList, redirectRegex, redirectScheme, headers, replacePath, replacePathRegex, stripPrefix, stripPrefixRegex or addPrefix, got %d", set)
 	}
 
 	switch {
@@ -45,8 +61,18 @@ func validateMiddleware(mw *traefik.Middleware) error {
 		return validateRedirectRegex(mw.Spec.RedirectRegex)
 	case mw.Spec.RedirectScheme != nil:
 		return validateRedirectScheme(mw.Spec.RedirectScheme)
-	default:
+	case mw.Spec.Headers != nil:
 		return validateHeaders(mw.Spec.Headers)
+	case mw.Spec.ReplacePath != nil:
+		return validateReplacePath(mw.Spec.ReplacePath)
+	case mw.Spec.ReplacePathRegex != nil:
+		return validateReplacePathRegex(mw.Spec.ReplacePathRegex)
+	case mw.Spec.StripPrefix != nil:
+		return validateStripPrefix(mw.Spec.StripPrefix)
+	case mw.Spec.StripPrefixRegex != nil:
+		return validateStripPrefixRegex(mw.Spec.StripPrefixRegex)
+	default:
+		return validateAddPrefix(mw.Spec.AddPrefix)
 	}
 }
 
@@ -112,6 +138,74 @@ func validateRedirectScheme(redirect *traefik.RedirectScheme) error {
 	return nil
 }
 
+func validateReplacePath(replace *traefik.ReplacePath) error {
+	return validateAbsolutePath("replacePath.path", replace.Path)
+}
+
+func validateReplacePathRegex(replace *traefik.ReplacePathRegex) error {
+	if err := validateRegex("replacePathRegex.regex", replace.Regex); err != nil {
+		return err
+	}
+	if containsControlChar(replace.Replacement) {
+		return fmt.Errorf("spec.replacePathRegex.replacement %q contains a control character", replace.Replacement)
+	}
+	return nil
+}
+
+func validateStripPrefix(strip *traefik.StripPrefix) error {
+	if len(strip.Prefixes) == 0 {
+		return fmt.Errorf("spec.stripPrefix.prefixes must list at least one prefix")
+	}
+	for i, prefix := range strip.Prefixes {
+		if err := validateAbsolutePath(fmt.Sprintf("stripPrefix.prefixes[%d]", i), prefix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateStripPrefixRegex(strip *traefik.StripPrefixRegex) error {
+	if len(strip.Regex) == 0 {
+		return fmt.Errorf("spec.stripPrefixRegex.regex must list at least one regular expression")
+	}
+	for i, expression := range strip.Regex {
+		if err := validateRegex(fmt.Sprintf("stripPrefixRegex.regex[%d]", i), expression); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAddPrefix(prefix *traefik.AddPrefix) error {
+	return validateAbsolutePath("addPrefix.prefix", prefix.Prefix)
+}
+
+func validateAbsolutePath(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("spec.%s is required", field)
+	}
+	if containsControlChar(value) {
+		return fmt.Errorf("spec.%s %q contains a control character", field, value)
+	}
+	if !strings.HasPrefix(value, "/") {
+		return fmt.Errorf("spec.%s %q is invalid: must start with \"/\"", field, value)
+	}
+	return nil
+}
+
+func validateRegex(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("spec.%s is required", field)
+	}
+	if containsControlChar(value) {
+		return fmt.Errorf("spec.%s %q contains a control character", field, value)
+	}
+	if _, err := regexp.Compile(value); err != nil {
+		return fmt.Errorf("spec.%s %q is invalid: %s", field, value, err.Error())
+	}
+	return nil
+}
+
 func validateHeaders(headers *traefik.Headers) error {
 	for field, values := range map[string]map[string]string{
 		"customRequestHeaders":  headers.CustomRequestHeaders,
@@ -136,6 +230,15 @@ func containsCRLFOrNUL(value string) bool {
 	for i := 0; i < len(value); i++ {
 		switch value[i] {
 		case '\r', '\n', 0:
+			return true
+		}
+	}
+	return false
+}
+
+func containsControlChar(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] == 0x7f {
 			return true
 		}
 	}
