@@ -103,12 +103,6 @@ func (s *Source) command(ctx context.Context, args ...string) ([]byte, error) {
 	return s.Run(ctx, "journalctl", args...)
 }
 
-// journalArgs returns the journalctl selection for the manager messages of
-// one CronJob unit.
-func (s *Source) journalArgs(namespace, cronJob string) []string {
-	return s.journalArgsForUnit(UnitName(namespace, cronJob))
-}
-
 // journalArgsForUnit returns the journalctl selection for the manager
 // messages of one unit.
 func (s *Source) journalArgsForUnit(unit string) []string {
