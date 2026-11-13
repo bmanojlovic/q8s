@@ -1,6 +1,9 @@
 package podman
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestContainerInfoHealth(t *testing.T) {
 	tests := []struct {
@@ -83,5 +86,27 @@ func TestNetworkErrorMatching(t *testing.T) {
 	}
 	if isAlreadyDisconnected("Error: permission denied") {
 		t.Error("unrelated error must not count as already disconnected")
+	}
+}
+
+func TestContainerInfoParsesExitTiming(t *testing.T) {
+	// Shape from `podman ps --all --format json`: timestamps are unix seconds.
+	sample := []byte(`[{
+		"Id": "abc",
+		"Names": ["/default-app"],
+		"State": "exited",
+		"ExitCode": 3,
+		"StartedAt": 1700000000,
+		"ExitedAt": 1700000060
+	}]`)
+	var got []ContainerInfo
+	if err := json.Unmarshal(sample, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("containers = %d, want 1", len(got))
+	}
+	if got[0].StartedAt != 1700000000 || got[0].ExitedAt != 1700000060 {
+		t.Errorf("StartedAt/ExitedAt = %d/%d, want 1700000000/1700000060", got[0].StartedAt, got[0].ExitedAt)
 	}
 }

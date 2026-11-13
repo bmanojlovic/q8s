@@ -82,7 +82,7 @@ var podColumns = []columnDef{
 	{Name: "Name", Type: "string", Format: "name", Description: "Pod name", Priority: 0},
 	{Name: "Ready", Type: "string", Description: "Containers ready", Priority: 0},
 	{Name: "Status", Type: "string", Description: "Pod phase", Priority: 0},
-	{Name: "Restarts", Type: "integer", Description: "Restart count", Priority: 0},
+	{Name: "Restarts", Type: "string", Description: "Restart count", Priority: 0},
 	{Name: "Age", Type: "string", Description: "Time since creation", Priority: 0},
 }
 
@@ -91,21 +91,33 @@ func podsToTable(pods []*corev1.Pod, rv string) *table {
 	for _, p := range pods {
 		ready, total := 0, len(p.Status.ContainerStatuses)
 		restarts := 0
+		var lastFinished time.Time
 		for _, cs := range p.Status.ContainerStatuses {
 			if cs.Ready {
 				ready++
 			}
 			restarts += int(cs.RestartCount)
+			if t := cs.LastTerminationState.Terminated; t != nil && !t.FinishedAt.IsZero() {
+				if lastFinished.IsZero() || t.FinishedAt.Time.After(lastFinished) {
+					lastFinished = t.FinishedAt.Time
+				}
+			}
 		}
 		if total == 0 {
 			total = len(p.Spec.Containers)
+		}
+		// kubectl shows the restart count and, once a container has a last
+		// termination time, how long ago that was: "2 (5m ago)".
+		restartsCell := fmt.Sprintf("%d", restarts)
+		if restarts > 0 && !lastFinished.IsZero() {
+			restartsCell = fmt.Sprintf("%d (%s ago)", restarts, age(lastFinished))
 		}
 		t.Rows = append(t.Rows, tableRow{
 			Cells: []interface{}{
 				p.Name,
 				fmt.Sprintf("%d/%d", ready, total),
 				podStatus(p),
-				restarts,
+				restartsCell,
 				age(p.CreationTimestamp.Time),
 			},
 			Object: partialMeta{Kind: "Pod", APIVersion: "v1", Metadata: p.ObjectMeta},

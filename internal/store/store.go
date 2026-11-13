@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sync"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -692,12 +693,17 @@ func (s *Store) UpdatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 }
 
 // SyncPodTemplate replaces the spec and the template-derived metadata
-// (labels, annotations, owner references) of a stored pod, keeping its UID,
-// creation time and status. A Deployment instance is materialized from the
-// template on every deploy; without this the stored object kept the spec it
-// was first created with, and every reader of the store (namespace network
-// attach, Ingress backends, kubectl) saw a stale pod. Done under the lock so a
-// concurrent status update is not lost. Returns false if the pod is missing.
+// (labels, annotations, owner references) of a stored pod, keeping its UID.
+// A Deployment instance is materialized from the template on every deploy;
+// without this the stored object kept the spec it was first created with, and
+// every reader of the store (namespace network attach, Ingress backends,
+// kubectl) saw a stale pod. Done under the lock so a concurrent status update
+// is not lost.
+//
+// A changed spec means the stored object now stands for a new pod, as in
+// Kubernetes: creation time and status are reset so kubectl reports a fresh
+// AGE and the sync loop fills in the new container state. A metadata-only
+// change keeps the existing status. Returns false if the pod is missing.
 func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
 	s.mu.Lock()
 	key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
@@ -706,7 +712,8 @@ func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
 		s.mu.Unlock()
 		return false
 	}
-	if reflect.DeepEqual(existing.Spec, pod.Spec) &&
+	specChanged := !reflect.DeepEqual(existing.Spec, pod.Spec)
+	if !specChanged &&
 		reflect.DeepEqual(existing.Labels, pod.Labels) &&
 		reflect.DeepEqual(existing.Annotations, pod.Annotations) &&
 		reflect.DeepEqual(existing.OwnerReferences, pod.OwnerReferences) {
@@ -718,6 +725,10 @@ func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
 	updated.Labels = copyStringMap(pod.Labels)
 	updated.Annotations = copyStringMap(pod.Annotations)
 	updated.OwnerReferences = append([]metav1.OwnerReference(nil), pod.OwnerReferences...)
+	if specChanged {
+		updated.CreationTimestamp = metav1.Now()
+		updated.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	}
 	updated.ResourceVersion = s.incRV()
 	s.pods[key] = updated
 	s.mu.Unlock()
@@ -741,7 +752,19 @@ func copyStringMap(m map[string]string) map[string]string {
 // "starting") or "" when there is no health check, in which case readiness
 // is unaffected. Ignores missing pods silently (race between delete and sync
 // is fine).
+//
+// It carries no Podman timing observation; callers that have one use
+// UpdatePodPhaseState.
 func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase, health string) {
+	s.UpdatePodPhaseState(ns, name, phase, ContainerSyncState{Phase: phase, Health: health, Seen: true})
+}
+
+// UpdatePodPhaseState is UpdatePodPhase with the Podman observation for the
+// pod's single container. obs.Health is the Podman health ("healthy",
+// "unhealthy", "starting") or "" when there is no health check. When the
+// container has not been seen, the pod phase decides whether it is still
+// being created or crash-looping.
+func (s *Store) UpdatePodPhaseState(ns, name string, phase corev1.PodPhase, obs ContainerSyncState) {
 	s.mu.Lock()
 	key := types.NamespacedName{Namespace: ns, Name: name}
 	pod, ok := s.pods[key]
@@ -763,19 +786,23 @@ func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase, health st
 				Image: c.Image,
 			}
 		}
+		changed = true
 	}
 	for i := range pod.Status.ContainerStatuses {
 		cs := &pod.Status.ContainerStatuses[i]
-		// Not ready if crash-looping (has restarts with non-zero exit)
-		crashLooping := cs.RestartCount > 0 && cs.LastTerminationState.Terminated != nil &&
-			cs.LastTerminationState.Terminated.ExitCode != 0
+		if applyContainerObservation(cs, obs, phase) {
+			changed = true
+		}
 		// A health check exists when health is non-empty: Ready then needs
 		// Podman to report it healthy, not just running.
-		ready := running && !crashLooping && (health == "" || health == "healthy")
+		ready := running && !isCrashLooping(cs) && (obs.Health == "" || obs.Health == "healthy")
 		if cs.Ready != ready {
 			cs.Ready = ready
 			changed = true
 		}
+	}
+	if syncPodStartTime(pod) {
+		changed = true
 	}
 	if syncPodConditions(pod) {
 		changed = true
@@ -795,19 +822,171 @@ func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase, health st
 	}
 }
 
-// ContainerSyncState is the phase and Podman health observed for one
-// container of a pod by the reconcile loop.
+// ContainerSyncState is the phase, Podman health and container timing
+// observed for one container of a pod by the reconcile loop.
 type ContainerSyncState struct {
-	Phase  corev1.PodPhase
-	Health string
+	Phase     corev1.PodPhase
+	Health    string
+	StartedAt time.Time
+	ExitedAt  time.Time
+	ExitCode  int
+	Seen      bool
+}
+
+// isCrashLooping reports whether the container has restarted after an error.
+func isCrashLooping(cs *corev1.ContainerStatus) bool {
+	return cs.RestartCount > 0 && cs.LastTerminationState.Terminated != nil &&
+		cs.LastTerminationState.Terminated.ExitCode != 0
+}
+
+// containerStartedAt returns the start time recorded in either container
+// state variant, which is also what StartTime is derived from.
+func containerStartedAt(cs *corev1.ContainerStatus) time.Time {
+	if cs.State.Terminated != nil {
+		return cs.State.Terminated.StartedAt.Time
+	}
+	if cs.State.Running != nil {
+		return cs.State.Running.StartedAt.Time
+	}
+	return time.Time{}
+}
+
+// terminatedFromObservation builds the terminated state for a container
+// Podman reported as exited. Timestamps already known are kept when Podman
+// does not provide them, so polling a stopped container does not churn.
+func terminatedFromObservation(cs *corev1.ContainerStatus, obs ContainerSyncState) corev1.ContainerState {
+	startedAt := obs.StartedAt
+	finishedAt := obs.ExitedAt
+	if cs.State.Terminated != nil {
+		if startedAt.IsZero() {
+			startedAt = cs.State.Terminated.StartedAt.Time
+		}
+		if finishedAt.IsZero() {
+			finishedAt = cs.State.Terminated.FinishedAt.Time
+		}
+	}
+	if startedAt.IsZero() {
+		startedAt = containerStartedAt(cs)
+	}
+	reason := "Completed"
+	if obs.ExitCode != 0 {
+		reason = "Error"
+	}
+	return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+		ExitCode:   int32(obs.ExitCode),
+		Reason:     reason,
+		StartedAt:  metav1.NewTime(startedAt),
+		FinishedAt: metav1.NewTime(finishedAt),
+	}}
+}
+
+// startedValue reads the optional Started flag, treating unset as false.
+func startedValue(p *bool) bool {
+	return p != nil && *p
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// observedContainerState derives the Kubernetes container state from the
+// Podman observation and, when no container is seen, from the pod phase.
+func observedContainerState(cs *corev1.ContainerStatus, obs ContainerSyncState, phase corev1.PodPhase) (corev1.ContainerState, bool) {
+	if obs.Seen {
+		observedPhase := obs.Phase
+		if observedPhase == "" {
+			// A caller may only fill the timing fields; the pod phase is
+			// still a usable description of the observed container.
+			observedPhase = phase
+		}
+		switch observedPhase {
+		case corev1.PodRunning:
+			startedAt := obs.StartedAt
+			if startedAt.IsZero() && cs.State.Running != nil {
+				startedAt = cs.State.Running.StartedAt.Time
+			}
+			return corev1.ContainerState{Running: &corev1.ContainerStateRunning{
+				StartedAt: metav1.NewTime(startedAt),
+			}}, true
+		case corev1.PodSucceeded, corev1.PodFailed:
+			return terminatedFromObservation(cs, obs), true
+		default:
+			return waitingState(cs), startedValue(cs.Started)
+		}
+	}
+	switch phase {
+	case corev1.PodSucceeded, corev1.PodFailed:
+		if cs.State.Terminated != nil {
+			return cs.State, startedValue(cs.Started)
+		}
+		reason := "Completed"
+		if phase == corev1.PodFailed {
+			reason = "Error"
+		}
+		return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode:   int32(obs.ExitCode),
+			Reason:     reason,
+			StartedAt:  metav1.NewTime(containerStartedAt(cs)),
+			FinishedAt: metav1.NewTime(obs.ExitedAt),
+		}}, true
+	default:
+		return waitingState(cs), startedValue(cs.Started)
+	}
+}
+
+// waitingState is the state of a container that is not running: between the
+// restarts of a crash loop it is CrashLoopBackOff, as kubelet reports it,
+// otherwise it is still being created.
+func waitingState(cs *corev1.ContainerStatus) corev1.ContainerState {
+	reason := "ContainerCreating"
+	if isCrashLooping(cs) {
+		reason = "CrashLoopBackOff"
+	}
+	return corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}}
+}
+
+// applyContainerObservation sets cs.State and cs.Started from the observation
+// and the pod phase. It reports whether either field changed, so a running
+// container polled every pass does not produce a MODIFIED event.
+func applyContainerObservation(cs *corev1.ContainerStatus, obs ContainerSyncState, phase corev1.PodPhase) bool {
+	state, started := observedContainerState(cs, obs, phase)
+	if reflect.DeepEqual(cs.State, state) && startedValue(cs.Started) == started {
+		return false
+	}
+	cs.State = state
+	cs.Started = boolPtr(started)
+	return true
+}
+
+// syncPodStartTime sets Status.StartTime once, from the earliest container
+// start time seen, or now when no start time is known. Container restarts do
+// not move it afterwards.
+func syncPodStartTime(pod *corev1.Pod) bool {
+	if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
+		return false
+	}
+	var earliest time.Time
+	for i := range pod.Status.ContainerStatuses {
+		t := containerStartedAt(&pod.Status.ContainerStatuses[i])
+		if t.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || t.Before(earliest) {
+			earliest = t
+		}
+	}
+	if earliest.IsZero() {
+		earliest = time.Now()
+	}
+	pod.Status.StartTime = &metav1.Time{Time: earliest}
+	return true
 }
 
 // UpdatePodContainerPhases updates a pod's phase and syncs each container's
-// ready state from per-container state. states is keyed by container name
-// (the reconcile loop matches Podman's io.kubernetes.container.name label to
-// it). A missing entry means the container is not observable yet and counts
-// as pending/not ready. Ready follows the same rules as UpdatePodPhase:
-// running, not crash-looping, and healthy (or no health check).
+// ready state and state from per-container observations. states is keyed by
+// container name (the reconcile loop matches Podman's
+// io.kubernetes.container.name label to it). A missing entry means the
+// container is not observable yet and counts as pending/not ready. Ready
+// follows the same rules as UpdatePodPhase: running, not crash-looping, and
+// healthy (or no health check).
 func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase, states map[string]ContainerSyncState) {
 	s.mu.Lock()
 	key := types.NamespacedName{Namespace: ns, Name: name}
@@ -836,11 +1015,12 @@ func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase,
 		if cs.Image == "" {
 			cs.Image = c.Image
 		}
-		state := states[c.Name]
-		running := state.Phase == corev1.PodRunning
-		crashLooping := cs.RestartCount > 0 && cs.LastTerminationState.Terminated != nil &&
-			cs.LastTerminationState.Terminated.ExitCode != 0
-		ready := running && !crashLooping && (state.Health == "" || state.Health == "healthy")
+		obs := states[c.Name]
+		if applyContainerObservation(&cs, obs, phase) {
+			changed = true
+		}
+		ready := obs.Phase == corev1.PodRunning && !isCrashLooping(&cs) &&
+			(obs.Health == "" || obs.Health == "healthy")
 		if cs.Ready != ready {
 			cs.Ready = ready
 			changed = true
@@ -859,6 +1039,9 @@ func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase,
 	}
 	pod.Status.ContainerStatuses = statuses
 
+	if syncPodStartTime(pod) {
+		changed = true
+	}
 	if syncPodConditions(pod) {
 		changed = true
 	}
@@ -904,26 +1087,64 @@ func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCo
 	changed := false
 	for i := range pod.Status.ContainerStatuses {
 		cs := &pod.Status.ContainerStatuses[i]
+		countIncreased := restartCount > cs.RestartCount
 		if cs.RestartCount != restartCount {
 			cs.RestartCount = restartCount
 			changed = true
 		}
-		if hasExited && (cs.LastTerminationState.Terminated == nil ||
-			cs.LastTerminationState.Terminated.ExitCode != exitCode ||
-			cs.LastTerminationState.Terminated.Reason != reason) {
-			cs.LastTerminationState = corev1.ContainerState{
-				Terminated: &corev1.ContainerStateTerminated{
-					ExitCode: exitCode,
-					Reason:   reason,
-				},
+		if hasExited {
+			existing := cs.LastTerminationState.Terminated
+			if existing == nil || existing.ExitCode != exitCode || existing.Reason != reason || countIncreased {
+				finishedAt := metav1.Time{}
+				switch {
+				case existing != nil && !countIncreased:
+					// Same restart observed again: keep the timestamp, no churn.
+					finishedAt = existing.FinishedAt
+				case cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero():
+					// Podman knows when the container exited, which is better
+					// than the moment the restart was observed.
+					finishedAt = cs.State.Terminated.FinishedAt
+				default:
+					finishedAt = metav1.Now()
+				}
+				startedAt := metav1.Time{}
+				if existing != nil {
+					startedAt = existing.StartedAt
+				}
+				if startedAt.IsZero() && cs.State.Terminated != nil {
+					startedAt = cs.State.Terminated.StartedAt
+				}
+				cs.LastTerminationState = corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode:   exitCode,
+						Reason:     reason,
+						StartedAt:  startedAt,
+						FinishedAt: finishedAt,
+					},
+				}
+				changed = true
 			}
-			changed = true
 		}
 		// Mark not ready when crash-looping
 		if restartCount > 0 && exitCode != 0 && cs.Ready {
 			cs.Ready = false
 			changed = true
 		}
+	}
+	// The phase pass ran before this one and may have written the waiting
+	// reason from the previous restart count; refresh it now that the new
+	// restart and exit code are known.
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.State.Waiting != nil {
+			if w := waitingState(cs); w.Waiting.Reason != cs.State.Waiting.Reason {
+				cs.State = w
+				changed = true
+			}
+		}
+	}
+	if syncPodStartTime(pod) {
+		changed = true
 	}
 	if syncPodConditions(pod) {
 		changed = true

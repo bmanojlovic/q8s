@@ -628,8 +628,8 @@ func TestPodWatchTable(t *testing.T) {
 	if got, _ := cells[2].(string); got == "" {
 		t.Fatalf("Status cell is empty: %v", cells)
 	}
-	if _, ok := cells[3].(float64); !ok {
-		t.Fatalf("Restarts cell is not a number: %v", cells[3])
+	if _, ok := cells[3].(string); !ok {
+		t.Fatalf("Restarts cell is not a string: %v", cells[3])
 	}
 	if got := nested(nested(row, "object"), "metadata")["name"]; got != "watched" {
 		t.Fatalf("row object name = %v, want watched", got)

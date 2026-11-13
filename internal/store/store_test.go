@@ -229,6 +229,8 @@ func TestSyncPodTemplateReplacesTemplateMetadata(t *testing.T) {
 	pod.OwnerReferences = []metav1.OwnerReference{{
 		APIVersion: "apps/v1", Kind: "Deployment", Name: "old", UID: types.UID("old-deploy"),
 	}}
+	createdAt := metav1.NewTime(time.Now().Add(-time.Hour))
+	pod.CreationTimestamp = createdAt
 	created, err := st.CreatePod(pod)
 	if err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -272,14 +274,20 @@ func TestSyncPodTemplateReplacesTemplateMetadata(t *testing.T) {
 	if updated.UID != created.UID {
 		t.Errorf("UID changed from %q to %q", created.UID, updated.UID)
 	}
-	if !updated.CreationTimestamp.Equal(&created.CreationTimestamp) {
-		t.Errorf("CreationTimestamp changed from %v to %v", created.CreationTimestamp, updated.CreationTimestamp)
+	if !updated.CreationTimestamp.After(createdAt.Time) {
+		t.Errorf("CreationTimestamp = %v, want a time after the old pod's %v", updated.CreationTimestamp, createdAt)
 	}
-	if updated.Status.Phase != stored.Status.Phase {
-		t.Errorf("status phase changed from %s to %s", stored.Status.Phase, updated.Status.Phase)
+	if updated.Status.Phase != corev1.PodPending {
+		t.Errorf("status phase = %s, want Pending for a new pod", updated.Status.Phase)
 	}
-	if len(updated.Status.ContainerStatuses) != len(stored.Status.ContainerStatuses) {
-		t.Errorf("container statuses changed from %v to %v", stored.Status.ContainerStatuses, updated.Status.ContainerStatuses)
+	if updated.Status.StartTime != nil {
+		t.Errorf("status.startTime = %v, want nil for a new pod", updated.Status.StartTime)
+	}
+	if len(updated.Status.ContainerStatuses) != 0 {
+		t.Errorf("container statuses = %v, want them reset", updated.Status.ContainerStatuses)
+	}
+	if len(updated.Status.Conditions) != 0 {
+		t.Errorf("conditions = %v, want them reset", updated.Status.Conditions)
 	}
 	if updated.ResourceVersion == stored.ResourceVersion {
 		t.Fatalf("expected ResourceVersion to change, still %s", updated.ResourceVersion)
@@ -295,6 +303,56 @@ func TestSyncPodTemplateReplacesTemplateMetadata(t *testing.T) {
 	}
 	if again.ResourceVersion != rv {
 		t.Errorf("identical sync bumped ResourceVersion from %s to %s", rv, again.ResourceVersion)
+	}
+}
+
+func TestSyncPodTemplateMetadataOnlyKeepsStatus(t *testing.T) {
+	st := newStore(t)
+	pod := makePod("default", "app", "img:1")
+	pod.Labels = map[string]string{"app": "old"}
+	createdAt := metav1.NewTime(time.Now().Add(-time.Hour))
+	pod.CreationTimestamp = createdAt
+	created, err := st.CreatePod(pod)
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	st.UpdatePodPhase("default", "app", corev1.PodRunning, "")
+	stored, err := st.GetPod("default", "app")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+
+	incoming := makePod("default", "app", "img:1")
+	incoming.Labels = map[string]string{"app": "new"}
+	incoming.Annotations = map[string]string{"note": "changed"}
+	if !st.SyncPodTemplate(incoming) {
+		t.Fatal("expected true for an existing pod")
+	}
+
+	updated, err := st.GetPod("default", "app")
+	if err != nil {
+		t.Fatalf("GetPod after sync: %v", err)
+	}
+	if got := updated.Labels["app"]; got != "new" {
+		t.Errorf("labels = %v, want the incoming labels", updated.Labels)
+	}
+	if updated.UID != created.UID {
+		t.Errorf("UID changed from %q to %q", created.UID, updated.UID)
+	}
+	if !updated.CreationTimestamp.Equal(&createdAt) {
+		t.Errorf("CreationTimestamp changed from %v to %v for a metadata-only sync", createdAt, updated.CreationTimestamp)
+	}
+	if updated.Status.Phase != corev1.PodRunning {
+		t.Errorf("status phase = %s, want Running kept for a metadata-only sync", updated.Status.Phase)
+	}
+	if len(updated.Status.ContainerStatuses) != len(stored.Status.ContainerStatuses) {
+		t.Errorf("container statuses changed from %v to %v", stored.Status.ContainerStatuses, updated.Status.ContainerStatuses)
+	}
+	if updated.Status.StartTime == nil || !updated.Status.StartTime.Equal(stored.Status.StartTime) {
+		t.Errorf("status.startTime changed from %v to %v", stored.Status.StartTime, updated.Status.StartTime)
+	}
+	if updated.ResourceVersion == stored.ResourceVersion {
+		t.Fatal("expected ResourceVersion to change for a metadata sync")
 	}
 }
 
@@ -427,6 +485,156 @@ func TestUpdatePodPhaseHealthBumpsResourceVersion(t *testing.T) {
 	}
 	if got.ResourceVersion == shown.ResourceVersion {
 		t.Fatalf("expected ResourceVersion to change on Ready transition, still %s", got.ResourceVersion)
+	}
+}
+
+func TestUpdatePodPhaseStateContainerLifecycle(t *testing.T) {
+	st := newStore(t)
+	if _, err := st.CreatePod(makePod("default", "app", "img")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	started := time.Unix(1700000000, 0).UTC()
+	exited := started.Add(5 * time.Minute)
+
+	st.UpdatePodPhaseState("default", "app", corev1.PodRunning, store.ContainerSyncState{
+		Phase: corev1.PodRunning, StartedAt: started, Seen: true,
+	})
+	pod, err := st.GetPod("default", "app")
+	if err != nil {
+		t.Fatalf("GetPod: %v", err)
+	}
+	cs := pod.Status.ContainerStatuses[0]
+	if cs.State.Running == nil {
+		t.Fatalf("state = %+v, want Running", cs.State)
+	}
+	if got := cs.State.Running.StartedAt.Time; !got.Equal(started) {
+		t.Errorf("running startedAt = %v, want %v", got, started)
+	}
+	if cs.Started == nil || !*cs.Started {
+		t.Errorf("Started = %v, want true", cs.Started)
+	}
+	if pod.Status.StartTime == nil || !pod.Status.StartTime.Time.Equal(started) {
+		t.Fatalf("status.startTime = %v, want %v", pod.Status.StartTime, started)
+	}
+
+	// A repeated observation of the same running container must not bump
+	// the resourceVersion.
+	rv := pod.ResourceVersion
+	st.UpdatePodPhaseState("default", "app", corev1.PodRunning, store.ContainerSyncState{
+		Phase: corev1.PodRunning, StartedAt: started, Seen: true,
+	})
+	polled, _ := st.GetPod("default", "app")
+	if polled.ResourceVersion != rv {
+		t.Errorf("unchanged running observation bumped ResourceVersion from %s to %s", rv, polled.ResourceVersion)
+	}
+
+	// Exit 0 is Completed, with the Podman timestamps on the state.
+	st.UpdatePodPhaseState("default", "app", corev1.PodSucceeded, store.ContainerSyncState{
+		Phase: corev1.PodSucceeded, StartedAt: started, ExitedAt: exited, ExitCode: 0, Seen: true,
+	})
+	pod, _ = st.GetPod("default", "app")
+	cs = pod.Status.ContainerStatuses[0]
+	if cs.State.Terminated == nil {
+		t.Fatalf("state = %+v, want Terminated", cs.State)
+	}
+	if got := cs.State.Terminated.ExitCode; got != 0 {
+		t.Errorf("exit code = %d, want 0", got)
+	}
+	if got := cs.State.Terminated.Reason; got != "Completed" {
+		t.Errorf("reason = %q, want Completed", got)
+	}
+	if got := cs.State.Terminated.FinishedAt.Time; !got.Equal(exited) {
+		t.Errorf("finishedAt = %v, want %v", got, exited)
+	}
+	if got := cs.State.Terminated.StartedAt.Time; !got.Equal(started) {
+		t.Errorf("startedAt = %v, want %v", got, started)
+	}
+
+	// A restart with a later start time does not move status.startTime.
+	restarted := started.Add(10 * time.Minute)
+	st.UpdatePodPhaseState("default", "app", corev1.PodRunning, store.ContainerSyncState{
+		Phase: corev1.PodRunning, StartedAt: restarted, Seen: true,
+	})
+	pod, _ = st.GetPod("default", "app")
+	if got := pod.Status.StartTime.Time; !got.Equal(started) {
+		t.Errorf("status.startTime moved to %v after restart, want %v", got, started)
+	}
+}
+
+func TestUpdatePodPhaseStateWaitingWithoutContainer(t *testing.T) {
+	st := newStore(t)
+	if _, err := st.CreatePod(makePod("default", "app", "img")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	st.UpdatePodPhaseState("default", "app", corev1.PodPending, store.ContainerSyncState{Seen: false})
+	pod, _ := st.GetPod("default", "app")
+	cs := pod.Status.ContainerStatuses[0]
+	if cs.State.Waiting == nil || cs.State.Waiting.Reason != "ContainerCreating" {
+		t.Fatalf("state = %+v, want Waiting ContainerCreating", cs.State)
+	}
+	if cs.Started != nil && *cs.Started {
+		t.Errorf("Started = %v, want unset or false before the first start", cs.Started)
+	}
+
+	// While the unit is active but Podman lists no container yet, a
+	// container that already crash-looped is reported as CrashLoopBackOff.
+	st.UpdatePodRestartInfo("default", "app", 1, 1, true)
+	st.UpdatePodPhaseState("default", "app", corev1.PodRunning, store.ContainerSyncState{Seen: false})
+	pod, _ = st.GetPod("default", "app")
+	cs = pod.Status.ContainerStatuses[0]
+	if cs.State.Waiting == nil || cs.State.Waiting.Reason != "CrashLoopBackOff" {
+		t.Fatalf("state = %+v, want Waiting CrashLoopBackOff", cs.State)
+	}
+}
+
+func TestUpdatePodRestartInfoFinishedAt(t *testing.T) {
+	st := newStore(t)
+	if _, err := st.CreatePod(makePod("default", "app", "img")); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+
+	st.UpdatePodRestartInfo("default", "app", 0, 1, true)
+	pod, _ := st.GetPod("default", "app")
+	first := pod.Status.ContainerStatuses[0].LastTerminationState.Terminated
+	if first == nil || first.FinishedAt.IsZero() {
+		t.Fatalf("lastTerminationState = %+v, want a finishedAt", first)
+	}
+	finished := first.FinishedAt
+	rv := pod.ResourceVersion
+
+	// The same restart observed again keeps the timestamp and the RV.
+	st.UpdatePodRestartInfo("default", "app", 0, 1, true)
+	pod, _ = st.GetPod("default", "app")
+	again := pod.Status.ContainerStatuses[0].LastTerminationState.Terminated
+	if !again.FinishedAt.Equal(&finished) {
+		t.Errorf("finishedAt changed from %v to %v without a new restart", finished, again.FinishedAt)
+	}
+	if pod.ResourceVersion != rv {
+		t.Errorf("repeat restart observation bumped ResourceVersion from %s to %s", rv, pod.ResourceVersion)
+	}
+
+	// A new restart (count increase) records a new finishedAt.
+	time.Sleep(5 * time.Millisecond)
+	st.UpdatePodRestartInfo("default", "app", 1, 1, true)
+	pod, _ = st.GetPod("default", "app")
+	cs := pod.Status.ContainerStatuses[0]
+	if cs.RestartCount != 1 {
+		t.Fatalf("RestartCount = %d, want 1", cs.RestartCount)
+	}
+	if !cs.LastTerminationState.Terminated.FinishedAt.After(finished.Time) {
+		t.Errorf("finishedAt = %v, want after the previous %v", cs.LastTerminationState.Terminated.FinishedAt, finished)
+	}
+
+	// Podman's exit time is a better value than the observation time.
+	known := metav1.NewTime(time.Now().Add(-time.Minute))
+	st.UpdatePodPhaseState("default", "app", corev1.PodFailed, store.ContainerSyncState{
+		Phase: corev1.PodFailed, StartedAt: known.Time.Add(-time.Minute), ExitedAt: known.Time, ExitCode: 2, Seen: true,
+	})
+	st.UpdatePodRestartInfo("default", "app", 2, 2, true)
+	pod, _ = st.GetPod("default", "app")
+	if got := pod.Status.ContainerStatuses[0].LastTerminationState.Terminated.FinishedAt.Time; !got.Equal(known.Time) {
+		t.Errorf("finishedAt = %v, want Podman's %v", got, known.Time)
 	}
 }
 
@@ -1246,5 +1454,24 @@ func TestPodConditionsFollowReadiness(t *testing.T) {
 	s.UpdatePodPhase("default", "c", corev1.PodRunning, "down")
 	if got := cond(); got[corev1.PodReady] != corev1.ConditionFalse {
 		t.Fatalf("down: %v", got)
+	}
+}
+
+// The phase pass runs before the restart-info pass in the same reconcile, so
+// the waiting reason must be refreshed when the restart is recorded.
+func TestWaitingReasonFollowsRestartInfo(t *testing.T) {
+	s := store.New()
+	if _, err := s.CreatePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cl", Namespace: "default"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "cl", Image: "busybox"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.UpdatePodPhaseState("default", "cl", corev1.PodRunning, store.ContainerSyncState{})
+	s.UpdatePodRestartInfo("default", "cl", 1, 3, true)
+	p, _ := s.GetPod("default", "cl")
+	w := p.Status.ContainerStatuses[0].State.Waiting
+	if w == nil || w.Reason != "CrashLoopBackOff" {
+		t.Fatalf("state = %+v, want waiting CrashLoopBackOff", p.Status.ContainerStatuses[0].State)
 	}
 }

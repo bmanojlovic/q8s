@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -101,6 +102,41 @@ func TestPodmanStateToPhase(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("podmanStateToPhase(%q, %d) = %q, want %q", tc.state, tc.exitCode, got, tc.want)
 		}
+	}
+}
+
+// --- podmanContainerSyncState (single-container observation) ---
+
+func TestPodmanContainerSyncStateTimes(t *testing.T) {
+	started := time.Unix(1700000000, 0).UTC()
+	exited := time.Unix(1700000300, 0).UTC()
+	got := podmanContainerSyncState(podman.ContainerInfo{
+		State:     "exited",
+		ExitCode:  1,
+		StartedAt: started.Unix(),
+		ExitedAt:  exited.Unix(),
+	})
+	if !got.Seen {
+		t.Error("Seen = false, want true for a listed container")
+	}
+	if got.Phase != corev1.PodFailed {
+		t.Errorf("Phase = %q, want Failed", got.Phase)
+	}
+	if got.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1", got.ExitCode)
+	}
+	if !got.StartedAt.Equal(started) {
+		t.Errorf("StartedAt = %v, want %v", got.StartedAt, started)
+	}
+	if !got.ExitedAt.Equal(exited) {
+		t.Errorf("ExitedAt = %v, want %v", got.ExitedAt, exited)
+	}
+}
+
+func TestPodmanContainerSyncStateUnsetTimes(t *testing.T) {
+	got := podmanContainerSyncState(podman.ContainerInfo{State: "running"})
+	if !got.StartedAt.IsZero() || !got.ExitedAt.IsZero() {
+		t.Errorf("times = %v/%v, want zero for unset podman values", got.StartedAt, got.ExitedAt)
 	}
 }
 

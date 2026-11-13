@@ -24,6 +24,7 @@ type ContainerInfo struct {
 	ExitCode  int               `json:"ExitCode"`
 	Image     string            `json:"Image"`
 	StartedAt int64             `json:"StartedAt"`
+	ExitedAt  int64             `json:"ExitedAt"`
 	Labels    map[string]string `json:"Labels"`
 }
 

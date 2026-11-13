@@ -960,7 +960,7 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) map[string][]pod
 		if err != nil {
 			continue
 		}
-		st.UpdatePodPhase(created.Namespace, created.Name, podmanStateToPhase(c.State, c.ExitCode), c.Health())
+		st.UpdatePodPhaseState(created.Namespace, created.Name, podmanStateToPhase(c.State, c.ExitCode), podmanContainerSyncState(c))
 		imported++
 		fmt.Printf("imported container: %s/%s (%s)\n", ns, name, c.State)
 	}
@@ -1060,7 +1060,15 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 			containerName := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
 			cs, perr := podman.InspectState(containerName)
 			if perr == nil {
-				st.UpdatePodPhase(pod.Namespace, pod.Name, podmanStateToPhase(cs.State, cs.ExitCode), health)
+				phase := podmanStateToPhase(cs.State, cs.ExitCode)
+				obs := store.ContainerSyncState{Phase: phase, Health: health, ExitCode: cs.ExitCode, Seen: true}
+				if len(infos) > 0 {
+					obs = podmanContainerSyncState(infos[0])
+					obs.Phase = phase
+					obs.Health = health
+					obs.ExitCode = cs.ExitCode
+				}
+				st.UpdatePodPhaseState(pod.Namespace, pod.Name, phase, obs)
 			}
 			continue
 		}
@@ -1074,7 +1082,16 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 			// down instead of leaving ready=true until the restart.
 			health = containerDown
 		}
-		st.UpdatePodPhase(pod.Namespace, pod.Name, unitPhase(pod, state, infos), health)
+		obs := store.ContainerSyncState{Health: health}
+		if len(infos) > 0 {
+			obs = podmanContainerSyncState(infos[0])
+			obs.Health = health
+		} else {
+			// No container to observe: keep the unit's exit code so a
+			// terminal pod can still report the terminated state.
+			obs.ExitCode = int(state.ExitCode)
+		}
+		st.UpdatePodPhaseState(pod.Namespace, pod.Name, unitPhase(pod, state, infos), obs)
 		st.UpdatePodRestartInfo(pod.Namespace, pod.Name, int32(state.NRestarts), int32(state.ExitCode), state.Result != "")
 	}
 	for _, dep := range st.AllDeployments() {
@@ -1287,6 +1304,27 @@ func unitStateToPhase(s *systemd.UnitState) corev1.PodPhase {
 	}
 }
 
+// podmanContainerSyncState converts one live Podman container to the store's
+// observation. Podman reports StartedAt and ExitedAt as unix seconds, with 0
+// meaning not set.
+func podmanContainerSyncState(ci podman.ContainerInfo) store.ContainerSyncState {
+	return store.ContainerSyncState{
+		Phase:     podmanStateToPhase(ci.State, ci.ExitCode),
+		Health:    ci.Health(),
+		StartedAt: unixSeconds(ci.StartedAt),
+		ExitedAt:  unixSeconds(ci.ExitedAt),
+		ExitCode:  ci.ExitCode,
+		Seen:      true,
+	}
+}
+
+func unixSeconds(sec int64) time.Time {
+	if sec <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0).UTC()
+}
+
 // podmanContainerStates maps the live Podman containers of a multi-container
 // pod to per-container sync state, matched by io.kubernetes.container.name.
 // The pod phase follows the set: Running when every container runs,
@@ -1311,12 +1349,13 @@ func podmanContainerStates(pod *corev1.Pod, infos []podman.ContainerInfo) (corev
 	running, succeeded, failed := 0, 0, 0
 	for _, c := range pod.Spec.Containers {
 		phase := corev1.PodPending
-		health := ""
 		if ci, ok := byName[c.Name]; ok {
-			phase = podmanStateToPhase(ci.State, ci.ExitCode)
-			health = ci.Health()
+			state := podmanContainerSyncState(ci)
+			states[c.Name] = state
+			phase = state.Phase
+		} else {
+			states[c.Name] = store.ContainerSyncState{Phase: phase}
 		}
-		states[c.Name] = store.ContainerSyncState{Phase: phase, Health: health}
 		switch phase {
 		case corev1.PodRunning:
 			running++
