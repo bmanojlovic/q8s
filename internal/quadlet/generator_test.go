@@ -1255,6 +1255,107 @@ func TestCronTimerBasic(t *testing.T) {
 	assertContains(t, out, "WantedBy=timers.target")
 }
 
+// TestCronTimerTimeZone pins the systemd >= 235 zone suffix. It is appended
+// to every OnCalendar= line, including both lines of the day-of-month/day-of-
+// week union.
+func TestCronTimerTimeZone(t *testing.T) {
+	zone := "Europe/Belgrade"
+	tests := []struct {
+		name     string
+		schedule string
+		timeZone *string
+		want     []string
+	}{
+		{
+			name:     "single expression",
+			schedule: "34 0 * * *",
+			timeZone: &zone,
+			want:     []string{"OnCalendar=*-*-* 0:34:00 Europe/Belgrade\n"},
+		},
+		{
+			name:     "both day fields restricted",
+			schedule: "34 0 1 * 1",
+			timeZone: &zone,
+			want: []string{
+				"OnCalendar=1 *-*-* 0:34:00 Europe/Belgrade\n",
+				"OnCalendar=*-*-1 0:34:00 Europe/Belgrade\n",
+			},
+		},
+		{
+			name:     "unset",
+			schedule: "34 0 * * *",
+			want:     []string{"OnCalendar=*-*-* 0:34:00\n"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cj := &batchv1.CronJob{
+				ObjectMeta: metav1.ObjectMeta{Name: "zoned", Namespace: "default"},
+				Spec:       batchv1.CronJobSpec{Schedule: tt.schedule, TimeZone: tt.timeZone},
+			}
+			b, err := quadlet.CronTimer(cj.Name, cj)
+			if err != nil {
+				t.Fatalf("CronTimer: %v", err)
+			}
+			out := string(b)
+			for _, want := range tt.want {
+				assertContains(t, out, want)
+			}
+			if got, want := strings.Count(out, "OnCalendar="), len(tt.want); got != want {
+				t.Errorf("got %d OnCalendar lines, want %d:\n%s", got, want, out)
+			}
+			if tt.timeZone != nil {
+				if got := strings.Count(out, "Europe/Belgrade"); got != len(tt.want) {
+					t.Errorf("zone appears %d times, want %d:\n%s", got, len(tt.want), out)
+				}
+			}
+		})
+	}
+}
+
+// An explicitly empty spec.timeZone means unset, so it must render exactly
+// like an absent one.
+func TestCronTimerTimeZoneEmptyIsUnset(t *testing.T) {
+	empty := ""
+	spec := batchv1.CronJobSpec{Schedule: "34 0 * * *"}
+	unset := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"}, Spec: spec}
+	spec.TimeZone = &empty
+	withEmpty := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"}, Spec: spec}
+
+	unsetOut, err := quadlet.CronTimer(unset.Name, unset)
+	if err != nil {
+		t.Fatalf("CronTimer unset: %v", err)
+	}
+	emptyOut, err := quadlet.CronTimer(withEmpty.Name, withEmpty)
+	if err != nil {
+		t.Fatalf("CronTimer empty: %v", err)
+	}
+	if string(unsetOut) != string(emptyOut) {
+		t.Errorf("empty timeZone changed the timer output:\nunset:\n%s\nempty:\n%s", unsetOut, emptyOut)
+	}
+}
+
+// CronTimer renders objects loaded from disk, which never passed API
+// validation, so an invalid zone is dropped instead of written.
+func TestCronTimerDropsInvalidTimeZone(t *testing.T) {
+	for _, zone := range []string{"Mars/Phobos", "Local", "Europe/Belgrade\nX", "../etc"} {
+		t.Run(zone, func(t *testing.T) {
+			invalid := zone
+			cj := &batchv1.CronJob{
+				ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+				Spec:       batchv1.CronJobSpec{Schedule: "34 0 * * *", TimeZone: &invalid},
+			}
+			b, err := quadlet.CronTimer(cj.Name, cj)
+			if err != nil {
+				t.Fatalf("CronTimer: %v", err)
+			}
+			out := string(b)
+			assertContains(t, out, "OnCalendar=*-*-* 0:34:00\n")
+			assertNotContains(t, out, zone)
+		})
+	}
+}
+
 // --- cronToOnCalendar (via CronTimer output) ---
 
 func TestCronToOnCalendar(t *testing.T) {

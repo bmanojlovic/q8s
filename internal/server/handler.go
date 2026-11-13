@@ -2652,6 +2652,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateCronJobTimeZone(cj.Spec.TimeZone); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateCronJob(&cj)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -2690,6 +2694,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			return
 		}
 		if err := validateUserNSSizeAnnotation("cronjob spec.jobTemplate.spec.template", cj.Spec.JobTemplate.Spec.Template.Annotations); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateCronJobTimeZone(cj.Spec.TimeZone); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2764,6 +2772,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			return
 		}
 		if err := validateUserNSSizeAnnotation("cronjob spec.jobTemplate.spec.template", patched.Spec.JobTemplate.Spec.Template.Annotations); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateCronJobTimeZone(patched.Spec.TimeZone); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}

@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -177,6 +178,34 @@ var cronFieldBounds = [5][2]int{
 	{1, 31}, // day of month
 	{1, 12}, // month
 	{0, 7},  // day of week (0 and 7 = Sunday)
+}
+
+// cronTimeZoneRE restricts a CronJob time zone to the characters IANA zone
+// names use. It rules out whitespace, control characters and ".." so a zone
+// can never add a directive or a line to the generated timer unit.
+var cronTimeZoneRE = regexp.MustCompile(`^[A-Za-z0-9_+\-/]+$`)
+
+// ValidateCronTimeZone checks a CronJob spec.timeZone value. The API calls it
+// on every create, update and patch (server-side apply funnels into patch) so
+// an invalid zone is rejected with 422 instead of being stored. CronTimer
+// calls it again because it also renders objects loaded from disk.
+//
+// An absent zone means the controller's local zone and is valid. A zone that
+// is present but empty, "Local", or not loadable is rejected.
+func ValidateCronTimeZone(value string) error {
+	if value == "" {
+		return fmt.Errorf("timeZone must not be empty")
+	}
+	if value == "Local" {
+		return fmt.Errorf("timeZone %q is invalid: Local is not allowed", value)
+	}
+	if !cronTimeZoneRE.MatchString(value) {
+		return fmt.Errorf("timeZone %q is invalid: must match %s", value, cronTimeZoneRE)
+	}
+	if _, err := time.LoadLocation(value); err != nil {
+		return fmt.Errorf("timeZone %q is invalid: %v", value, err)
+	}
+	return nil
 }
 
 func validateCronSchedule(schedule string) error {

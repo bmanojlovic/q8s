@@ -1771,6 +1771,93 @@ func TestCronJobUpdatePutValidation(t *testing.T) {
 	resp.Body.Close()
 }
 
+// TestCronJobTimeZoneValidation422 checks spec.timeZone on create, update,
+// patch and server-side apply. Every path must reject an invalid zone with
+// 422 before the object is stored.
+func TestCronJobTimeZoneValidation422(t *testing.T) {
+	ts, st := newTestServer(t)
+	collection := ts.URL + "/apis/batch/v1/namespaces/default/cronjobs"
+	objectURL := collection + "/zoned"
+
+	withZone := func(name, zone string) map[string]interface{} {
+		body := cronJobBody("default", name, "34 0 * * *")
+		body["spec"].(map[string]interface{})["timeZone"] = zone
+		return body
+	}
+
+	resp := post(t, collection, withZone("zoned", "Europe/Belgrade"))
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	for _, zone := range []string{"Mars/Phobos", "Local", "Europe/Belgrade\nX", "../etc"} {
+		t.Run(zone, func(t *testing.T) {
+			// Create under a name that is never stored, so this is a
+			// validation failure and not an AlreadyExists conflict.
+			resp := post(t, collection, withZone("invalid-zoned", zone))
+			assertStatus(t, resp, http.StatusUnprocessableEntity)
+			resp.Body.Close()
+			if _, err := st.GetCronJob("default", "invalid-zoned"); err == nil {
+				t.Fatal("invalid timeZone was stored on create")
+			}
+
+			resp = do(t, http.MethodPut, objectURL, withZone("zoned", zone))
+			assertStatus(t, resp, http.StatusUnprocessableEntity)
+			resp.Body.Close()
+
+			resp = strategicPatch(t, objectURL, map[string]interface{}{
+				"spec": map[string]interface{}{"timeZone": zone},
+			})
+			assertStatus(t, resp, http.StatusUnprocessableEntity)
+			resp.Body.Close()
+
+			applied, err := json.Marshal(withZone("zoned", zone))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp = applyPatch(t, objectURL, string(applied))
+			assertStatus(t, resp, http.StatusUnprocessableEntity)
+			resp.Body.Close()
+
+			cj, err := st.GetCronJob("default", "zoned")
+			if err != nil {
+				t.Fatalf("get stored CronJob: %v", err)
+			}
+			if cj.Spec.TimeZone == nil || *cj.Spec.TimeZone != "Europe/Belgrade" {
+				t.Fatalf("stored timeZone changed after rejected writes: %v", cj.Spec.TimeZone)
+			}
+		})
+	}
+}
+
+// TestCronJobTimeZoneRendersTimer checks that a valid zone is stored and
+// reaches every generated OnCalendar= line.
+func TestCronJobTimeZoneRendersTimer(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	body := cronJobBody("default", "zoned", "34 0 * * *")
+	body["spec"].(map[string]interface{})["timeZone"] = "Europe/Belgrade"
+	resp := post(t, ts.URL+"/apis/batch/v1/namespaces/default/cronjobs", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	cj, err := st.GetCronJob("default", "zoned")
+	if err != nil {
+		t.Fatalf("created CronJob not persisted: %v", err)
+	}
+	if cj.Spec.TimeZone == nil || *cj.Spec.TimeZone != "Europe/Belgrade" {
+		t.Fatalf("stored timeZone = %v, want Europe/Belgrade", cj.Spec.TimeZone)
+	}
+
+	timer := readTestFile(t, filepath.Join(quadletDir, "default-zoned-cron.timer"))
+	if !strings.Contains(timer, "OnCalendar=*-*-* 0:34:00 Europe/Belgrade\n") {
+		t.Fatalf("timer missing zoned OnCalendar line:\n%s", timer)
+	}
+}
+
 // --- Ingress ---
 
 func ingressBody(ns, name, host, svcName string, svcPort int) map[string]interface{} {

@@ -707,15 +707,31 @@ func CronTimer(name string, cj *batchv1.CronJob) ([]byte, error) {
 		return nil, err
 	}
 
+	// Validate again here: CronTimer also renders objects loaded from disk,
+	// which never went through the API. An invalid zone is dropped rather
+	// than written into the unit file, so the timer falls back to the host
+	// zone. An empty zone means unset, like a nil pointer.
+	timeZone := ""
+	if cj.Spec.TimeZone != nil {
+		if err := ValidateCronTimeZone(*cj.Spec.TimeZone); err == nil {
+			timeZone = *cj.Spec.TimeZone
+		}
+	}
+
 	var b strings.Builder
 
 	b.WriteString("# app.kubernetes.io/managed-by=q8s\n")
 	b.WriteString("[Unit]\n")
 	b.WriteString(fmt.Sprintf("Description=Timer for CronJob %s/%s\n", cj.Namespace, name))
 
+	zoneSuffix := ""
+	if timeZone != "" {
+		zoneSuffix = " " + timeZone
+	}
+
 	b.WriteString("\n[Timer]\n")
 	for _, cal := range cronToCalendars(cj.Spec.Schedule) {
-		b.WriteString(fmt.Sprintf("OnCalendar=%s\n", cal))
+		b.WriteString(fmt.Sprintf("OnCalendar=%s%s\n", cal, zoneSuffix))
 	}
 	b.WriteString("Persistent=true\n")
 

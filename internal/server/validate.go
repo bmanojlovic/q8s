@@ -344,6 +344,22 @@ func validateUserNSSizeAnnotation(kind string, annotations map[string]string) er
 	return nil
 }
 
+// validateCronJobTimeZone rejects a malformed CronJob spec.timeZone. A nil
+// pointer means the field is unset and keeps the controller's local zone, as
+// Kubernetes does. The handler calls this on create, update and patch (and
+// the apply middleware funnels into patch) so an invalid zone fails with 422
+// before the object is stored. The generator validates the zone again for
+// objects that bypass the API.
+func validateCronJobTimeZone(timeZone *string) error {
+	if timeZone == nil {
+		return nil
+	}
+	if err := quadlet.ValidateCronTimeZone(*timeZone); err != nil {
+		return fmt.Errorf("cronjob spec.timeZone: %w", err)
+	}
+	return nil
+}
+
 // validatePodAnnotations rejects q8s pod annotations that cannot be honored
 // by the requested shape. replicas is 0 for a bare Pod. Probe handlers are
 // checked here too, because Pods and Deployments share this choke point and
