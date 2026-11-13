@@ -699,11 +699,9 @@ func (s *Store) UpdatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 // every reader of the store (namespace network attach, Ingress backends,
 // kubectl) saw a stale pod. Done under the lock so a concurrent status update
 // is not lost.
-//
-// A changed spec means the stored object now stands for a new pod, as in
-// Kubernetes: creation time and status are reset so kubectl reports a fresh
-// AGE and the sync loop fills in the new container state. A metadata-only
-// change keeps the existing status. Returns false if the pod is missing.
+// Status and creation time are kept: they are reset by ResetPodForRestart
+// when the template change actually restarts the unit. Returns false if the
+// pod is missing.
 func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
 	s.mu.Lock()
 	key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
@@ -712,8 +710,7 @@ func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
 		s.mu.Unlock()
 		return false
 	}
-	specChanged := !reflect.DeepEqual(existing.Spec, pod.Spec)
-	if !specChanged &&
+	if reflect.DeepEqual(existing.Spec, pod.Spec) &&
 		reflect.DeepEqual(existing.Labels, pod.Labels) &&
 		reflect.DeepEqual(existing.Annotations, pod.Annotations) &&
 		reflect.DeepEqual(existing.OwnerReferences, pod.OwnerReferences) {
@@ -725,10 +722,6 @@ func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
 	updated.Labels = copyStringMap(pod.Labels)
 	updated.Annotations = copyStringMap(pod.Annotations)
 	updated.OwnerReferences = append([]metav1.OwnerReference(nil), pod.OwnerReferences...)
-	if specChanged {
-		updated.CreationTimestamp = metav1.Now()
-		updated.Status = corev1.PodStatus{Phase: corev1.PodPending}
-	}
 	updated.ResourceVersion = s.incRV()
 	s.pods[key] = updated
 	s.mu.Unlock()
@@ -771,6 +764,10 @@ func (s *Store) UpdatePodPhaseState(ns, name string, phase corev1.PodPhase, obs 
 	if !ok {
 		s.mu.Unlock()
 		return
+	}
+	if previousContainer(pod, obs) {
+		phase = corev1.PodPending
+		obs = ContainerSyncState{}
 	}
 	phaseChanged := pod.Status.Phase != phase
 	changed := phaseChanged
@@ -1016,6 +1013,9 @@ func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase,
 			cs.Image = c.Image
 		}
 		obs := states[c.Name]
+		if previousContainer(pod, obs) {
+			obs = ContainerSyncState{Phase: corev1.PodPending}
+		}
 		if applyContainerObservation(&cs, obs, phase) {
 			changed = true
 		}
@@ -1217,6 +1217,48 @@ func podPhaseEvent(ns, name string, phase corev1.PodPhase) (eventType, reason, m
 	default:
 		return "", "", "", false
 	}
+}
+
+// PodReady reports the pod's Ready condition. Deployment readiness counts
+// Ready pods: a Running pod whose container is still starting (or about to be
+// replaced) is not available yet.
+func PodReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// ResetPodForRestart marks a pod whose unit is being restarted for a new
+// template as a new pod, the way Kubernetes replaces the pod on a rollout:
+// creation time now, status back to Pending with no container statuses. Until
+// podman reports a container that started after this moment, the old one is
+// ignored (previousContainer), so the pod is not Ready and kubectl rollout
+// status keeps waiting.
+func (s *Store) ResetPodForRestart(ns, name string) {
+	s.mu.Lock()
+	pod, ok := s.pods[types.NamespacedName{Namespace: ns, Name: name}]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	pod.CreationTimestamp = metav1.Now()
+	pod.Status = corev1.PodStatus{Phase: corev1.PodPending}
+	syncPodConditions(pod)
+	pod.ResourceVersion = s.incRV()
+	s.mu.Unlock()
+	go s.save()
+}
+
+// previousContainer reports whether an observed container started before the
+// pod was created: then it is the container of the pod this one replaced
+// (still running until its unit restarts) and says nothing about this pod.
+// Podman reports start times in whole seconds, hence the truncation.
+func previousContainer(pod *corev1.Pod, obs ContainerSyncState) bool {
+	return obs.Seen && !obs.StartedAt.IsZero() &&
+		obs.StartedAt.Before(pod.CreationTimestamp.Time.Truncate(time.Second))
 }
 
 // --- Services ---

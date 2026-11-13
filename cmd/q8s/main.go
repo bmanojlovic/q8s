@@ -947,6 +947,12 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) map[string][]pod
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, CreationTimestamp: metav1.Now()},
 			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: containerName, Image: c.Image}}},
 		}
+		// The pod existed at least since its container started; the store
+		// ignores containers that started before their pod (see
+		// store.previousContainer), so an imported pod must not look younger.
+		if started := unixSeconds(c.StartedAt); !started.IsZero() && started.Before(pod.CreationTimestamp.Time) {
+			pod.CreationTimestamp = metav1.NewTime(started)
+		}
 		if depName := c.PodDeployment(); depName != "" {
 			dep, _ := st.GetDeployment(ns, depName)
 			owner := metav1.OwnerReference{APIVersion: "apps/v1", Kind: "Deployment", Name: depName, Controller: boolPtr(true)}
@@ -1099,13 +1105,14 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 		if dep.Spec.Replicas != nil && *dep.Spec.Replicas > 1 {
 			n = *dep.Spec.Replicas
 		}
+		// Same rule as the API's derived status: a Ready pod, not just an
+		// active unit. The stored count drives the deployment's
+		// resourceVersion, so a watcher (kubectl rollout status) gets the
+		// MODIFIED event when the new pod becomes Ready.
 		ready := int32(0)
 		for i := int32(0); i < n; i++ {
-			state, err := mgr.UnitState(fmt.Sprintf("%s-%s-%d.service", dep.Namespace, dep.Name, i))
-			if err != nil || state == nil {
-				continue
-			}
-			if state.Active == "active" {
+			pod, err := st.GetPod(dep.Namespace, fmt.Sprintf("%s-%d", dep.Name, i))
+			if err == nil && pod.Status.Phase == corev1.PodRunning && store.PodReady(pod) {
 				ready++
 			}
 		}

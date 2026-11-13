@@ -274,20 +274,13 @@ func TestSyncPodTemplateReplacesTemplateMetadata(t *testing.T) {
 	if updated.UID != created.UID {
 		t.Errorf("UID changed from %q to %q", created.UID, updated.UID)
 	}
-	if !updated.CreationTimestamp.After(createdAt.Time) {
-		t.Errorf("CreationTimestamp = %v, want a time after the old pod's %v", updated.CreationTimestamp, createdAt)
+	// A template change alone keeps the pod's status and creation time;
+	// ResetPodForRestart resets them when the unit is really restarted.
+	if !updated.CreationTimestamp.Equal(&createdAt) {
+		t.Errorf("CreationTimestamp = %v, want the old %v", updated.CreationTimestamp, createdAt)
 	}
-	if updated.Status.Phase != corev1.PodPending {
-		t.Errorf("status phase = %s, want Pending for a new pod", updated.Status.Phase)
-	}
-	if updated.Status.StartTime != nil {
-		t.Errorf("status.startTime = %v, want nil for a new pod", updated.Status.StartTime)
-	}
-	if len(updated.Status.ContainerStatuses) != 0 {
-		t.Errorf("container statuses = %v, want them reset", updated.Status.ContainerStatuses)
-	}
-	if len(updated.Status.Conditions) != 0 {
-		t.Errorf("conditions = %v, want them reset", updated.Status.Conditions)
+	if updated.Status.Phase != corev1.PodRunning {
+		t.Errorf("status phase = %s, want Running kept", updated.Status.Phase)
 	}
 	if updated.ResourceVersion == stored.ResourceVersion {
 		t.Fatalf("expected ResourceVersion to change, still %s", updated.ResourceVersion)
@@ -493,7 +486,8 @@ func TestUpdatePodPhaseStateContainerLifecycle(t *testing.T) {
 	if _, err := st.CreatePod(makePod("default", "app", "img")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
-	started := time.Unix(1700000000, 0).UTC()
+	// After the pod's creation: an earlier start is a previous container.
+	started := time.Now().Add(2 * time.Second).Truncate(time.Second).UTC()
 	exited := started.Add(5 * time.Minute)
 
 	st.UpdatePodPhaseState("default", "app", corev1.PodRunning, store.ContainerSyncState{
@@ -627,9 +621,11 @@ func TestUpdatePodRestartInfoFinishedAt(t *testing.T) {
 	}
 
 	// Podman's exit time is a better value than the observation time.
-	known := metav1.NewTime(time.Now().Add(-time.Minute))
+	// (Times after the pod's creation: an earlier start is a previous
+	// container and is ignored.)
+	known := metav1.NewTime(time.Now().Add(time.Minute).Truncate(time.Second))
 	st.UpdatePodPhaseState("default", "app", corev1.PodFailed, store.ContainerSyncState{
-		Phase: corev1.PodFailed, StartedAt: known.Time.Add(-time.Minute), ExitedAt: known.Time, ExitCode: 2, Seen: true,
+		Phase: corev1.PodFailed, StartedAt: known.Time.Add(-30 * time.Second), ExitedAt: known.Time, ExitCode: 2, Seen: true,
 	})
 	st.UpdatePodRestartInfo("default", "app", 2, 2, true)
 	pod, _ = st.GetPod("default", "app")
@@ -1473,5 +1469,35 @@ func TestWaitingReasonFollowsRestartInfo(t *testing.T) {
 	w := p.Status.ContainerStatuses[0].State.Waiting
 	if w == nil || w.Reason != "CrashLoopBackOff" {
 		t.Fatalf("state = %+v, want waiting CrashLoopBackOff", p.Status.ContainerStatuses[0].State)
+	}
+}
+
+// A restart for a new template resets the pod; until podman reports a
+// container that started after the reset, the old one is ignored and the
+// pod is not Ready, so kubectl rollout status keeps waiting.
+func TestResetPodForRestartIgnoresPreviousContainer(t *testing.T) {
+	st := newStore(t)
+	if _, err := st.CreatePod(makePod("default", "web-0", "img")); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	st.UpdatePodPhaseState("default", "web-0", corev1.PodRunning, store.ContainerSyncState{Phase: corev1.PodRunning, StartedAt: old, Seen: true})
+	if p, _ := st.GetPod("default", "web-0"); store.PodReady(p) {
+		t.Fatal("old container: pod should not be Ready, it started before the pod existed")
+	}
+
+	st.ResetPodForRestart("default", "web-0")
+	p, _ := st.GetPod("default", "web-0")
+	if p.Status.Phase != corev1.PodPending || store.PodReady(p) || time.Since(p.CreationTimestamp.Time) > 5*time.Second {
+		t.Fatalf("after reset: phase=%s ready=%v created=%v", p.Status.Phase, store.PodReady(p), p.CreationTimestamp)
+	}
+	st.UpdatePodPhaseState("default", "web-0", corev1.PodRunning, store.ContainerSyncState{Phase: corev1.PodRunning, StartedAt: old, Seen: true})
+	if p, _ := st.GetPod("default", "web-0"); p.Status.Phase != corev1.PodPending || store.PodReady(p) {
+		t.Fatalf("previous container still counted: phase=%s ready=%v", p.Status.Phase, store.PodReady(p))
+	}
+	fresh := time.Now().Add(time.Second).Truncate(time.Second)
+	st.UpdatePodPhaseState("default", "web-0", corev1.PodRunning, store.ContainerSyncState{Phase: corev1.PodRunning, StartedAt: fresh, Seen: true})
+	if p, _ := st.GetPod("default", "web-0"); p.Status.Phase != corev1.PodRunning || !store.PodReady(p) {
+		t.Fatalf("new container: phase=%s ready=%v", p.Status.Phase, store.PodReady(p))
 	}
 }

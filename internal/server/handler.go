@@ -1806,7 +1806,7 @@ func (s *Server) withDeploymentStatus(dep *appsv1.Deployment) *appsv1.Deployment
 	for i := int32(0); i < desired; i++ {
 		instanceName := fmt.Sprintf("%s-%d", d.Name, i)
 		pod, err := s.config.Store.GetPod(d.Namespace, instanceName)
-		if err == nil && pod.Status.Phase == corev1.PodRunning {
+		if err == nil && pod.Status.Phase == corev1.PodRunning && store.PodReady(pod) {
 			ready++
 		}
 	}
@@ -4258,7 +4258,24 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 	if restart && len(changed) == 0 && !removed && !socketChanged {
 		return
 	}
+	// A restart for a new template replaces the pod, as a rollout does in
+	// Kubernetes: reset it before the restart so rollout status waits for
+	// the new container instead of reporting the old one as ready.
+	if restart && (socketChanged || unitFileChanged(changed)) {
+		s.config.Store.ResetPodForRestart(dep.Namespace, instanceName)
+	}
 	s.reloadAndRun(podUnitNames(dep.Namespace, instanceName, pod.Spec.Containers), restart, removed, socketChanged, changed)
+}
+
+// unitFileChanged reports whether a container or pod unit file was rewritten,
+// which is what makes reloadAndRun restart the instance.
+func unitFileChanged(changed map[string]bool) bool {
+	for name := range changed {
+		if strings.HasSuffix(name, ".container") || strings.HasSuffix(name, ".pod") {
+			return true
+		}
+	}
+	return false
 }
 
 // syncInstancePod stores a freshly materialized Deployment instance: created

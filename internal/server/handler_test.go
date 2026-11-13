@@ -2227,6 +2227,7 @@ func TestDeploymentStatusForRollout(t *testing.T) {
 		name := fmt.Sprintf("roll-%d", i)
 		if _, err := st.CreatePod(&corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "nginx"}}},
 		}); err != nil {
 			t.Fatalf("CreatePod %s: %v", name, err)
 		}
