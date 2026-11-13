@@ -146,6 +146,11 @@ func podStatus(p *corev1.Pod) string {
 			return cs.State.Terminated.Reason
 		}
 	}
+	// kubectl shows a finished pod as Completed (the container's
+	// terminated reason); keep that when no container status says so.
+	if p.Status.Phase == corev1.PodSucceeded {
+		return "Completed"
+	}
 	if p.Status.Phase != "" {
 		return string(p.Status.Phase)
 	}

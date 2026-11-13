@@ -84,6 +84,16 @@ func ContainerName(namespace, cronJob string) string {
 	return fmt.Sprintf("%s-%s-cron", namespace, cronJob)
 }
 
+// JobUnitName is the systemd service unit of a Job.
+func JobUnitName(namespace, job string) string {
+	return fmt.Sprintf("%s-%s-job.service", namespace, job)
+}
+
+// JobContainerName is the Podman container name of a Job.
+func JobContainerName(namespace, job string) string {
+	return fmt.Sprintf("%s-%s-job", namespace, job)
+}
+
 func (s *Source) command(ctx context.Context, args ...string) ([]byte, error) {
 	if s.Run == nil {
 		return nil, errors.New("cronruns: no command runner configured")
@@ -96,11 +106,17 @@ func (s *Source) command(ctx context.Context, args ...string) ([]byte, error) {
 // journalArgs returns the journalctl selection for the manager messages of
 // one CronJob unit.
 func (s *Source) journalArgs(namespace, cronJob string) []string {
+	return s.journalArgsForUnit(UnitName(namespace, cronJob))
+}
+
+// journalArgsForUnit returns the journalctl selection for the manager
+// messages of one unit.
+func (s *Source) journalArgsForUnit(unit string) []string {
 	args := make([]string, 0, 12)
 	if !s.Rootful {
 		args = append(args, "--user")
 	}
-	args = append(args, "-u", UnitName(namespace, cronJob), "-o", "json", "-n", "400",
+	args = append(args, "-u", unit, "-o", "json", "-n", "400",
 		"MESSAGE_ID="+MessageIDStarted,
 		"MESSAGE_ID="+MessageIDExited,
 		"MESSAGE_ID="+MessageIDSucceeded,
@@ -110,19 +126,28 @@ func (s *Source) journalArgs(namespace, cronJob string) []string {
 }
 
 // LogArgs returns the journalctl arguments that select the output of one run.
-// Rootful journals use INVOCATION_ID, rootless user journals the same value
-// under USER_INVOCATION_ID; container output always carries
-// _SYSTEMD_INVOCATION_ID, so that is the field to match here.
 func (s *Source) LogArgs(namespace, cronJob, invocationID string, opt LogOptions) []string {
+	return s.LogArgsForUnit(UnitName(namespace, cronJob), ContainerName(namespace, cronJob), invocationID, opt)
+}
+
+// LogArgsForUnit returns the journalctl arguments that select the output of
+// one unit run. Rootful journals use INVOCATION_ID, rootless user journals the
+// same value under USER_INVOCATION_ID; container output always carries
+// _SYSTEMD_INVOCATION_ID, so that is the field to match here. An empty
+// invocationID selects every run of the unit.
+func (s *Source) LogArgsForUnit(unit, container, invocationID string, opt LogOptions) []string {
 	args := make([]string, 0, 16)
 	if !s.Rootful {
 		args = append(args, "--user")
 	}
-	args = append(args,
-		"-u", UnitName(namespace, cronJob),
-		"CONTAINER_NAME="+ContainerName(namespace, cronJob),
-		"_SYSTEMD_INVOCATION_ID="+invocationID,
-		"-o", "json")
+	args = append(args, "-u", unit)
+	if container != "" {
+		args = append(args, "CONTAINER_NAME="+container)
+	}
+	if invocationID != "" {
+		args = append(args, "_SYSTEMD_INVOCATION_ID="+invocationID)
+	}
+	args = append(args, "-o", "json")
 	if opt.TailLines != nil {
 		args = append(args, "-n", strconv.FormatInt(*opt.TailLines, 10))
 	}
@@ -138,7 +163,13 @@ func (s *Source) LogArgs(namespace, cronJob, invocationID string, opt LogOptions
 // Runs returns the run history of one CronJob, newest first. History limits
 // are a server concern and are not applied here.
 func (s *Source) Runs(ctx context.Context, namespace, cronJob string) ([]Run, error) {
-	out, err := s.command(ctx, s.journalArgs(namespace, cronJob)...)
+	return s.RunsForUnit(ctx, UnitName(namespace, cronJob))
+}
+
+// RunsForUnit returns the run history of one unit, newest first. History
+// limits are a server concern and are not applied here.
+func (s *Source) RunsForUnit(ctx context.Context, unit string) ([]Run, error) {
+	out, err := s.command(ctx, s.journalArgsForUnit(unit)...)
 	if len(out) == 0 {
 		if err != nil {
 			return nil, fmt.Errorf("journalctl: %w", err)

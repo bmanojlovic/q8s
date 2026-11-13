@@ -143,12 +143,15 @@ func (s *Server) cronRunFindJob(ctx context.Context, ns, name string) (*batchv1.
 	return nil, false
 }
 
-// getPod returns a stored pod, falling back to a CronJob run with the same
-// name. A stored object always wins.
+// getPod returns a stored pod, falling back to a derived Job pod and then a
+// CronJob run with the same name. A stored object always wins.
 func (s *Server) getPod(ctx context.Context, ns, name string) (*corev1.Pod, error) {
 	pod, err := s.config.Store.GetPod(ns, name)
 	if err == nil {
 		return pod, nil
+	}
+	if jobPod, ok := s.jobPodFindPod(ctx, ns, name); ok {
+		return jobPod, nil
 	}
 	if run, ok := s.cronRunFindPod(ctx, ns, name); ok {
 		return run, nil
@@ -161,6 +164,7 @@ func (s *Server) getPod(ctx context.Context, ns, name string) (*corev1.Pod, erro
 func (s *Server) getJob(ctx context.Context, ns, name string) (*batchv1.Job, error) {
 	job, err := s.config.Store.GetJob(ns, name)
 	if err == nil {
+		ensureJobPodIdentity(job)
 		return job, nil
 	}
 	if run, ok := s.cronRunFindJob(ctx, ns, name); ok {
@@ -513,6 +517,16 @@ func cronRunResourceVersion(kind string, run cronruns.Run) string {
 // journal. The pod's template container name is only one container; its
 // journald output is selected by CONTAINER_NAME and the run's invocation id.
 func (s *Server) handleCronRunPodLogs(w http.ResponseWriter, r *http.Request, pod *corev1.Pod) {
+	cronJob := pod.Labels[cronRunCronJobLabel]
+	s.handleJournalPodLogs(w, r, pod,
+		cronruns.UnitName(pod.Namespace, cronJob),
+		cronruns.ContainerName(pod.Namespace, cronJob))
+}
+
+// handleJournalPodLogs serves a synthetic pod's log subresource from one
+// systemd unit. The invocation id annotation selects the newest run; without
+// it every run of the unit is returned.
+func (s *Server) handleJournalPodLogs(w http.ResponseWriter, r *http.Request, pod *corev1.Pod, unit, container string) {
 	src := s.config.CronRuns
 	if src == nil {
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "pod %q not found", pod.Name)
@@ -520,7 +534,6 @@ func (s *Server) handleCronRunPodLogs(w http.ResponseWriter, r *http.Request, po
 	}
 	q := r.URL.Query()
 	invocationID := pod.Annotations[cronRunInvocationAnnotation]
-	cronJob := pod.Labels[cronRunCronJobLabel]
 
 	opt := cronruns.LogOptions{Follow: q.Get("follow") == "true" && pod.Status.Phase == corev1.PodRunning}
 	if tail := q.Get("tailLines"); tail != "" {
@@ -542,7 +555,7 @@ func (s *Server) handleCronRunPodLogs(w http.ResponseWriter, r *http.Request, po
 			opt.Since = t
 		}
 	}
-	args := src.LogArgs(pod.Namespace, cronJob, invocationID, opt)
+	args := src.LogArgsForUnit(unit, container, invocationID, opt)
 	timestamps := q.Get("timestamps") == "true"
 
 	if opt.Follow && src.Stream != nil {
@@ -619,7 +632,12 @@ func writeJournalLogLine(w io.Writer, line []byte, timestamps bool) {
 // and its predecessor's runs must not show up as its own.
 // creationTimestamp has second precision, so compare at that precision.
 func runsSince(runs []cronruns.Run, cj *batchv1.CronJob) []cronruns.Run {
-	created := cj.CreationTimestamp.Time
+	return runsSinceTime(runs, cj.CreationTimestamp.Time)
+}
+
+// runsSinceTime is runsSince for a plain creation timestamp. Job units are
+// named the same way and can be reused after a delete and create too.
+func runsSinceTime(runs []cronruns.Run, created time.Time) []cronruns.Run {
 	if created.IsZero() {
 		return runs
 	}

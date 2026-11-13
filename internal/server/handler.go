@@ -821,6 +821,9 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 	if s.rejectCronRunPodWrite(w, r, ns, name) {
 		return
 	}
+	if s.rejectJobPodWrite(w, r, ns, name) {
+		return
+	}
 	dry, ok := s.dryRunWrite(w, r)
 	if !ok {
 		return
@@ -829,7 +832,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
-			respondListMerged(w, r, s, func() []*corev1.Pod { return s.config.Store.Pods(ns) }, s.cronRunPodsExtra(r.Context(), ns), podsToTable,
+			respondListMerged(w, r, s, func() []*corev1.Pod { return s.config.Store.Pods(ns) }, s.derivedPodsExtra(r.Context(), ns), podsToTable,
 				func(items []corev1.Pod) *corev1.PodList {
 					return &corev1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}, Items: items}
 				})
@@ -1056,6 +1059,10 @@ func (s *Server) podContainerName(ns, podName, requested string) string {
 
 func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request, ns, name string) {
 	if _, err := s.config.Store.GetPod(ns, name); err != nil {
+		if pod, ok := s.jobPodFindPod(r.Context(), ns, name); ok {
+			s.handleJobPodLogs(w, r, pod)
+			return
+		}
 		if pod, ok := s.cronRunFindPod(r.Context(), ns, name); ok {
 			s.handleCronRunPodLogs(w, r, pod)
 			return
@@ -2097,7 +2104,7 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, resource string) {
 	switch resource {
 	case "pods":
-		respondListMerged(w, r, s, s.config.Store.AllPods, s.cronRunPodsExtra(r.Context(), ""), podsToTable,
+		respondListMerged(w, r, s, s.config.Store.AllPods, s.derivedPodsExtra(r.Context(), ""), podsToTable,
 			func(items []corev1.Pod) *corev1.PodList {
 				return &corev1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}, Items: items}
 			})
@@ -2372,7 +2379,7 @@ func (s *Server) handleBatchNamespaced(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBatchClusterList(w http.ResponseWriter, r *http.Request, resource string) {
 	switch resource {
 	case "jobs":
-		respondListMerged(w, r, s, s.config.Store.AllJobs, s.cronRunJobsExtra(r.Context(), ""), jobsToTable,
+		respondListMerged(w, r, s, func() []*batchv1.Job { return normalizeJobs(s.config.Store.AllJobs()) }, s.cronRunJobsExtra(r.Context(), ""), jobsToTable,
 			func(items []batchv1.Job) *batchv1.JobList {
 				return &batchv1.JobList{TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1", Kind: "JobList"}, Items: items}
 			})
@@ -2395,7 +2402,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
-			respondListMerged(w, r, s, func() []*batchv1.Job { return s.config.Store.Jobs(ns) }, s.cronRunJobsExtra(r.Context(), ns), jobsToTable,
+			respondListMerged(w, r, s, func() []*batchv1.Job { return normalizeJobs(s.config.Store.Jobs(ns)) }, s.cronRunJobsExtra(r.Context(), ns), jobsToTable,
 				func(items []batchv1.Job) *batchv1.JobList {
 					return &batchv1.JobList{TypeMeta: metav1.TypeMeta{APIVersion: "batch/v1", Kind: "JobList"}, Items: items}
 				})
@@ -2441,6 +2448,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		ensureJobPodIdentity(&job)
 		created, err := s.config.Store.CreateJob(&job)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -2491,6 +2499,12 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
 		}
+		// Compare the templates with the derived Pod identity applied to
+		// both sides: a Job stored before this defaulting existed still
+		// accepts a PUT that repeats its user template, and the template
+		// labels added at create time cannot be removed by a PUT.
+		ensureJobPodIdentity(&job)
+		ensureJobPodIdentity(existing)
 		// A Job's pod template is immutable, as in Kubernetes. Only
 		// metadata (labels, annotations) can change through a PUT.
 		if !equality.Semantic.DeepEqual(job.Spec.Template, existing.Spec.Template) {
@@ -2561,6 +2575,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		ensureJobPodIdentity(&patched)
 		updated, err := s.config.Store.UpdateJob(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())

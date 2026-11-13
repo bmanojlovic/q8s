@@ -34,6 +34,14 @@ Every pod spec q8s accepts must contain exactly one container; specs with additi
 A Job's pod template is immutable: a PUT that changes `spec.template` is
 rejected with 422, matching Kubernetes.
 
+A stored Job gets `spec.selector` matching `job-name=<name>` and the
+`job-name` and `batch.kubernetes.io/job-name` template labels when it is
+created without them; updates keep them. One Pod named `<job name>-run` is
+derived from it on read, with its phase taken from the Job's systemd unit
+state (and the newest run in the journal when that is available).
+`kubectl logs job/<name>` uses the job unit's output. Deleting the Job
+removes the derived Pod, and writes to that Pod answer 405.
+
 A CronJob run appears as a Job named `<cronjob>-<start unix minutes>` and a
 Pod named `<job name>-run`; older runs in the same minute get a `-2`, `-3`
 suffix. Nothing new is stored: both objects are derived from the systemd
