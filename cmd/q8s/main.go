@@ -1098,7 +1098,9 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 			obs.ExitCode = int(state.ExitCode)
 		}
 		st.UpdatePodPhaseState(pod.Namespace, pod.Name, unitPhase(pod, state, infos), obs)
-		st.UpdatePodRestartInfo(pod.Namespace, pod.Name, int32(state.NRestarts), int32(state.ExitCode), state.Result != "")
+		// Exited is systemd's auto-restart window, the only time the ended
+		// run's exit status is still readable.
+		st.UpdatePodRestartInfo(pod.Namespace, pod.Name, int32(state.NRestarts), int32(state.ExitCode), state.Sub == "auto-restart")
 	}
 	for _, dep := range st.AllDeployments() {
 		n := int32(1)

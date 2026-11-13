@@ -582,58 +582,6 @@ func TestUpdatePodPhaseStateWaitingWithoutContainer(t *testing.T) {
 	}
 }
 
-func TestUpdatePodRestartInfoFinishedAt(t *testing.T) {
-	st := newStore(t)
-	if _, err := st.CreatePod(makePod("default", "app", "img")); err != nil {
-		t.Fatalf("CreatePod: %v", err)
-	}
-
-	st.UpdatePodRestartInfo("default", "app", 0, 1, true)
-	pod, _ := st.GetPod("default", "app")
-	first := pod.Status.ContainerStatuses[0].LastTerminationState.Terminated
-	if first == nil || first.FinishedAt.IsZero() {
-		t.Fatalf("lastTerminationState = %+v, want a finishedAt", first)
-	}
-	finished := first.FinishedAt
-	rv := pod.ResourceVersion
-
-	// The same restart observed again keeps the timestamp and the RV.
-	st.UpdatePodRestartInfo("default", "app", 0, 1, true)
-	pod, _ = st.GetPod("default", "app")
-	again := pod.Status.ContainerStatuses[0].LastTerminationState.Terminated
-	if !again.FinishedAt.Equal(&finished) {
-		t.Errorf("finishedAt changed from %v to %v without a new restart", finished, again.FinishedAt)
-	}
-	if pod.ResourceVersion != rv {
-		t.Errorf("repeat restart observation bumped ResourceVersion from %s to %s", rv, pod.ResourceVersion)
-	}
-
-	// A new restart (count increase) records a new finishedAt.
-	time.Sleep(5 * time.Millisecond)
-	st.UpdatePodRestartInfo("default", "app", 1, 1, true)
-	pod, _ = st.GetPod("default", "app")
-	cs := pod.Status.ContainerStatuses[0]
-	if cs.RestartCount != 1 {
-		t.Fatalf("RestartCount = %d, want 1", cs.RestartCount)
-	}
-	if !cs.LastTerminationState.Terminated.FinishedAt.After(finished.Time) {
-		t.Errorf("finishedAt = %v, want after the previous %v", cs.LastTerminationState.Terminated.FinishedAt, finished)
-	}
-
-	// Podman's exit time is a better value than the observation time.
-	// (Times after the pod's creation: an earlier start is a previous
-	// container and is ignored.)
-	known := metav1.NewTime(time.Now().Add(time.Minute).Truncate(time.Second))
-	st.UpdatePodPhaseState("default", "app", corev1.PodFailed, store.ContainerSyncState{
-		Phase: corev1.PodFailed, StartedAt: known.Time.Add(-30 * time.Second), ExitedAt: known.Time, ExitCode: 2, Seen: true,
-	})
-	st.UpdatePodRestartInfo("default", "app", 2, 2, true)
-	pod, _ = st.GetPod("default", "app")
-	if got := pod.Status.ContainerStatuses[0].LastTerminationState.Terminated.FinishedAt.Time; !got.Equal(known.Time) {
-		t.Errorf("finishedAt = %v, want Podman's %v", got, known.Time)
-	}
-}
-
 func TestUpdatePodRestartInfo(t *testing.T) {
 	st := newStore(t)
 	st.CreatePod(makePod("default", "app", "img"))
@@ -1499,5 +1447,61 @@ func TestResetPodForRestartIgnoresPreviousContainer(t *testing.T) {
 	st.UpdatePodPhaseState("default", "web-0", corev1.PodRunning, store.ContainerSyncState{Phase: corev1.PodRunning, StartedAt: fresh, Seen: true})
 	if p, _ := st.GetPod("default", "web-0"); p.Status.Phase != corev1.PodRunning || !store.PodReady(p) {
 		t.Fatalf("new container: phase=%s ready=%v", p.Status.Phase, store.PodReady(p))
+	}
+}
+
+// kubectl describe prints Last State's Started unconditionally, so a restart
+// must carry the start of the run that ended, not null or an older run's.
+func TestLastStateStartedAtIsTheEndedRun(t *testing.T) {
+	st := newStore(t)
+	if _, err := st.CreatePod(makePod("default", "r", "img")); err != nil {
+		t.Fatal(err)
+	}
+	run1 := time.Now().Add(2 * time.Second).Truncate(time.Second)
+	st.UpdatePodPhaseState("default", "r", corev1.PodRunning, store.ContainerSyncState{Phase: corev1.PodRunning, StartedAt: run1, Seen: true})
+	// The container exits and is removed (--rm): podman lists nothing.
+	st.UpdatePodPhaseState("default", "r", corev1.PodRunning, store.ContainerSyncState{})
+	st.UpdatePodRestartInfo("default", "r", 1, 3, true)
+	p, _ := st.GetPod("default", "r")
+	if got := p.Status.ContainerStatuses[0].LastTerminationState.Terminated.StartedAt.Time; !got.Equal(run1) {
+		t.Fatalf("restart 1 startedAt = %v, want %v", got, run1)
+	}
+
+	run2 := run1.Add(10 * time.Second)
+	st.UpdatePodPhaseState("default", "r", corev1.PodRunning, store.ContainerSyncState{Phase: corev1.PodRunning, StartedAt: run2, Seen: true})
+	st.UpdatePodPhaseState("default", "r", corev1.PodRunning, store.ContainerSyncState{})
+	st.UpdatePodRestartInfo("default", "r", 2, 3, true)
+	p, _ = st.GetPod("default", "r")
+	if got := p.Status.ContainerStatuses[0].LastTerminationState.Terminated.StartedAt.Time; !got.Equal(run2) {
+		t.Fatalf("restart 2 startedAt = %v, want %v (not the older run)", got, run2)
+	}
+}
+
+// Once the restarted container runs again systemd reports exit status 0 for
+// the new run; that must not overwrite the ended run's exit code, and the
+// ended run's start must not be replaced by the new run's.
+func TestLastStateSurvivesTheNextRun(t *testing.T) {
+	st := newStore(t)
+	if _, err := st.CreatePod(makePod("default", "n", "img")); err != nil {
+		t.Fatal(err)
+	}
+	run1 := time.Now().Add(2 * time.Second).Truncate(time.Second)
+	run2 := run1.Add(10 * time.Second)
+	st.UpdatePodPhaseState("default", "n", corev1.PodRunning, store.ContainerSyncState{Phase: corev1.PodRunning, StartedAt: run1, Seen: true})
+	// Auto-restart window: container gone, systemd reports exit 3.
+	st.UpdatePodPhaseState("default", "n", corev1.PodRunning, store.ContainerSyncState{})
+	st.UpdatePodRestartInfo("default", "n", 0, 3, true)
+	st.UpdatePodRestartInfo("default", "n", 0, 3, true) // same window again: no change
+	// Next run: counter up, status 0, not exited.
+	st.UpdatePodPhaseState("default", "n", corev1.PodRunning, store.ContainerSyncState{Phase: corev1.PodRunning, StartedAt: run2, Seen: true})
+	st.UpdatePodRestartInfo("default", "n", 1, 0, false)
+	p, _ := st.GetPod("default", "n")
+	cs := p.Status.ContainerStatuses[0]
+	last := cs.LastTerminationState.Terminated
+	if cs.RestartCount != 1 || last == nil || last.ExitCode != 3 || last.Reason != "Error" {
+		t.Fatalf("restarts=%d lastState=%+v, want 1 and exit 3 Error", cs.RestartCount, last)
+	}
+	if !last.StartedAt.Time.Equal(run1) || last.FinishedAt.IsZero() {
+		t.Fatalf("lastState started=%v finished=%v, want started %v and a finish time", last.StartedAt, last.FinishedAt, run1)
 	}
 }

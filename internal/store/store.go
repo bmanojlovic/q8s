@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,12 @@ type Store struct {
 	middlewares      map[types.NamespacedName]*traefik.Middleware
 	ingressRouteTCPs map[types.NamespacedName]*traefik.IngressRouteTCP
 	resourceVer      int
+
+	// runStarts remembers, in memory only, when each container's current
+	// run started (ns/pod/container). By the time a restart is recorded the
+	// container state has already moved from running to waiting, so this is
+	// where lastState.terminated.startedAt comes from.
+	runStarts map[string]runStart
 
 	notifyMu sync.Mutex
 	notifyCh chan struct{}
@@ -154,6 +161,7 @@ func (s *Store) Events(ns string) []*corev1.Event {
 
 func newEmpty() *Store {
 	return &Store{
+		runStarts:        make(map[string]runStart),
 		pods:             make(map[types.NamespacedName]*corev1.Pod),
 		services:         make(map[types.NamespacedName]*corev1.Service),
 		pvcs:             make(map[types.NamespacedName]*corev1.PersistentVolumeClaim),
@@ -531,6 +539,7 @@ func (s *Store) PurgeNamespace(name string) {
 	for key := range s.pods {
 		if key.Namespace == name {
 			delete(s.pods, key)
+			s.forgetRunStarts(key)
 		}
 	}
 	for key := range s.services {
@@ -668,6 +677,7 @@ func (s *Store) DeletePod(ns, name string) error {
 		return fmt.Errorf("pod %q not found in namespace %q", name, ns)
 	}
 	delete(s.pods, key)
+	s.forgetRunStarts(key)
 	s.mu.Unlock()
 	go s.save()
 	s.recordEvent("Pod", ns, name, pod.UID, corev1.EventTypeNormal, "Deleted",
@@ -790,6 +800,7 @@ func (s *Store) UpdatePodPhaseState(ns, name string, phase corev1.PodPhase, obs 
 		if applyContainerObservation(cs, obs, phase) {
 			changed = true
 		}
+		s.noteRunStart(pod, cs)
 		// A health check exists when health is non-empty: Ready then needs
 		// Podman to report it healthy, not just running.
 		ready := running && !isCrashLooping(cs) && (obs.Health == "" || obs.Health == "healthy")
@@ -1019,6 +1030,7 @@ func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase,
 		if applyContainerObservation(&cs, obs, phase) {
 			changed = true
 		}
+		s.noteRunStart(pod, &cs)
 		ready := obs.Phase == corev1.PodRunning && !isCrashLooping(&cs) &&
 			(obs.Health == "" || obs.Health == "healthy")
 		if cs.Ready != ready {
@@ -1087,32 +1099,26 @@ func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCo
 	changed := false
 	for i := range pod.Status.ContainerStatuses {
 		cs := &pod.Status.ContainerStatuses[i]
-		countIncreased := restartCount > cs.RestartCount
 		if cs.RestartCount != restartCount {
 			cs.RestartCount = restartCount
 			changed = true
 		}
+		// hasExited means the unit is in systemd's auto-restart window: the
+		// container exited and systemd still reports that run's exit
+		// status. That is the only moment the exit code is known (the
+		// restart counter goes up only when the next run starts, and by
+		// then the status reads 0), so the last state is recorded here,
+		// once per ended run.
 		if hasExited {
+			startedAt := s.endedRunStart(pod, cs)
+			if cs.State.Terminated != nil && !cs.State.Terminated.StartedAt.IsZero() {
+				startedAt = cs.State.Terminated.StartedAt
+			}
 			existing := cs.LastTerminationState.Terminated
-			if existing == nil || existing.ExitCode != exitCode || existing.Reason != reason || countIncreased {
-				finishedAt := metav1.Time{}
-				switch {
-				case existing != nil && !countIncreased:
-					// Same restart observed again: keep the timestamp, no churn.
-					finishedAt = existing.FinishedAt
-				case cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero():
-					// Podman knows when the container exited, which is better
-					// than the moment the restart was observed.
+			if existing == nil || !existing.StartedAt.Equal(&startedAt) || existing.ExitCode != exitCode {
+				finishedAt := metav1.Now()
+				if cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero() {
 					finishedAt = cs.State.Terminated.FinishedAt
-				default:
-					finishedAt = metav1.Now()
-				}
-				startedAt := metav1.Time{}
-				if existing != nil {
-					startedAt = existing.StartedAt
-				}
-				if startedAt.IsZero() && cs.State.Terminated != nil {
-					startedAt = cs.State.Terminated.StartedAt
 				}
 				cs.LastTerminationState = corev1.ContainerState{
 					Terminated: &corev1.ContainerStateTerminated{
@@ -1125,6 +1131,7 @@ func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCo
 				changed = true
 			}
 		}
+
 		// Mark not ready when crash-looping
 		if restartCount > 0 && exitCode != 0 && cs.Ready {
 			cs.Ready = false
@@ -1229,6 +1236,52 @@ func PodReady(pod *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func runKey(pod *corev1.Pod, container string) string {
+	return pod.Namespace + "/" + pod.Name + "/" + container
+}
+
+// forgetRunStarts drops the remembered run starts of a deleted pod. Caller
+// holds s.mu.
+func (s *Store) forgetRunStarts(key types.NamespacedName) {
+	prefix := key.Namespace + "/" + key.Name + "/"
+	for k := range s.runStarts {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.runStarts, k)
+		}
+	}
+}
+
+// runStart is the start of a container's current run and of the run before
+// it: the sync pass may already see the new run before the restart that
+// ended the previous one is recorded.
+type runStart struct {
+	cur, prev metav1.Time
+}
+
+// noteRunStart remembers the start of a running container's current run.
+// Caller holds s.mu.
+func (s *Store) noteRunStart(pod *corev1.Pod, cs *corev1.ContainerStatus) {
+	if cs.State.Running == nil || cs.State.Running.StartedAt.IsZero() {
+		return
+	}
+	k := runKey(pod, cs.Name)
+	r := s.runStarts[k]
+	if !r.cur.Equal(&cs.State.Running.StartedAt) {
+		r.prev, r.cur = r.cur, cs.State.Running.StartedAt
+		s.runStarts[k] = r
+	}
+}
+
+// endedRunStart is the start of the run a newly recorded restart ended: the
+// previous run when the container already runs again, else the current one.
+func (s *Store) endedRunStart(pod *corev1.Pod, cs *corev1.ContainerStatus) metav1.Time {
+	r := s.runStarts[runKey(pod, cs.Name)]
+	if cs.State.Running != nil && r.cur.Equal(&cs.State.Running.StartedAt) {
+		return r.prev
+	}
+	return r.cur
 }
 
 // ResetPodForRestart marks a pod whose unit is being restarted for a new
