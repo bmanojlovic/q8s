@@ -1216,3 +1216,35 @@ func settledTempDir(t *testing.T) string {
 	})
 	return dir
 }
+
+// kubectl run --attach waits for the Ready condition, so the conditions must
+// follow the containers' readiness.
+func TestPodConditionsFollowReadiness(t *testing.T) {
+	s := store.New()
+	if _, err := s.CreatePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "default"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cond := func() map[corev1.PodConditionType]corev1.ConditionStatus {
+		p, _ := s.GetPod("default", "c")
+		m := map[corev1.PodConditionType]corev1.ConditionStatus{}
+		for _, c := range p.Status.Conditions {
+			m[c.Type] = c.Status
+		}
+		return m
+	}
+	s.UpdatePodPhase("default", "c", corev1.PodPending, "")
+	if got := cond(); got[corev1.PodReady] != corev1.ConditionFalse || got[corev1.PodScheduled] != corev1.ConditionTrue {
+		t.Fatalf("pending: %v", got)
+	}
+	s.UpdatePodPhase("default", "c", corev1.PodRunning, "")
+	if got := cond(); got[corev1.PodReady] != corev1.ConditionTrue || got[corev1.ContainersReady] != corev1.ConditionTrue {
+		t.Fatalf("running: %v", got)
+	}
+	s.UpdatePodPhase("default", "c", corev1.PodRunning, "down")
+	if got := cond(); got[corev1.PodReady] != corev1.ConditionFalse {
+		t.Fatalf("down: %v", got)
+	}
+}

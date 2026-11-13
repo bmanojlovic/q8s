@@ -303,6 +303,7 @@ func renderContainer(r containerRender) ([]byte, error) {
 	}
 
 	writeResourceLimits(&b, c.Resources.Limits)
+	writePodRunFlags(&b, pod.Spec, c)
 	writeGPUDevice(&b, c.Resources.Limits)
 	if err := writeUlimits(&b, pod.Annotations); err != nil {
 		return nil, err

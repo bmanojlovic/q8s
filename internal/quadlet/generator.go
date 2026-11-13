@@ -102,6 +102,36 @@ func writeResourceLimits(b *strings.Builder, limits corev1.ResourceList) {
 	}
 }
 
+// containerPrivileged reports whether the container asks for a privileged
+// container. A nil securityContext or a nil privileged field means false.
+func containerPrivileged(c corev1.Container) bool {
+	return c.SecurityContext != nil && c.SecurityContext.Privileged != nil && *c.SecurityContext.Privileged
+}
+
+// writePodRunFlags translates the container and pod settings that have no
+// native quadlet key onto podman run flags through PodmanArgs=. The pod's host
+// namespaces are set per container (podman accepts --pid=host and --ipc=host
+// on a container inside a pod), and stdin/tty are per container. Quadlet runs
+// `podman run -d`, so conmon owns the pty and keeps stdin open, which is what
+// the attach subresource connects to.
+func writePodRunFlags(b *strings.Builder, spec corev1.PodSpec, c corev1.Container) {
+	if containerPrivileged(c) {
+		b.WriteString("PodmanArgs=--privileged\n")
+	}
+	if spec.HostPID {
+		b.WriteString("PodmanArgs=--pid=host\n")
+	}
+	if spec.HostIPC {
+		b.WriteString("PodmanArgs=--ipc=host\n")
+	}
+	if c.Stdin {
+		b.WriteString("PodmanArgs=--interactive\n")
+	}
+	if c.TTY {
+		b.WriteString("PodmanArgs=--tty\n")
+	}
+}
+
 // GPULimitResource is the extended resource name Kubernetes uses to request
 // an NVIDIA GPU. q8s does not allocate individual devices: any request of at
 // least one maps to the CDI device name nvidia.com/gpu=all, which podman
@@ -204,15 +234,30 @@ func SetUserNS(enabled bool) func() {
 }
 
 // podUsesUserNS reports whether this pod gets UserNS=auto. A user namespace
-// combined with the host network namespace gains no isolation and cannot bind
-// host ports below 1024, so hostNetwork pods stay in the host user namespace.
+// combined with a host namespace (network, PID or IPC) gains no isolation:
+// the workloads can already see or signal host processes, and hostNetwork
+// pods additionally cannot bind host ports below 1024. A privileged container
+// needs the host user namespace for the same reason: full capabilities in a
+// user namespace still cannot reach host resources, and nsenter into host
+// PID 1 needs the host user namespace. Any privileged container, including an
+// init container, therefore keeps the whole pod in the host user namespace.
 // hostUsers: true is the Kubernetes opt-out (pod.spec.hostUsers, KEP-127).
 func podUsesUserNS(spec corev1.PodSpec) bool {
 	if !userNSEnabled {
 		return false
 	}
-	if spec.HostNetwork {
+	if spec.HostNetwork || spec.HostPID || spec.HostIPC {
 		return false
+	}
+	for _, c := range spec.InitContainers {
+		if containerPrivileged(c) {
+			return false
+		}
+	}
+	for _, c := range spec.Containers {
+		if containerPrivileged(c) {
+			return false
+		}
 	}
 	return spec.HostUsers == nil || !*spec.HostUsers
 }
@@ -394,6 +439,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 	}
 
 	writeResourceLimits(&b, spec.Containers[0].Resources.Limits)
+	writePodRunFlags(&b, spec, spec.Containers[0])
 
 	if envFile != "" {
 		if err := validatePath("envFile", envFile); err != nil {
@@ -547,6 +593,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 	}
 
 	writeResourceLimits(&b, spec.Containers[0].Resources.Limits)
+	writePodRunFlags(&b, spec, spec.Containers[0])
 
 	if envFile != "" {
 		if err := validatePath("envFile", envFile); err != nil {

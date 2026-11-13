@@ -146,7 +146,23 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	if _, dry := r.URL.Query()["dryRun"]; dry && r.Method != http.MethodGet && !isPodWritePath(r.URL.Path) {
+		// Only pods honor dryRun. Refusing it elsewhere is safer than the
+		// alternative of running the write for real.
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "dryRun is only supported for pods")
+		return
+	}
 	s.handler.ServeHTTP(w, r)
+}
+
+// isPodWritePath reports whether path is /api/v1/namespaces/NS/pods or
+// /api/v1/namespaces/NS/pods/NAME, the only paths that honor dryRun.
+func isPodWritePath(path string) bool {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 5 && len(parts) != 6 {
+		return false
+	}
+	return parts[0] == "api" && parts[1] == "v1" && parts[2] == "namespaces" && parts[4] == "pods"
 }
 
 func (s *Server) setupRoutes() {

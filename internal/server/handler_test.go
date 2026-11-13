@@ -778,6 +778,21 @@ func TestPVCCRUD(t *testing.T) {
 	resp.Body.Close()
 }
 
+func newTestServerWithConfigDir(t *testing.T, st *store.Store, configDir string) *server.Server {
+	t.Helper()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:     st,
+		CertPEM:   certPEM,
+		KeyPEM:    keyPEM,
+		ConfigDir: configDir,
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	return srv
+}
+
 func newTestServerWithQuadletDir(t *testing.T, st *store.Store, quadletDir string) *server.Server {
 	t.Helper()
 	certPEM, keyPEM := genTestCert(t)

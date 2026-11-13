@@ -775,6 +775,9 @@ func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase, health st
 			changed = true
 		}
 	}
+	if syncPodConditions(pod) {
+		changed = true
+	}
 	if changed {
 		pod.ResourceVersion = s.incRV()
 	}
@@ -854,6 +857,9 @@ func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase,
 	}
 	pod.Status.ContainerStatuses = statuses
 
+	if syncPodConditions(pod) {
+		changed = true
+	}
 	if changed {
 		pod.ResourceVersion = s.incRV()
 	}
@@ -917,6 +923,9 @@ func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCo
 			changed = true
 		}
 	}
+	if syncPodConditions(pod) {
+		changed = true
+	}
 	if changed {
 		pod.ResourceVersion = s.incRV()
 	}
@@ -924,6 +933,52 @@ func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCo
 	if changed {
 		go s.save()
 	}
+}
+
+// syncPodConditions derives the pod conditions from the container statuses:
+// PodScheduled and Initialized are always true on the single node, Ready and
+// ContainersReady follow the containers' ready flags. kubectl run --attach
+// (and kubectl wait --for=condition=Ready) wait for Ready=True, so a pod
+// without conditions was never attachable. A condition keeps its
+// lastTransitionTime while its status does not change. Reports whether
+// anything changed.
+func syncPodConditions(pod *corev1.Pod) bool {
+	ready := len(pod.Status.ContainerStatuses) > 0
+	for _, cs := range pod.Status.ContainerStatuses {
+		if !cs.Ready {
+			ready = false
+		}
+	}
+	want := map[corev1.PodConditionType]bool{
+		corev1.PodScheduled:    true,
+		corev1.PodInitialized:  true,
+		corev1.ContainersReady: ready,
+		corev1.PodReady:        ready,
+	}
+	order := []corev1.PodConditionType{corev1.PodScheduled, corev1.PodInitialized, corev1.ContainersReady, corev1.PodReady}
+	existing := make(map[corev1.PodConditionType]corev1.PodCondition, len(pod.Status.Conditions))
+	for _, c := range pod.Status.Conditions {
+		existing[c.Type] = c
+	}
+	changed := len(pod.Status.Conditions) != len(order)
+	now := metav1.Now()
+	conds := make([]corev1.PodCondition, 0, len(order))
+	for _, t := range order {
+		status := corev1.ConditionFalse
+		if want[t] {
+			status = corev1.ConditionTrue
+		}
+		c, ok := existing[t]
+		if !ok || c.Status != status {
+			c = corev1.PodCondition{Type: t, Status: status, LastTransitionTime: now}
+			changed = true
+		}
+		conds = append(conds, c)
+	}
+	if changed {
+		pod.Status.Conditions = conds
+	}
+	return changed
 }
 
 // podPhaseEvent maps a pod phase transition to an event; Pending isn't

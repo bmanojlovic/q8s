@@ -138,6 +138,72 @@ func (s *Server) rv() string {
 
 func boolPtr(b bool) *bool { return &b }
 
+// isDryRun reports whether the request asks for a server-side dry run.
+// Kubernetes accepts only the literal value All: any other value, including
+// an empty one, is a bad request.
+func isDryRun(r *http.Request) (bool, error) {
+	values, ok := r.URL.Query()["dryRun"]
+	if !ok {
+		return false, nil
+	}
+	for _, value := range values {
+		if value != "All" {
+			return false, fmt.Errorf("dryRun value %q is not supported: only %q is allowed", value, "All")
+		}
+	}
+	return true, nil
+}
+
+// dryRunWrite validates the dryRun query parameter for a write request and
+// reports whether the handler must avoid every store write and side effect.
+// It returns ok=false after answering 400 for an unsupported dryRun value, so
+// callers return immediately. Read requests ignore dryRun entirely.
+func (s *Server) dryRunWrite(w http.ResponseWriter, r *http.Request) (dry bool, ok bool) {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+	default:
+		return false, true
+	}
+	dry, err := isDryRun(r)
+	if err != nil {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+		return false, false
+	}
+	return dry, true
+}
+
+// dryRunCreated marks a to-be-created object the way the store would, so a
+// dry-run response carries the same server-generated metadata as a real
+// create without incrementing the resource version or recording an event.
+func (s *Server) dryRunCreated(obj metav1.Object) {
+	if obj.GetResourceVersion() == "" {
+		obj.SetResourceVersion(s.rv())
+	}
+	if created := obj.GetCreationTimestamp(); created.IsZero() {
+		obj.SetCreationTimestamp(metav1.Now())
+	}
+}
+
+// respondDryRunDeleteCollection answers a dry-run collection delete without
+// touching the stored objects.
+func (s *Server) respondDryRunDeleteCollection(w http.ResponseWriter, count int) {
+	encode(w, &metav1.Status{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+		Status:   "Success",
+		Message:  fmt.Sprintf("deleted %d object(s)", count),
+	}, http.StatusOK)
+}
+
+// dryRunUpdated marks a to-be-updated object the way the store would,
+// preserving the UID and creation timestamp of existing.
+func (s *Server) dryRunUpdated(obj, existing metav1.Object) {
+	obj.SetUID(existing.GetUID())
+	obj.SetResourceVersion(s.rv())
+	if created := obj.GetCreationTimestamp(); created.IsZero() {
+		obj.SetCreationTimestamp(existing.GetCreationTimestamp())
+	}
+}
+
 // watchItem constrains a watch-eligible resource to a pointer type whose
 // element is Item, satisfying both runtime.Object (for encoding) and
 // metav1.Object (for reading name/namespace/resourceVersion when diffing).
@@ -145,6 +211,52 @@ type watchItem[Item any] interface {
 	*Item
 	runtime.Object
 	metav1.Object
+}
+
+// fieldReq is one metadata.name / metadata.namespace term of a fieldSelector.
+type fieldReq struct {
+	field, value string
+	not          bool
+}
+
+// parseFieldSelector keeps the metadata.name and metadata.namespace terms of
+// a fieldSelector ("a=b", "a==b", "a!=b", comma separated). Other fields
+// (spec.nodeName, status.phase) are ignored as before: there is one node, and
+// ignoring a phase filter only returns more than asked. kubectl run waits for
+// its pod with metadata.name=<pod>; without this filter any other running
+// pod in the namespace satisfied that wait.
+func parseFieldSelector(sel string) []fieldReq {
+	var reqs []fieldReq
+	for _, term := range strings.Split(sel, ",") {
+		var req fieldReq
+		var ok bool
+		if req.field, req.value, ok = strings.Cut(term, "!="); ok {
+			req.not = true
+		} else if req.field, req.value, ok = strings.Cut(term, "=="); !ok {
+			if req.field, req.value, ok = strings.Cut(term, "="); !ok {
+				continue
+			}
+		}
+		req.field = strings.TrimSpace(req.field)
+		req.value = strings.TrimSpace(req.value)
+		if req.field == "metadata.name" || req.field == "metadata.namespace" {
+			reqs = append(reqs, req)
+		}
+	}
+	return reqs
+}
+
+func matchesFields(o metav1.Object, reqs []fieldReq) bool {
+	for _, req := range reqs {
+		got := o.GetName()
+		if req.field == "metadata.namespace" {
+			got = o.GetNamespace()
+		}
+		if (got == req.value) == req.not {
+			return false
+		}
+	}
+	return true
 }
 
 // respondList handles the table/list/watch response pattern common to all
@@ -176,8 +288,23 @@ func respondList[Item any, PI watchItem[Item], List runtime.Object](
 			return filtered
 		}
 	}
+	if reqs := parseFieldSelector(r.URL.Query().Get("fieldSelector")); len(reqs) > 0 {
+		inner := listFn
+		listFn = func() []PI {
+			all := inner()
+			filtered := make([]PI, 0, len(all))
+			for _, item := range all {
+				if matchesFields(item, reqs) {
+					filtered = append(filtered, item)
+				}
+			}
+			return filtered
+		}
+	}
 	if r.URL.Query().Get("watch") == "true" {
-		serveWatch(w, r, s, listFn, toTable)
+		gvk := makeList(nil).GetObjectKind().GroupVersionKind()
+		gvk.Kind = strings.TrimSuffix(gvk.Kind, "List")
+		serveWatch(w, r, s, listFn, toTable, gvk.GroupVersion().String(), gvk.Kind)
 		return
 	}
 	items := listFn()
@@ -247,7 +374,7 @@ func respondListMerged[Item any, PI watchItem[Item], List runtime.Object](
 // a meta.k8s.io/v1 Table built from toTable, matching kube-apiserver: the
 // first event carries columnDefinitions and later events only rows, so
 // kubectl keeps the header it learned from the first one.
-func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Request, s *Server, listFn func() []PI, toTable func([]PI, string) *table) {
+func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Request, s *Server, listFn func() []PI, toTable func([]PI, string) *table, apiVersion, kind string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "streaming not supported")
@@ -303,12 +430,32 @@ func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Req
 	// the object it just printed. Without the replay it dropped the first
 	// real change instead (a pod's ready=false after a restart went missing).
 	// Other values (an informer's list resourceVersion) start from now.
-	if r.URL.Query().Get("resourceVersion") == "0" {
+	// sendInitialEvents=true is the watch-list protocol (client-go
+	// informers, kubectl run/wait): the current state as ADDED, then a
+	// BOOKMARK annotated k8s.io/initial-events-end. Without the bookmark the
+	// client waits for it until its timeout.
+	q := r.URL.Query()
+	sendInitial := q.Get("sendInitialEvents") == "true"
+	if q.Get("resourceVersion") == "0" || sendInitial {
 		for _, o := range initial {
 			if !write("ADDED", o) {
 				return
 			}
 		}
+	}
+	if sendInitial && !tableWatch {
+		raw, _ := json.Marshal(map[string]any{
+			"apiVersion": apiVersion,
+			"kind":       kind,
+			"metadata": map[string]any{
+				"resourceVersion": s.rv(),
+				"annotations":     map[string]string{"k8s.io/initial-events-end": "true"},
+			},
+		})
+		if err := enc.Encode(metav1.WatchEvent{Type: "BOOKMARK", Object: runtime.RawExtension{Raw: raw}}); err != nil {
+			return
+		}
+		flusher.Flush()
 	}
 
 	ctx := r.Context()
@@ -663,6 +810,8 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.handlePodLogs(w, r, ns, podName)
 		case "exec":
 			s.handlePodExec(w, r, ns, podName)
+		case "attach":
+			s.handlePodAttach(w, r, ns, podName)
 		default:
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "subresource %q not supported", sub)
 		}
@@ -670,6 +819,10 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 	}
 
 	if s.rejectCronRunPodWrite(w, r, ns, name) {
+		return
+	}
+	dry, ok := s.dryRunWrite(w, r)
+	if !ok {
 		return
 	}
 
@@ -748,6 +901,15 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		// inserted, so mutating fields on it afterwards would race.
 		pod.Status.Phase = corev1.PodPending
 		pod.Status.StartTime = &metav1.Time{Time: time.Now()}
+		if dry {
+			if _, err := s.config.Store.GetPod(ns, pod.Name); err == nil {
+				s.respondStatus(w, http.StatusConflict, "AlreadyExists", "pod %q already exists in namespace %q", pod.Name, ns)
+				return
+			}
+			s.dryRunCreated(&pod)
+			encode(w, &pod, http.StatusCreated)
+			return
+		}
 		created, err := s.config.Store.CreatePod(&pod)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -816,6 +978,11 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if dry {
+			s.dryRunUpdated(&patched, pod)
+			encode(w, &patched, http.StatusOK)
+			return
+		}
 		updated, err := s.config.Store.UpdatePod(&patched)
 		if err != nil {
 			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
@@ -825,6 +992,10 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
 		if name == "" {
+			if dry {
+				s.respondDryRunDeleteCollection(w, len(s.config.Store.Pods(ns)))
+				return
+			}
 			s.deleteCollection(w,
 				func() []string {
 					var names []string
@@ -834,6 +1005,20 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 					return names
 				},
 				func(n string) error { return s.deletePodByName(ns, n) })
+			return
+		}
+		if dry {
+			if _, err := s.config.Store.GetPod(ns, name); err != nil {
+				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+				return
+			}
+			encode(w, &metav1.Status{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
+				Status:   "Success",
+				Message:  name,
+				Reason:   metav1.StatusReason(name),
+				Code:     http.StatusOK,
+			}, http.StatusOK)
 			return
 		}
 		if err := s.deletePodByName(ns, name); err != nil {

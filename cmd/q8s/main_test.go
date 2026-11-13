@@ -356,3 +356,21 @@ func TestChangedNamespacesForBackends(t *testing.T) {
 		t.Fatalf("unchanged state reported %v", got)
 	}
 }
+
+// A unit that systemd has not started yet looks exactly like one that exited
+// 0 (inactive, Result=success). A Pending pod with no container stays Pending.
+func TestUnitPhaseNotStartedYetStaysPending(t *testing.T) {
+	notStarted := &systemd.UnitState{Active: "inactive", Sub: "dead", Result: "success"}
+	pending := &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}
+	if got := unitPhase(pending, notStarted, nil); got != corev1.PodPending {
+		t.Fatalf("pending pod, no container: %s, want Pending", got)
+	}
+	running := &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	if got := unitPhase(running, notStarted, nil); got != corev1.PodSucceeded {
+		t.Fatalf("pod that ran: %s, want Succeeded", got)
+	}
+	exited := []podman.ContainerInfo{{State: "exited"}}
+	if got := unitPhase(pending, notStarted, exited); got != corev1.PodSucceeded {
+		t.Fatalf("pending pod with an exited container: %s, want Succeeded", got)
+	}
+}

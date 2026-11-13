@@ -1040,7 +1040,7 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 			phase, states := podmanContainerStates(pod, infos)
 			if len(infos) == 0 {
 				if state, err := mgr.UnitState(fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name)); err == nil && state != nil {
-					phase = unitStateToPhase(state)
+					phase = unitPhase(pod, state, infos)
 				}
 			}
 			st.UpdatePodContainerPhases(pod.Namespace, pod.Name, phase, states)
@@ -1070,7 +1070,7 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 			// down instead of leaving ready=true until the restart.
 			health = containerDown
 		}
-		st.UpdatePodPhase(pod.Namespace, pod.Name, unitStateToPhase(state), health)
+		st.UpdatePodPhase(pod.Namespace, pod.Name, unitPhase(pod, state, infos), health)
 		st.UpdatePodRestartInfo(pod.Namespace, pod.Name, int32(state.NRestarts), int32(state.ExitCode), state.Result != "")
 	}
 	for _, dep := range st.AllDeployments() {
@@ -1244,6 +1244,19 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 // running right now; any health other than "" or "healthy" makes the store
 // report the container as not ready.
 const containerDown = "down"
+
+// unitPhase is unitStateToPhase for a stored pod. A unit that systemd has not
+// started yet is inactive with Result=success, the same as one that ran and
+// exited 0. A pod that is still Pending and has no podman container has not
+// run yet, so it stays Pending: reporting Succeeded made kubectl run -it give
+// up before the container existed.
+func unitPhase(pod *corev1.Pod, s *systemd.UnitState, infos []podman.ContainerInfo) corev1.PodPhase {
+	phase := unitStateToPhase(s)
+	if phase == corev1.PodSucceeded && pod.Status.Phase == corev1.PodPending && len(infos) == 0 {
+		return corev1.PodPending
+	}
+	return phase
+}
 
 func unitStateToPhase(s *systemd.UnitState) corev1.PodPhase {
 	switch s.Active {

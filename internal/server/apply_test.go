@@ -320,7 +320,7 @@ data:
 `)
 		defer resp.Body.Close()
 		assertStatus(t, resp, http.StatusBadRequest)
-		if msg := statusMessage(t, resp); !strings.Contains(msg, "dryRun is not supported") {
+		if msg := statusMessage(t, resp); !strings.Contains(msg, "dryRun is") {
 			t.Fatalf("message = %q", msg)
 		}
 		resp = get(t, ts.URL+"/api/v1/namespaces/default/configmaps/applied")

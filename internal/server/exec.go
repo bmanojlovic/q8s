@@ -305,25 +305,80 @@ func serveClientFrames(r io.Reader, setDeadline func(), stdin io.WriteCloser, ws
 	}
 }
 
-func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name string) {
+// podStreamTarget rejects a stream request for a pod that only exists as a
+// CronJob run, whose container is already gone. A missing stored pod falls
+// through and lets the podman command report the failure on the stream.
+func (s *Server) podStreamTarget(w http.ResponseWriter, r *http.Request, ns, name, stream string) bool {
 	if _, err := s.config.Store.GetPod(ns, name); err != nil {
 		if _, ok := s.cronRunFindPod(r.Context(), ns, name); ok {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "CronJob runs cannot be exec'd (the container is gone)")
-			return
+			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "CronJob runs cannot be %s'd (the container is gone)", stream)
+			return false
 		}
 	}
-	q := r.URL.Query()
-	commands := q["command"]
-	if len(commands) == 0 {
-		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "no command specified")
-		return
-	}
-	wantStdin := q.Get("stdin") == "true"
+	return true
+}
 
-	// Only GET + WebSocket upgrade is supported (kubectl ≥1.29 default).
+// execPodmanArgs builds the podman argv for an exec request. marker is the
+// Q8S_EXEC_SESSION environment entry inherited by every process the exec
+// starts, so a disconnected client can be cleaned up by scanning /proc. It is
+// a pure function so the argv can be tested without podman.
+func execPodmanArgs(containerName string, commands []string, wantTTY bool, marker string) []string {
+	args := []string{"exec", "-i", "-e", marker}
+	if wantTTY {
+		args = append(args, "-t")
+	}
+	return append(append(args, containerName), commands...)
+}
+
+// attachPodmanArgs builds the podman argv for an attach request.
+// --sig-proxy=false is deliberate: ending the kubectl session must detach,
+// never signal the container. --no-stdin is added when the request did not
+// ask for stdin, so attach does not wait on a stream it cannot receive.
+func attachPodmanArgs(containerName string, wantStdin bool) []string {
+	args := []string{"attach", "--sig-proxy=false"}
+	if !wantStdin {
+		args = append(args, "--no-stdin")
+	}
+	return append(args, containerName)
+}
+
+// negotiateWSProtocol picks the best channel protocol the client offers. The
+// first supported entry wins, so a client that prefers v5 gets v5. An empty
+// result means no supported protocol was offered and the handshake omits the
+// Sec-WebSocket-Protocol response header.
+func negotiateWSProtocol(header string) string {
+	for _, p := range strings.Split(header, ",") {
+		p = strings.TrimSpace(p)
+		if p == "v5.channel.k8s.io" || p == "v4.channel.k8s.io" {
+			return p
+		}
+	}
+	return ""
+}
+
+// podStream carries the process command and lifecycle differences between the
+// exec and attach subresources into the shared WebSocket streaming code.
+type podStream struct {
+	// name is used in error messages: "exec" or "attach".
+	name string
+	// args is the complete podman argv.
+	args []string
+	// wantStdin opens the process stdin pipe and forwards channel 0 to it.
+	wantStdin bool
+	// marker is the exec session marker. It is empty for attach, where
+	// terminating the podman attach process is enough to detach.
+	marker string
+}
+
+// servePodStream upgrades the connection, proxies the v4/v5 channel protocol
+// to a podman child process, and sends the exit status frame. It is shared by
+// exec and attach; the command and cleanup semantics come from stream.
+func (s *Server) servePodStream(w http.ResponseWriter, r *http.Request, stream podStream) {
+	// Only GET + WebSocket upgrade is supported (kubectl 1.29 and newer
+	// default to this transport).
 	if r.Method != http.MethodGet {
 		s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
-			"exec requires a WebSocket upgrade (GET). Upgrade kubectl or pass --disable-http2")
+			"%s requires a WebSocket upgrade (GET). Upgrade kubectl or pass --disable-http2", stream.name)
 		return
 	}
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
@@ -337,15 +392,7 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 		return
 	}
 
-	// Pick the best protocol the client offers.
-	proto := ""
-	for _, p := range strings.Split(r.Header.Get("Sec-Websocket-Protocol"), ",") {
-		p = strings.TrimSpace(p)
-		if p == "v5.channel.k8s.io" || p == "v4.channel.k8s.io" {
-			proto = p
-			break
-		}
-	}
+	proto := negotiateWSProtocol(r.Header.Get("Sec-Websocket-Protocol"))
 
 	// Hijack the connection before writing the 101.
 	hj, ok := w.(http.Hijacker)
@@ -377,26 +424,10 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 	rw.Flush()
 
 	ws := &wsConn{w: conn}
-
-	// Build podman exec command.
-	// Passing -t tells Podman to allocate a PTY inside the container so
-	// interactive programs (bash, readline, vim) work correctly. Podman owns
-	// the PTY master; we proxy bytes through pipes. Resize events (channel 4)
-	// are accepted but silently ignored — the initial size is Podman's default.
-	containerName := s.podContainerName(ns, name, q.Get("container"))
-	wantTTY := q.Get("tty") == "true"
-	// The session marker is inherited by every process podman starts for this
-	// exec, so we can find and stop them all if the client goes away.
-	marker := execSessionEnv + "=" + newExecSessionMarker()
-	podmanArgs := []string{"exec", "-i", "-e", marker}
-	if wantTTY {
-		podmanArgs = append(podmanArgs, "-t")
-	}
-	execArgs := append(append(podmanArgs, containerName), commands...)
-	cmd := exec.Command("podman", execArgs...)
+	cmd := exec.Command("podman", stream.args...)
 
 	var stdinW io.WriteCloser
-	if wantStdin {
+	if stream.wantStdin {
 		stdinW, err = cmd.StdinPipe()
 		if err != nil {
 			ws.writeChan(chanError, execStatus(fmt.Errorf("stdin pipe: %w", err)))
@@ -415,14 +446,14 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 	}
 
 	if err := cmd.Start(); err != nil {
-		ws.writeChan(chanError, execStatus(fmt.Errorf("exec failed: %w", err)))
+		ws.writeChan(chanError, execStatus(fmt.Errorf("%s failed: %w", stream.name, err)))
 		return
 	}
 
 	var wg sync.WaitGroup
 
 	// Keepalive: ping the client on an interval so an idle command (no
-	// stdout/stderr for a while) doesn't let a client or intermediary idle-
+	// stdout/stderr for a while) does not let a client or intermediary idle-
 	// read timeout tear the stream down. Stopped when the command finishes.
 	// writeFrame is mutex-guarded, so pings interleave safely with output.
 	keepaliveDone := make(chan struct{})
@@ -439,14 +470,14 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 		}
 	}()
 
-	// stdout → channel 1
+	// stdout -> channel 1
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		pipe(ws, chanStdout, stdoutR)
 	}()
 
-	// stderr → channel 2
+	// stderr -> channel 2
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -489,7 +520,13 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 				// buffer fills; make further writes fail at once so the
 				// pipes drain and the handler can return.
 				_ = conn.SetWriteDeadline(time.Now())
-				terminateExecSession(cmd, hostProcRoot, marker)
+				if stream.marker != "" {
+					terminateExecSession(cmd, hostProcRoot, stream.marker)
+				} else if cmd.Process != nil {
+					// Attach needs no session marker: killing the podman
+					// attach client only detaches from the container.
+					_ = cmd.Process.Kill()
+				}
 			}
 		}
 		<-cmdDone
@@ -500,6 +537,54 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name 
 	// Send exit status on channel 3 then close the WebSocket.
 	ws.writeChan(chanError, execStatus(exitErr))
 	ws.writeFrame(wsOpClose, []byte{0x03, 0xE8}) // 1000 Normal Closure
+}
+
+func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if !s.podStreamTarget(w, r, ns, name, "exec") {
+		return
+	}
+	q := r.URL.Query()
+	commands := q["command"]
+	if len(commands) == 0 {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "no command specified")
+		return
+	}
+	wantStdin := q.Get("stdin") == "true"
+
+	// Passing -t tells Podman to allocate a PTY inside the container so
+	// interactive programs (bash, readline, vim) work correctly. Podman owns
+	// the PTY master; we proxy bytes through pipes. Resize events (channel 4)
+	// are accepted but silently ignored: the initial size is Podman's default.
+	containerName := s.podContainerName(ns, name, q.Get("container"))
+	wantTTY := q.Get("tty") == "true"
+	// The session marker is inherited by every process podman starts for this
+	// exec, so we can find and stop them all if the client goes away.
+	marker := execSessionEnv + "=" + newExecSessionMarker()
+
+	s.servePodStream(w, r, podStream{
+		name:      "exec",
+		args:      execPodmanArgs(containerName, commands, wantTTY, marker),
+		wantStdin: wantStdin,
+		marker:    marker,
+	})
+}
+
+// handlePodAttach streams an existing container to pods/POD/attach. It uses
+// the same protocol and connection handling as exec, but podman attach only
+// mirrors the container's stdio and never signals it on exit.
+func (s *Server) handlePodAttach(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if !s.podStreamTarget(w, r, ns, name, "attach") {
+		return
+	}
+	q := r.URL.Query()
+	containerName := s.podContainerName(ns, name, q.Get("container"))
+	wantStdin := q.Get("stdin") == "true"
+
+	s.servePodStream(w, r, podStream{
+		name:      "attach",
+		args:      attachPodmanArgs(containerName, wantStdin),
+		wantStdin: wantStdin,
+	})
 }
 
 func pipe(ws *wsConn, ch byte, r io.Reader) {
