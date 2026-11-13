@@ -324,7 +324,9 @@ func (s *Store) save() {
 		return
 	}
 	tmp := s.dataFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	// Sync before the rename: without it a power loss right after the
+	// rename can leave an empty store.json on ext4/xfs.
+	if err := writeFileSync(tmp, data, 0600); err != nil {
 		fmt.Printf("store: write %s: %v\n", tmp, err)
 		return
 	}
@@ -2128,4 +2130,21 @@ func (s *Store) NodePortAvailable(port int32, svc types.NamespacedName) bool {
 		return false
 	}
 	return !s.nodePortInUse(port, svc)
+}
+
+// writeFileSync is os.WriteFile followed by an fsync of the file.
+func writeFileSync(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

@@ -639,6 +639,10 @@ func cmdServe() {
 		mode = systemd.ModeRootful
 	}
 	d := resolveDirs(rootful)
+	if err := lockDataDir(d.dataDir); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
 
 	// Rootful pods run in their own user namespace, the podman equivalent of
 	// kubelet's pod.spec.hostUsers: false. q8s owns the host like kubelet
