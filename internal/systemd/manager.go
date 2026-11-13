@@ -124,11 +124,24 @@ func (m *Manager) StartUnit(name string) error {
 	return err
 }
 
-// StopUnit stops a systemd unit.
+// StopUnit stops a unit and, once the stop job finishes, clears its failed
+// state. q8s stops units only to remove them; without the reset a removed
+// unit stays in systemctl --failed as "not-found failed". The API does not
+// wait for the stop: the reset runs in the background after the job is done,
+// so a failure during the stop is cleared too.
 func (m *Manager) StopUnit(name string) error {
-	ctx := context.Background()
-	_, err := m.conn.StopUnitContext(ctx, name, "replace", nil)
-	return err
+	done := make(chan string, 1)
+	if _, err := m.conn.StopUnitContext(context.Background(), name, "replace", done); err != nil {
+		return err
+	}
+	go func() {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Minute):
+		}
+		_ = m.conn.ResetFailedUnitContext(context.Background(), name)
+	}()
+	return nil
 }
 
 // EnableUnit enables a systemd unit (creates symlinks in WantedBy).
