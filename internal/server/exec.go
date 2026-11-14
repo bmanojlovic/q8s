@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -43,6 +44,15 @@ const wsKeepaliveInterval = 20 * time.Second
 // before treating it as gone. Every frame resets the deadline; a live client
 // answers the 20s server pings with pongs, so it never trips this.
 const wsReadTimeout = 3 * wsKeepaliveInterval
+
+// wsCloseWait is how long the server waits for the client to answer its
+// WebSocket Close frame before it gives up and closes the connection. A var so
+// tests can shorten it.
+var wsCloseWait = 30 * time.Second
+
+// wsCloseGrace is how long the frame reader gets to notice the read deadline
+// that is pushed into the past when the close wait expires.
+const wsCloseGrace = 250 * time.Millisecond
 
 // Channel numbers defined by v4/v5.channel.k8s.io.
 const (
@@ -114,6 +124,64 @@ func (c *wsConn) ping() { c.writeFrame(wsOpPing, nil) }
 
 // pong replies to a client ping, echoing its payload as RFC 6455 requires.
 func (c *wsConn) pong(payload []byte) { c.writeFrame(wsOpPong, payload) }
+
+// wsCloseHandshake refreshes the client liveness deadline while the stream is
+// open and stops doing so once the closing handshake timed out. The stop flag
+// matters: without it a client that keeps sending pings would keep moving the
+// deadline forward and the handler would never return.
+type wsCloseHandshake struct {
+	conn net.Conn
+
+	mu      sync.Mutex
+	stopped bool
+}
+
+// refreshReadDeadline extends the client liveness deadline. After
+// expireReadDeadline it is a no-op. It holds the lock across the set so a
+// refresh can never re-arm a deadline that was already pushed into the past.
+func (h *wsCloseHandshake) refreshReadDeadline() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.stopped {
+		return
+	}
+	_ = h.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+}
+
+// expireReadDeadline stops the deadline refreshes and pushes the read deadline
+// into the past, so a reader blocked in readFrame returns at once.
+func (h *wsCloseHandshake) expireReadDeadline() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopped = true
+	_ = h.conn.SetReadDeadline(time.Now())
+}
+
+// awaitClientClose finishes the RFC 6455 closing handshake after the server
+// wrote its Close frame. TCP is ordered, so the client can only answer our
+// Close once it has read everything sent before it, including the tail of a
+// large stdout. Returning any earlier would let the kernel answer the client's
+// still-arriving frames with a RST, which can destroy output the client has
+// not read yet. readerDone reports that the frame reader already ended and its
+// result was consumed by the caller, so there is nothing left to wait for.
+func (h *wsCloseHandshake) awaitClientClose(framesDone <-chan bool, readerDone bool, timeout time.Duration) {
+	if readerDone {
+		return
+	}
+	select {
+	case <-framesDone:
+		return
+	case <-time.After(timeout):
+	}
+
+	// The client never answered. Stop the reader itself: no more deadline
+	// refreshes, and the deadline in the past unblocks a pending read.
+	h.expireReadDeadline()
+	select {
+	case <-framesDone:
+	case <-time.After(wsCloseGrace):
+	}
+}
 
 // maxWSFrameBytes caps a single WebSocket frame. RFC 6455 lengths are 64-bit;
 // allocating straight from the header would let an authenticated client ask
@@ -488,11 +556,10 @@ func (s *Server) servePodStream(w http.ResponseWriter, r *http.Request, stream p
 	// close frame or a dead connection must be noticed in every mode. Every
 	// frame also refreshes the read deadline, which is the client liveness
 	// check. stdinW is nil when the request did not ask for stdin.
+	closeHandshake := &wsCloseHandshake{conn: conn}
 	framesDone := make(chan bool, 1)
 	go func() {
-		framesDone <- serveClientFrames(rw.Reader, func() {
-			_ = conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
-		}, stdinW, ws)
+		framesDone <- serveClientFrames(rw.Reader, closeHandshake.refreshReadDeadline, stdinW, ws)
 	}()
 
 	// Wait for the stdout/stderr pipes to close (which happens when the
@@ -507,9 +574,11 @@ func (s *Server) servePodStream(w http.ResponseWriter, r *http.Request, stream p
 		close(cmdDone)
 	}()
 
+	readerDone := false
 	select {
 	case <-cmdDone:
 	case gone := <-framesDone:
+		readerDone = true
 		if gone {
 			select {
 			case <-cmdDone:
@@ -537,6 +606,11 @@ func (s *Server) servePodStream(w http.ResponseWriter, r *http.Request, stream p
 	// Send exit status on channel 3 then close the WebSocket.
 	ws.writeChan(chanError, execStatus(exitErr))
 	ws.writeFrame(wsOpClose, []byte{0x03, 0xE8}) // 1000 Normal Closure
+
+	// Wait for the client's side of the close handshake before returning: the
+	// deferred conn.Close would otherwise reset a connection the client is
+	// still using to finish reading stdout.
+	closeHandshake.awaitClientClose(framesDone, readerDone, wsCloseWait)
 }
 
 func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, ns, name string) {

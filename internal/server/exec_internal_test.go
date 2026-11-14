@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -319,6 +320,175 @@ func TestServeClientFramesRefreshesDeadline(t *testing.T) {
 	// Two frames plus the read that hits EOF.
 	if calls != 3 {
 		t.Errorf("setDeadline called %d times, want 3", calls)
+	}
+}
+
+// TestWsCloseHandshakeWaitsForClientClose: after writing its Close frame the
+// server must keep the stream open until the client answers with its own Close
+// frame, so the client can still read the tail of a large stdout.
+func TestWsCloseHandshakeWaitsForClientClose(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	oldWait := wsCloseWait
+	wsCloseWait = 5 * time.Second
+	t.Cleanup(func() { wsCloseWait = oldWait })
+
+	hs := &wsCloseHandshake{conn: server}
+	ws := &wsConn{w: server}
+	framesDone := make(chan bool, 1)
+	go func() {
+		framesDone <- serveClientFrames(server, hs.refreshReadDeadline, nil, ws)
+	}()
+
+	// The client consumes every frame the server sends and reports the Close
+	// frame it is expected to answer.
+	sawClose := make(chan struct{})
+	go func() {
+		for {
+			op, _, err := readFrame(client)
+			if err != nil {
+				return
+			}
+			if op == wsOpClose {
+				close(sawClose)
+				return
+			}
+		}
+	}()
+
+	// What servePodStream writes at the end of the stream. It shares the
+	// wsConn with the frame reader, as the real handler does, so the pong
+	// replies of the reader and these frames cannot interleave.
+	ws.writeChan(chanError, execStatus(nil))
+	ws.writeFrame(wsOpClose, []byte{0x03, 0xE8})
+	<-sawClose
+
+	waited := make(chan struct{})
+	go func() {
+		hs.awaitClientClose(framesDone, false, wsCloseWait)
+		close(waited)
+	}()
+
+	// The client has not answered yet, so the handshake must still be running
+	// (and the handler must not have closed the connection).
+	select {
+	case <-waited:
+		t.Fatal("close handshake returned before the client sent its Close frame")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if _, err := client.Write(clientFrame(wsOpClose, []byte{0x03, 0xE8})); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("close handshake did not return after the client sent its Close frame")
+	}
+}
+
+// TestWsCloseHandshakeCutsOffUnansweringClient: a client that never answers
+// the server's Close frame is cut off after wsCloseWait even while it keeps
+// sending pings, which must not refresh the read deadline any more.
+func TestWsCloseHandshakeCutsOffUnansweringClient(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+
+	oldWait := wsCloseWait
+	wsCloseWait = 200 * time.Millisecond
+	t.Cleanup(func() { wsCloseWait = oldWait })
+
+	hs := &wsCloseHandshake{conn: server}
+	ws := &wsConn{w: server}
+	framesDone := make(chan bool, 1)
+	readerDone := make(chan struct{})
+	go func() {
+		framesDone <- serveClientFrames(server, hs.refreshReadDeadline, nil, ws)
+		close(readerDone)
+	}()
+
+	// The client ignores the server's Close frame and keeps sending pings.
+	// Reading and writing are separate goroutines because a net.Pipe write
+	// blocks until it is read, so one goroutine doing both would deadlock
+	// against the pongs the server writes. The ping payload is not empty
+	// because net.Pipe blocks on a zero-length write.
+	clientDone := make(chan struct{})
+	go func() {
+		for {
+			if _, _, err := readFrame(client); err != nil {
+				break
+			}
+		}
+		close(clientDone)
+	}()
+	go func() {
+		t := time.NewTicker(time.Millisecond)
+		defer t.Stop()
+		for range t.C {
+			if _, err := client.Write(clientFrame(wsOpPing, []byte("ka"))); err != nil {
+				return
+			}
+		}
+	}()
+
+	ws.writeChan(chanError, execStatus(nil))
+	ws.writeFrame(wsOpClose, []byte{0x03, 0xE8})
+
+	start := time.Now()
+	hs.awaitClientClose(framesDone, false, wsCloseWait)
+	elapsed := time.Since(start)
+
+	if elapsed < wsCloseWait {
+		t.Errorf("close handshake returned after %v, before the %v wait", elapsed, wsCloseWait)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("close handshake took %v, want about %v", elapsed, wsCloseWait)
+	}
+
+	// The read deadline push must end the frame reader despite the pings still
+	// arriving; otherwise the pings kept extending the liveness deadline.
+	select {
+	case <-readerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("frame reader kept running after the close wait expired")
+	}
+
+	_ = client.Close()
+	select {
+	case <-clientDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client loop did not stop")
+	}
+}
+
+// TestWsCloseHandshakeStopsRefreshingDeadline: once the close wait expired, a
+// deadline refresh must not move the read deadline forward again, otherwise a
+// client that keeps sending pings would keep the frame reader alive forever.
+func TestWsCloseHandshakeStopsRefreshingDeadline(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	hs := &wsCloseHandshake{conn: server}
+	hs.expireReadDeadline()
+	hs.refreshReadDeadline()
+
+	// The deadline is still in the past, so a read must fail at once instead
+	// of blocking until wsReadTimeout.
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := readFrame(server)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("read after an expired close deadline did not fail")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("refreshReadDeadline moved the deadline forward after it expired")
 	}
 }
 
