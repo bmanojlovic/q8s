@@ -644,40 +644,10 @@ WantedBy=sockets.target
 `, port)
 
 	// Generate q8s-api.service
-	serviceUnit := fmt.Sprintf(`[Unit]
-Description=q8s API Server
-Requires=q8s.socket
-After=q8s.socket
-
-[Service]
-Type=notify
-ExecStart=%s serve
-NotifyAccess=main
-Restart=on-failure
-RuntimeDirectory=q8s
-`, binaryPath)
-
-	if !cfg.Rootful {
-		// Prefer the live address (already has unix:path= scheme); fall back to constructing it.
-		busAddr := os.Getenv("DBUS_SESSION_BUS_ADDRESS")
-		if busAddr == "" {
-			busAddr = fmt.Sprintf("unix:path=%s/bus", os.Getenv("XDG_RUNTIME_DIR"))
-		}
-		line, err := quadlet.EnvLine("DBUS_SESSION_BUS_ADDRESS", busAddr)
-		if err != nil {
-			return err
-		}
-		serviceUnit += line
+	serviceUnit, err := renderServiceUnit(cfg, binaryPath)
+	if err != nil {
+		return err
 	}
-
-	if cfg.Rootful {
-		serviceUnit += "User=root\nGroup=root\n"
-	}
-
-	serviceUnit += `
-[Install]
-WantedBy=multi-user.target
-`
 
 	// Write unit files
 	if err := os.WriteFile(filepath.Join(systemdDir, "q8s.socket"), []byte(socketUnit), 0644); err != nil {
@@ -700,6 +670,53 @@ WantedBy=multi-user.target
 
 	fmt.Printf("Installed systemd units to %s\n", systemdDir)
 	return nil
+}
+
+// renderServiceUnit renders q8s-api.service for cfg.
+func renderServiceUnit(cfg InstallConfig, binaryPath string) (string, error) {
+	// RuntimeDirectoryPreserve=yes keeps /run/q8s (rootless: $XDG_RUNTIME_DIR/q8s)
+	// across a service restart. Pods that are already running bind-mount
+	// ConfigMap and Secret directories under it; without preserve, systemd
+	// deletes the tree on stop and the next start recreates it as new
+	// directories, so those mounts keep pointing at the deleted ones and the
+	// pods see empty volumes after a restart or upgrade. A reboot clears the
+	// tmpfs anyway and containers start fresh, which is fine.
+	serviceUnit := fmt.Sprintf(`[Unit]
+Description=q8s API Server
+Requires=q8s.socket
+After=q8s.socket
+
+[Service]
+Type=notify
+ExecStart=%s serve
+NotifyAccess=main
+Restart=on-failure
+RuntimeDirectory=q8s
+RuntimeDirectoryPreserve=yes
+`, binaryPath)
+
+	if !cfg.Rootful {
+		// Prefer the live address (already has unix:path= scheme); fall back to constructing it.
+		busAddr := os.Getenv("DBUS_SESSION_BUS_ADDRESS")
+		if busAddr == "" {
+			busAddr = fmt.Sprintf("unix:path=%s/bus", os.Getenv("XDG_RUNTIME_DIR"))
+		}
+		line, err := quadlet.EnvLine("DBUS_SESSION_BUS_ADDRESS", busAddr)
+		if err != nil {
+			return "", err
+		}
+		serviceUnit += line
+	}
+
+	if cfg.Rootful {
+		serviceUnit += "User=root\nGroup=root\n"
+	}
+
+	serviceUnit += `
+[Install]
+WantedBy=multi-user.target
+`
+	return serviceUnit, nil
 }
 
 // localIPs returns the IPs for the server certificate SAN:

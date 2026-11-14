@@ -374,3 +374,31 @@ func TestConfigureFirewallReload(t *testing.T) {
 		}
 	})
 }
+
+// --- generated systemd service unit ---
+
+func TestServiceUnitPreservesRuntimeDirectory(t *testing.T) {
+	cases := []struct {
+		name    string
+		rootful bool
+	}{
+		{"rootful", true},
+		{"rootless", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+			t.Setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+			unit, err := renderServiceUnit(InstallConfig{Rootful: tc.rootful, Home: "/home/tester"}, "/usr/local/bin/q8s")
+			if err != nil {
+				t.Fatalf("renderServiceUnit: %v", err)
+			}
+			if !strings.Contains(unit, "RuntimeDirectory=q8s\n") {
+				t.Fatalf("unit has no RuntimeDirectory=q8s:\n%s", unit)
+			}
+			if !strings.Contains(unit, "RuntimeDirectoryPreserve=yes\n") {
+				t.Fatalf("unit has no RuntimeDirectoryPreserve=yes:\n%s", unit)
+			}
+		})
+	}
+}
