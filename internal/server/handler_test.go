@@ -1104,6 +1104,56 @@ func TestConfigMapUpdateNotFound(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestConfigMapSizeLimit(t *testing.T) {
+	ts, _ := newTestServer(t)
+	url := ts.URL + "/api/v1/namespaces/default/configmaps/sized"
+
+	// Exactly 1 MiB in total, split between data and binaryData.
+	const half = 512 << 10
+	text := strings.Repeat("d", half)
+	blob := bytes.Repeat([]byte("b"), half)
+	body := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]interface{}{"name": "sized", "namespace": "default"},
+		"data":       map[string]string{"text": text},
+		"binaryData": map[string][]byte{"blob": blob},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/configmaps", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	// One byte over the limit on create.
+	overBody := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]interface{}{"name": "too-big", "namespace": "default"},
+		"data":       map[string]string{"text": strings.Repeat("d", (1<<20)+1)},
+	}
+	resp = post(t, ts.URL+"/api/v1/namespaces/default/configmaps", overBody)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	// One byte over the limit on PUT.
+	body["data"] = map[string]string{"text": text + "d"}
+	resp = do(t, http.MethodPut, url, body)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	status := decodeBody(t, resp)
+	if status["reason"] != "Invalid" {
+		t.Fatalf("reason = %v, want Invalid", status["reason"])
+	}
+	wantMessage := `ConfigMap "sized" is invalid: []: Too long: must have at most 1048576 bytes`
+	if status["message"] != wantMessage {
+		t.Fatalf("message = %q, want %q", status["message"], wantMessage)
+	}
+
+	// One byte over the limit on a merge patch. The stored object is still
+	// the accepted 1 MiB version, so adding a one byte key crosses the limit.
+	resp = strategicPatch(t, url, map[string]interface{}{"data": map[string]string{"extra": "x"}})
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+}
+
 // --- Secret ---
 
 func TestSecretCRUD(t *testing.T) {
@@ -1149,6 +1199,101 @@ func TestSecretDuplicate(t *testing.T) {
 	resp = post(t, ts.URL+"/api/v1/namespaces/default/secrets", body)
 	assertStatus(t, resp, 409)
 	resp.Body.Close()
+}
+
+func TestSecretSizeLimit(t *testing.T) {
+	ts, st := newTestServer(t)
+	collection := ts.URL + "/api/v1/namespaces/default/secrets"
+	overLimit := strings.Repeat("s", (1<<20)+1)
+
+	// Over the limit on create.
+	body := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "too-big", "namespace": "default"},
+		"stringData": map[string]string{"big": overLimit},
+	}
+	resp := post(t, collection, body)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	status := decodeBody(t, resp)
+	if status["reason"] != "Invalid" {
+		t.Fatalf("reason = %v, want Invalid", status["reason"])
+	}
+	wantMessage := `Secret "too-big" is invalid: data: Too long: must have at most 1048576 bytes`
+	if status["message"] != wantMessage {
+		t.Fatalf("message = %q, want %q", status["message"], wantMessage)
+	}
+	if _, err := st.GetSecret("default", "too-big"); err == nil {
+		t.Fatal("over-limit Secret was stored")
+	}
+
+	// Exactly 1 MiB is accepted.
+	body = map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "exact", "namespace": "default"},
+		"stringData": map[string]string{"value": strings.Repeat("s", 1<<20)},
+	}
+	resp = post(t, collection, body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	// Over the limit on a merge patch.
+	body = map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "bounded", "namespace": "default"},
+		"stringData": map[string]string{"small": "x"},
+	}
+	resp = post(t, collection, body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	resp = strategicPatch(t, ts.URL+"/api/v1/namespaces/default/secrets/bounded", map[string]interface{}{
+		"stringData": map[string]string{"big": overLimit},
+	})
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
+	resp.Body.Close()
+
+	stored, err := st.GetSecret("default", "bounded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Data) != 1 || stored.Data["small"] == nil {
+		t.Fatalf("rejected patch changed stored data: %v", stored.Data)
+	}
+	if _, ok := stored.Data["big"]; ok {
+		t.Fatalf("rejected patch stored the oversized key: %v", stored.Data)
+	}
+}
+
+func TestSecretStringDataCountsOnceForSize(t *testing.T) {
+	ts, st := newTestServer(t)
+
+	// Each map alone is under the limit, but a key present in both Data and
+	// StringData counts once with the StringData value winning. A naive sum
+	// would be 1.2 MB and reject the object.
+	const valueLen = 600000
+	dataValue := bytes.Repeat([]byte("d"), valueLen)
+	stringValue := strings.Repeat("s", valueLen)
+	body := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": "same-key", "namespace": "default"},
+		"data":       map[string][]byte{"same": dataValue},
+		"stringData": map[string]string{"same": stringValue},
+	}
+	resp := post(t, ts.URL+"/api/v1/namespaces/default/secrets", body)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+
+	stored, err := st.GetSecret("default", "same-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stored.Data["same"]; string(got) != stringValue {
+		t.Fatalf("stored value length = %d, want the StringData value of length %d", len(got), valueLen)
+	}
 }
 
 func TestSecretJSONPatch(t *testing.T) {

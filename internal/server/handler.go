@@ -1473,6 +1473,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateConfigMapSize(&cm); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateConfigMap(&cm)
 		if err != nil {
 			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
@@ -1503,6 +1507,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		if err := validateDataKeys(cm.Data, cm.BinaryData); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateConfigMapSize(&cm); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		updated, err := s.config.Store.UpdateConfigMap(&cm)
@@ -1555,6 +1563,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		if err := validateDataKeys(patched.Data, patched.BinaryData); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateConfigMapSize(&patched); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		updated, err := s.config.Store.UpdateConfigMap(&patched)
@@ -1631,6 +1643,10 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateSecretSize(&secret); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		normalizeSecret(&secret)
 		created, err := s.config.Store.CreateSecret(&secret)
 		if err != nil {
@@ -1685,6 +1701,10 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		}
 		if err := validateDataKeys(patched.StringData, patched.Data); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateSecretSize(&patched); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		normalizeSecret(&patched)

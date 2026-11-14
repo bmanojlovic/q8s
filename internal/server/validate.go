@@ -68,6 +68,46 @@ func validateDataKeys(data map[string]string, binaryData map[string][]byte) erro
 	return nil
 }
 
+// maxObjectDataBytes is the total ConfigMap/Secret data limit enforced by
+// Kubernetes apimachinery validation. Keys are not counted, only values.
+const maxObjectDataBytes = 1 << 20
+
+func validateConfigMapSize(cm *corev1.ConfigMap) error {
+	total := 0
+	for _, v := range cm.Data {
+		total += len(v)
+	}
+	for _, v := range cm.BinaryData {
+		total += len(v)
+	}
+	if total > maxObjectDataBytes {
+		return fmt.Errorf("ConfigMap %q is invalid: []: Too long: must have at most %d bytes", cm.Name, maxObjectDataBytes)
+	}
+	return nil
+}
+
+// validateSecretSize counts the Secret as it will be stored: StringData is
+// folded into Data on write, so a key present in both maps is counted once
+// and the StringData value wins. Callers may pass the object before or after
+// normalizeSecret.
+func validateSecretSize(sec *corev1.Secret) error {
+	total := 0
+	for _, v := range sec.Data {
+		total += len(v)
+	}
+	for k, v := range sec.StringData {
+		if old, ok := sec.Data[k]; ok {
+			total -= len(old)
+		}
+		total += len(v)
+	}
+	if total > maxObjectDataBytes {
+		//lint:ignore ST1005 the message mirrors the Kubernetes API error text
+		return fmt.Errorf("Secret %q is invalid: data: Too long: must have at most %d bytes", sec.Name, maxObjectDataBytes)
+	}
+	return nil
+}
+
 // hostRE matches an RFC 1123 DNS subdomain (dot-separated labels), optionally
 // prefixed with a single wildcard label ("*.example.com") — the host format
 // Ingress rules and TLS entries accept in real k8s. Unlike nameRE this is
