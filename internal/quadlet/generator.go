@@ -1,7 +1,9 @@
 package quadlet
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -426,13 +428,8 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 		writeUserNS(&b, job.Spec.Template.Annotations)
 	}
 
-	if cmd := append(spec.Containers[0].Command, spec.Containers[0].Args...); len(cmd) > 0 {
-		for _, part := range cmd {
-			if err := noControlChars("command", part); err != nil {
-				return nil, err
-			}
-		}
-		b.WriteString(fmt.Sprintf("Exec=%s\n", shellJoin(cmd)))
+	if err := writeCommandAndArgs(&b, spec.Containers[0]); err != nil {
+		return nil, err
 	}
 
 	if spec.Containers[0].WorkingDir != "" {
@@ -585,13 +582,8 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 		writeUserNS(&b, cj.Spec.JobTemplate.Spec.Template.Annotations)
 	}
 
-	if cmd := append(spec.Containers[0].Command, spec.Containers[0].Args...); len(cmd) > 0 {
-		for _, part := range cmd {
-			if err := noControlChars("command", part); err != nil {
-				return nil, err
-			}
-		}
-		b.WriteString(fmt.Sprintf("Exec=%s\n", shellJoin(cmd)))
+	if err := writeCommandAndArgs(&b, spec.Containers[0]); err != nil {
+		return nil, err
 	}
 
 	if spec.Containers[0].WorkingDir != "" {
@@ -1030,6 +1022,72 @@ func Network(name string) ([]byte, error) {
 	b.WriteString(ManagedByLabel + "\n")
 
 	return []byte(b.String()), nil
+}
+
+// writeCommandAndArgs renders the Kubernetes command/args pair as the
+// quadlet keys that model it. command replaces the image ENTRYPOINT, so it is
+// written as Entrypoint= in quadlet's JSON array form (which keeps spaces and
+// quotes inside one argument), and args replaces the image CMD, so it is
+// written as Exec=. When only args are set the image ENTRYPOINT stays and the
+// output is byte-identical to what q8s rendered before command was honored
+// separately. Containers that set neither keep emitting nothing, as before.
+func writeCommandAndArgs(b *strings.Builder, c corev1.Container) error {
+	for _, part := range c.Command {
+		if err := noControlChars("command", part); err != nil {
+			return err
+		}
+	}
+	for _, part := range c.Args {
+		if err := noControlChars("args", part); err != nil {
+			return err
+		}
+	}
+
+	if len(c.Command) > 0 {
+		entrypoint, err := jsonArgv("command", c.Command)
+		if err != nil {
+			return err
+		}
+		b.WriteString(fmt.Sprintf("Entrypoint=%s\n", escapeUnitSpecifiers(entrypoint)))
+		if len(c.Args) > 0 {
+			b.WriteString(fmt.Sprintf("Exec=%s\n", shellJoin(c.Args)))
+			return nil
+		}
+		// Kubernetes runs command alone here, without the image CMD. podman
+		// clears the image CMD when the entrypoint is overridden (checked:
+		// --entrypoint '["echo","x"]' on alpine prints only x), so no Exec=
+		// line is needed.
+		return nil
+	}
+
+	if len(c.Args) > 0 {
+		b.WriteString(fmt.Sprintf("Exec=%s\n", shellJoin(c.Args)))
+	}
+	return nil
+}
+
+// jsonArgv encodes args as a JSON array without HTML escaping, which keeps
+// "&&" and friends readable in the generated unit. The result is still valid
+// JSON that quadlet or podman decodes back into the exact argv. Callers have
+// already rejected control characters, so the encoded value cannot contain a
+// raw newline that would break the unit line.
+func jsonArgv(kind string, args []string) (string, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(args); err != nil {
+		return "", fmt.Errorf("cannot encode %s: %w", kind, err)
+	}
+	return strings.TrimSuffix(buf.String(), "\n"), nil
+}
+
+// escapeUnitSpecifiers doubles literal percent signs so systemd does not
+// expand them as specifiers in the ExecStart quadlet generates from
+// Entrypoint=. Only the JSON Entrypoint= value needs it: Exec= keeps the
+// historic shellJoin output so containers that set only args render
+// byte-identically, and changing their percent handling would restart them.
+func escapeUnitSpecifiers(value string) string {
+	return strings.ReplaceAll(value, "%", "%%")
 }
 
 // shellJoin joins command parts for use in Exec= directives.

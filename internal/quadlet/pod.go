@@ -283,15 +283,8 @@ func renderContainer(r containerRender) ([]byte, error) {
 		writeUserNS(&b, pod.Annotations)
 	}
 
-	// Exec: combine command (entrypoint override) and args
-	cmd := append(c.Command, c.Args...)
-	for _, part := range cmd {
-		if err := noControlChars("command", part); err != nil {
-			return nil, err
-		}
-	}
-	if len(cmd) > 0 {
-		b.WriteString(fmt.Sprintf("Exec=%s\n", shellJoin(cmd)))
+	if err := writeCommandAndArgs(&b, c); err != nil {
+		return nil, err
 	}
 
 	if c.WorkingDir != "" {

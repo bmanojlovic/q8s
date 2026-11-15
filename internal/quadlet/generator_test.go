@@ -165,7 +165,9 @@ func TestContainerExecArgs(t *testing.T) {
 	pod.Spec.Containers[0].Args = []string{"-c", "echo hello"}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, `Exec=/bin/sh -c "echo hello"`)
+	// command replaces the image ENTRYPOINT, args replace its CMD.
+	assertContains(t, out, `Entrypoint=["/bin/sh"]`)
+	assertContains(t, out, `Exec=-c "echo hello"`)
 }
 
 func TestContainerWorkingDir(t *testing.T) {
@@ -1763,7 +1765,8 @@ func TestNetwork(t *testing.T) {
 // --- ShellJoin ---
 
 func TestShellJoin(t *testing.T) {
-	// ShellJoin is not exported; test it indirectly through Container Exec
+	// ShellJoin is not exported; test it indirectly through Container Exec.
+	// Args alone keep the historic Exec= rendering.
 	cases := []struct {
 		cmd  []string
 		want string
@@ -1775,7 +1778,7 @@ func TestShellJoin(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(strings.Join(tc.cmd, " "), func(t *testing.T) {
 			pod := simplePod("default", "app", "img")
-			pod.Spec.Containers[0].Command = tc.cmd
+			pod.Spec.Containers[0].Args = tc.cmd
 			out := mustContainer(t, pod, "")
 			assertContains(t, out, tc.want)
 		})

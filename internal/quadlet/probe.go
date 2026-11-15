@@ -1,8 +1,6 @@
 package quadlet
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"net"
 	"regexp"
@@ -259,13 +257,7 @@ func resolveProbePort(c corev1.Container, port intstr.IntOrString) (int32, error
 // keeps "&&" and friends readable in the generated unit. The result is still
 // valid JSON that podman decodes back into the exact argv.
 func jsonExecCommand(args []string) (string, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(args); err != nil {
-		return "", fmt.Errorf("cannot encode health check command: %w", err)
-	}
-	return strings.TrimSuffix(buf.String(), "\n"), nil
+	return jsonArgv("health check command", args)
 }
 
 // writeHealthCheck emits the single Podman health check a unit can have.
