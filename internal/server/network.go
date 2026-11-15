@@ -207,7 +207,7 @@ func (s *Server) refreshPodQuadlets(pod *corev1.Pod, name string) {
 		fmt.Printf("refresh pod quadlets %s/%s: %v\n", pod.Namespace, name, err)
 		return
 	}
-	files, err := podQuadletFiles(name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved))
+	files, err := podQuadletFiles(name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(pod.Namespace, &resolved.Spec))
 	if err != nil {
 		fmt.Printf("refresh pod quadlets %s/%s: %v\n", pod.Namespace, name, err)
 		return

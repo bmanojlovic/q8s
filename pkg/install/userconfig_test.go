@@ -215,3 +215,27 @@ func TestNormalizeSerial(t *testing.T) {
 		}
 	}
 }
+
+func TestIssueClientCertificateAtUsesTheGivenWindow(t *testing.T) {
+	ca := testCA(t)
+	notBefore := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	notAfter := notBefore.Add(time.Hour)
+	issued, err := IssueClientCertificateAt(ca.caCert, ca.caKey, "system:serviceaccount:demo:worker", []string{"system:serviceaccounts"}, notBefore, notAfter)
+	if err != nil {
+		t.Fatalf("IssueClientCertificateAt: %v", err)
+	}
+	block, _ := pem.Decode(issued.CertPEM)
+	if block == nil {
+		t.Fatal("certificate is not PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cert.NotBefore.Equal(notBefore) || !cert.NotAfter.Equal(notAfter) {
+		t.Fatalf("validity = %v .. %v, want %v .. %v", cert.NotBefore, cert.NotAfter, notBefore, notAfter)
+	}
+	if _, err := IssueClientCertificateAt(ca.caCert, ca.caKey, "alice", nil, notAfter, notBefore); err == nil {
+		t.Fatal("an inverted validity window was accepted")
+	}
+}

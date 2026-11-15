@@ -62,6 +62,8 @@ func main() {
 		cmdDisable()
 	case "kubeconfig":
 		cmdKubeconfig()
+	case "credential":
+		cmdCredential()
 	case "-h", "--help", "help":
 		printUsage()
 	case "-v", "--version", "version":
@@ -87,6 +89,7 @@ func printUsage() {
 	fmt.Println("  enable     Enable and start q8s socket on boot")
 	fmt.Println("  disable    Disable q8s socket (stop and remove from boot)")
 	fmt.Println("  kubeconfig Print a kubeconfig file for this q8s instance")
+	fmt.Println("  credential Print the service account ExecCredential for this pod")
 }
 
 // --- Path resolution ---
@@ -666,13 +669,18 @@ func cmdServe() {
 	}
 
 	srv, err := server.New(server.Config{
-		Store:       st,
-		CACert:      caCert,
-		CertPEM:     certPEM,
-		KeyPEM:      keyPEM,
-		QuadletDir:  d.quadletDir,
-		SystemdDir:  d.systemdDir,
-		ConfigDir:   d.configDir,
+		Store:          st,
+		CACert:         caCert,
+		CertPEM:        certPEM,
+		KeyPEM:         keyPEM,
+		QuadletDir:     d.quadletDir,
+		SystemdDir:     d.systemdDir,
+		ConfigDir:      d.configDir,
+		WorkloadDir:    filepath.Join(filepath.Dir(d.configDir), "workload"),
+		WorkloadBinDir: workloadBinDir(d),
+		WorkloadKubeconfig: func(ns string) ([]byte, error) {
+			return workloadKubeconfigFor(resolvePort(d), caCert, ns)
+		},
 		TraefikDir:  d.dataDir + "/traefik",
 		DataDir:     d.dataDir,
 		RevokedFile: install.RevokedPath(d.dataDir),
@@ -692,6 +700,21 @@ func cmdServe() {
 		fmt.Fprintf(os.Stderr, "failed to create server: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Publish the workload files and start the credential socket. Pods that
+	// ask for a service account mount this directory; everything else keeps
+	// running without it.
+	workloadPath := workloadDir(d)
+	if err := writeWorkloadFiles(workloadPath, workloadBinDir(d), resolvePort(d), caCert); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: workload files not written: %v\n", err)
+	}
+	workloadCtx, stopWorkload := context.WithCancel(context.Background())
+	defer stopWorkload()
+	go func() {
+		if err := srv.ServeWorkloadSocket(workloadCtx, workloadPath); err != nil {
+			fmt.Fprintf(os.Stderr, "workload credential socket: %v\n", err)
+		}
+	}()
 
 	var listeners []net.Listener
 	if os.Getenv("LISTEN_FDS") != "" {

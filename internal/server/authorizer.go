@@ -200,7 +200,10 @@ func (s *Server) effectiveClusterRoleRules(name string, visited map[string]bool)
 }
 
 // bindingMatches reports whether any subject of a binding names u. A
-// ServiceAccount subject never matches a certificate user.
+// ServiceAccount subject names the certificate user
+// system:serviceaccount:{namespace}:{name}; group subjects for
+// system:serviceaccounts and system:serviceaccounts:{namespace} therefore
+// match through the certificate groups.
 func bindingMatches(subjects []rbacv1.Subject, u userInfo) bool {
 	for _, subject := range subjects {
 		switch subject.Kind {
@@ -213,6 +216,13 @@ func bindingMatches(subjects []rbacv1.Subject, u userInfo) bool {
 				if subject.Name == group {
 					return true
 				}
+			}
+		case "ServiceAccount":
+			if subject.Namespace == "" {
+				continue
+			}
+			if u.Name == "system:serviceaccount:"+subject.Namespace+":"+subject.Name {
+				return true
 			}
 		}
 	}

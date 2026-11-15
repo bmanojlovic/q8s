@@ -359,7 +359,9 @@ func detectCgroupControllers() {
 // This is the single-container shape q8s has always produced. A pod with
 // more than one container is rendered by PodUnits instead, which keeps the
 // same per-container rendering but moves the pod-level settings into a .pod.
-func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []NetworkAttachment) ([]byte, error) {
+// The optional workload mount is only rendered when its Enabled flag is set
+// and its Dir is non-empty; callers that omit it keep the historic output.
+func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []NetworkAttachment, workload ...WorkloadMount) ([]byte, error) {
 	// Name/namespace are validated here even though the API boundary
 	// already checks them: the Podman-label import path (reconcilePodmanPods)
 	// constructs pods from container labels, which nothing else vets, and a
@@ -386,6 +388,7 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 		pvcMap:         pvcMap,
 		envFile:        envFile,
 		standalone:     true,
+		workload:       workloadMountArg(workload),
 	})
 	if err != nil {
 		return nil, err
@@ -395,10 +398,11 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 
 // JobContainer generates a .container quadlet for a Job's pod template.
 // The unit runs once (no Restart) and exits with the container's exit code.
-func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
+func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, workload ...WorkloadMount) ([]byte, error) {
 	spec := job.Spec.Template.Spec
 	ns := job.Namespace
 	userNS := podUsesUserNS(spec)
+	workloadMount := workloadMountArg(workload)
 
 	if err := validateRefName("job name", name); err != nil {
 		return nil, err
@@ -457,6 +461,10 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 			return nil, err
 		}
 		b.WriteString(line)
+	}
+
+	if err := writeWorkloadMount(&b, workloadMount, spec.Containers[0], userNS); err != nil {
+		return nil, err
 	}
 
 	for _, vol := range spec.Volumes {
@@ -549,10 +557,11 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 
 // CronContainer generates the .container quadlet for a CronJob's pod template.
 // It is triggered by the paired .timer unit, not installed directly.
-func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string) ([]byte, error) {
+func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, workload ...WorkloadMount) ([]byte, error) {
 	spec := cj.Spec.JobTemplate.Spec.Template.Spec
 	ns := cj.Namespace
 	userNS := podUsesUserNS(spec)
+	workloadMount := workloadMountArg(workload)
 
 	if err := validateRefName("cronjob name", name); err != nil {
 		return nil, err
@@ -611,6 +620,10 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 			return nil, err
 		}
 		b.WriteString(line)
+	}
+
+	if err := writeWorkloadMount(&b, workloadMount, spec.Containers[0], userNS); err != nil {
+		return nil, err
 	}
 
 	for _, vol := range spec.Volumes {

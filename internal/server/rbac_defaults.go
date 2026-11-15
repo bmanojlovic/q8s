@@ -54,7 +54,7 @@ func clusterAdminClusterRole() *rbacv1.ClusterRole {
 func editClusterRole() *rbacv1.ClusterRole {
 	role := newBuiltinClusterRole("edit", viewClusterRole().Rules)
 	role.Rules = append(role.Rules,
-		rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"configmaps", "persistentvolumeclaims", "pods", "secrets", "services"}, Verbs: writeVerbs},
+		rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"configmaps", "persistentvolumeclaims", "pods", "secrets", "serviceaccounts", "services"}, Verbs: writeVerbs},
 		rbacv1.PolicyRule{APIGroups: []string{"apps"}, Resources: []string{"daemonsets", "deployments", "replicasets", "statefulsets"}, Verbs: writeVerbs},
 		rbacv1.PolicyRule{APIGroups: []string{"batch"}, Resources: []string{"cronjobs", "jobs"}, Verbs: writeVerbs},
 		rbacv1.PolicyRule{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"ingresses"}, Verbs: writeVerbs},
@@ -79,7 +79,7 @@ func adminClusterRole() *rbacv1.ClusterRole {
 
 func viewClusterRole() *rbacv1.ClusterRole {
 	role := newBuiltinClusterRole("view", []rbacv1.PolicyRule{
-		{APIGroups: []string{""}, Resources: []string{"configmaps", "events", "namespaces", "nodes", "persistentvolumeclaims", "pods", "services"}, Verbs: readVerbs},
+		{APIGroups: []string{""}, Resources: []string{"configmaps", "events", "namespaces", "nodes", "persistentvolumeclaims", "pods", "serviceaccounts", "services"}, Verbs: readVerbs},
 		{APIGroups: []string{""}, Resources: []string{"pods/log", "pods/status"}, Verbs: readVerbs},
 		{APIGroups: []string{"apps"}, Resources: []string{"daemonsets", "deployments", "replicasets", "statefulsets"}, Verbs: readVerbs},
 		{APIGroups: []string{"batch"}, Resources: []string{"cronjobs", "jobs"}, Verbs: readVerbs},

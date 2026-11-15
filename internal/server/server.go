@@ -27,6 +27,16 @@ type Config struct {
 	SystemdDir string // systemd user unit dir for .timer/.service files
 	ConfigDir  string // base dir for ConfigMap files: {ConfigDir}/{ns}/{cm-name}/
 	TraefikDir string // Traefik dynamic config dir for Ingress routing
+	// WorkloadDir is the host directory exposed to pods that use a
+	// ServiceAccount. It is bind-mounted read-only at
+	// quadlet.WorkloadMountPath. Empty disables the feature.
+	WorkloadDir string
+	// WorkloadBinDir is the on-disk directory holding the q8s binary the
+	// pods' exec credential plugin runs (<dataDir>/workload-bin).
+	WorkloadBinDir string
+	// WorkloadKubeconfig renders the kubeconfig for the pods of one
+	// namespace (nil disables the per-namespace files).
+	WorkloadKubeconfig func(namespace string) ([]byte, error)
 	// DataDir is the q8s data directory. When RevokedFile is empty it is
 	// used to locate revoked.json. Empty disables certificate revocation.
 	DataDir string
@@ -42,6 +52,10 @@ type Config struct {
 	// it doesn't affect what the server actually listens on. Defaults to 6443
 	// if zero.
 	Port int
+	// WorkloadPeers resolves the container labels of a process connecting to
+	// the workload credential socket. Nil uses the real /proc and podman
+	// implementation; tests inject a fake.
+	WorkloadPeers ContainerLabelResolver
 }
 
 // Server is the k8s-compatible API server.
@@ -247,7 +261,7 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/openapi/v3/", s.handleOpenAPIv3)
 
 	// Cluster-scoped resource lists (used by kubectl get -A)
-	for _, res := range []string{"pods", "services", "persistentvolumeclaims", "configmaps", "secrets", "events"} {
+	for _, res := range []string{"pods", "services", "persistentvolumeclaims", "configmaps", "secrets", "serviceaccounts", "events"} {
 		res := res
 		s.mux.HandleFunc("/api/v1/"+res, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {

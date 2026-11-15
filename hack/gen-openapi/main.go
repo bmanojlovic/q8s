@@ -65,6 +65,7 @@ var servedGVKs = []gvk{
 	{Group: "", Version: "v1", Kind: "PersistentVolumeClaim"},
 	{Group: "", Version: "v1", Kind: "ConfigMap"},
 	{Group: "", Version: "v1", Kind: "Secret"},
+	{Group: "", Version: "v1", Kind: "ServiceAccount"},
 	{Group: "", Version: "v1", Kind: "Event"},
 	{Group: "", Version: "v1", Kind: "Node"},
 	{Group: "apps", Version: "v1", Kind: "Deployment"},

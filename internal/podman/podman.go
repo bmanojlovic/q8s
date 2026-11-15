@@ -113,6 +113,30 @@ func InspectState(name string) (*ContainerState, error) {
 	}, nil
 }
 
+// InspectLabels returns the labels of a single container by id or name.
+// The workload credential socket uses it to map a cgroup container id to the
+// q8s pod labels that identify the requesting pod.
+func InspectLabels(id string) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "podman", "inspect", "--format", "json", id).Output()
+	if err != nil {
+		return nil, fmt.Errorf("podman inspect %s: %w", id, err)
+	}
+	var items []struct {
+		Config struct {
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+	}
+	if err := json.Unmarshal(out, &items); err != nil {
+		return nil, fmt.Errorf("podman inspect %s: parse error", id)
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("podman inspect %s: container not found", id)
+	}
+	return items[0].Config.Labels, nil
+}
+
 // ListOwned returns only containers that carry q8s pod labels.
 func ListOwned() ([]ContainerInfo, error) {
 	all, err := List()

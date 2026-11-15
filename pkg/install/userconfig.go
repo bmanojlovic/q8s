@@ -77,6 +77,18 @@ type ClientCertificate struct {
 // group. The CA certificate and key are the PEM files written by
 // `q8s install`.
 func IssueClientCertificate(caCertPEM, caKeyPEM []byte, userName string, groups []string, days int) (*ClientCertificate, error) {
+	if err := ValidateClientCertDays(days); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	return IssueClientCertificateAt(caCertPEM, caKeyPEM, userName, groups, now.Add(-time.Minute), now.Add(time.Duration(days)*24*time.Hour))
+}
+
+// IssueClientCertificateAt is IssueClientCertificate with an explicit
+// validity window. It lets short-lived credentials (the workload socket
+// issues one-hour service account certificates) use the same signing path as
+// the CLI without rounding through whole days.
+func IssueClientCertificateAt(caCertPEM, caKeyPEM []byte, userName string, groups []string, notBefore, notAfter time.Time) (*ClientCertificate, error) {
 	if err := ValidateIdentity("user name", userName); err != nil {
 		return nil, err
 	}
@@ -85,8 +97,8 @@ func IssueClientCertificate(caCertPEM, caKeyPEM []byte, userName string, groups 
 			return nil, err
 		}
 	}
-	if err := ValidateClientCertDays(days); err != nil {
-		return nil, err
+	if !notAfter.After(notBefore) {
+		return nil, fmt.Errorf("certificate notAfter must be after notBefore")
 	}
 
 	caCert, caKey, err := parseCA(caCertPEM, caKeyPEM)
@@ -106,8 +118,6 @@ func IssueClientCertificate(caCertPEM, caKeyPEM []byte, userName string, groups 
 		serial = big.NewInt(1)
 	}
 
-	notBefore := time.Now().Add(-time.Minute)
-	notAfter := time.Now().Add(time.Duration(days) * 24 * time.Hour)
 	// Groups are RDN-encoded one per RDN instead of together in one
 	// Organization SET. DER sorts the members of a SET, which would otherwise
 	// lose the requested group order when the certificate is parsed again.

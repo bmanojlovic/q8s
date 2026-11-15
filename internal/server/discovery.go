@@ -75,6 +75,7 @@ func (s *Server) handleAPIV1(w http.ResponseWriter, r *http.Request) {
 			{Name: "persistentvolumeclaims", SingularName: "persistentvolumeclaim", Namespaced: true, Kind: "PersistentVolumeClaim", Verbs: verbList(), ShortNames: []string{"pvc"}},
 			{Name: "configmaps", SingularName: "configmap", Namespaced: true, Kind: "ConfigMap", Verbs: verbList(), ShortNames: []string{"cm"}},
 			{Name: "secrets", SingularName: "secret", Namespaced: true, Kind: "Secret", Verbs: verbList()},
+			{Name: "serviceaccounts", SingularName: "serviceaccount", Namespaced: true, Kind: "ServiceAccount", Verbs: verbList(), ShortNames: []string{"sa"}},
 			{Name: "events", SingularName: "event", Namespaced: true, Kind: "Event", Verbs: []string{"get", "list", "watch"}, ShortNames: []string{"ev"}},
 		},
 	})
@@ -965,6 +966,7 @@ func DiscoveryResources() []schema.GroupVersionResource {
 		{Group: "", Version: "v1", Resource: "persistentvolumeclaims"},
 		{Group: "", Version: "v1", Resource: "configmaps"},
 		{Group: "", Version: "v1", Resource: "secrets"},
+		{Group: "", Version: "v1", Resource: "serviceaccounts"},
 		{Group: "", Version: "v1", Resource: "events"},
 		{Group: "batch", Version: "v1", Resource: "jobs"},
 		{Group: "batch", Version: "v1", Resource: "cronjobs"},

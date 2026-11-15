@@ -294,6 +294,27 @@ func secretsToTable(secrets []*corev1.Secret, rv string) *table {
 	return t
 }
 
+// --- ServiceAccount table ---
+
+var serviceAccountColumns = []columnDef{
+	{Name: "Name", Type: "string", Format: "name", Priority: 0},
+	{Name: "Secrets", Type: "integer", Priority: 0},
+	{Name: "Age", Type: "string", Priority: 0},
+}
+
+func serviceAccountsToTable(sas []*corev1.ServiceAccount, rv string) *table {
+	t := newTable(rv, serviceAccountColumns)
+	for _, sa := range sas {
+		// q8s never creates token Secrets, so the SECRETS column is always
+		// 0 even if a client stored a secrets list on the object.
+		t.Rows = append(t.Rows, tableRow{
+			Cells:  []interface{}{sa.Name, 0, age(sa.CreationTimestamp.Time)},
+			Object: partialMeta{Kind: "ServiceAccount", APIVersion: "v1", Metadata: sa.ObjectMeta},
+		})
+	}
+	return t
+}
+
 // --- Deployment table ---
 
 var deploymentColumns = []columnDef{

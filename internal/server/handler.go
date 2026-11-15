@@ -716,11 +716,11 @@ func hasExactLine(content []byte, want string) bool {
 // podQuadletFiles renders every quadlet file for one pod object. A
 // single-container pod keeps today's single .container; a multi-container
 // pod becomes a Podman pod (.pod plus one .container per container).
-func podQuadletFiles(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []quadlet.NetworkAttachment) (map[string][]byte, error) {
+func podQuadletFiles(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []quadlet.NetworkAttachment, workload quadlet.WorkloadMount) (map[string][]byte, error) {
 	if len(pod.Spec.Containers) > 1 {
-		return quadlet.PodUnits(name, pod, configDir, serviceAliases, pvcMap, envFile, networks)
+		return quadlet.PodUnits(name, pod, configDir, serviceAliases, pvcMap, envFile, networks, workload)
 	}
-	content, err := quadlet.Container(name, pod, configDir, serviceAliases, pvcMap, envFile, networks)
+	content, err := quadlet.Container(name, pod, configDir, serviceAliases, pvcMap, envFile, networks, workload)
 	if err != nil {
 		return nil, err
 	}
@@ -799,6 +799,8 @@ func (s *Server) handleNamespaced(w http.ResponseWriter, r *http.Request) {
 		s.handleConfigMaps(w, r, ns, name)
 	case "secrets":
 		s.handleSecrets(w, r, ns, name)
+	case "serviceaccounts":
+		s.handleServiceAccounts(w, r, ns, name)
 	case "events":
 		s.handleEvents(w, r, ns)
 	default:
@@ -891,7 +893,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		// server-side only) that its spec can't be safely turned into a
 		// unit file — e.g. an image reference or env value containing
 		// characters that would corrupt the generated quadlet.
-		if _, err := podQuadletFiles(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec), "", s.networkAttachments(&pod)); err != nil {
+		if _, err := podQuadletFiles(pod.Name, &pod, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, pod.Labels), s.podPVCMap(pod.Namespace, pod.Spec), "", s.networkAttachments(&pod), s.workloadMount(pod.Namespace, &pod.Spec)); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -983,7 +985,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		// be rendered into a unit file must be rejected here, not stored and
 		// then silently left unapplied (200 OK while the running container
 		// keeps the old spec).
-		if _, err := podQuadletFiles(patched.Name, &patched, s.config.ConfigDir, s.matchingServiceAliases(patched.Namespace, patched.Labels), s.podPVCMap(patched.Namespace, patched.Spec), "", s.networkAttachments(&patched)); err != nil {
+		if _, err := podQuadletFiles(patched.Name, &patched, s.config.ConfigDir, s.matchingServiceAliases(patched.Namespace, patched.Labels), s.podPVCMap(patched.Namespace, patched.Spec), "", s.networkAttachments(&patched), s.workloadMount(patched.Namespace, &patched.Spec)); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1759,6 +1761,148 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 	}
 }
 
+// --- ServiceAccounts ---
+
+// handleServiceAccounts serves core v1 ServiceAccount objects. q8s stores no
+// token Secrets for them: a ServiceAccount is only the identity a pod's
+// credential request is checked against.
+func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, ns, name string) {
+	switch r.Method {
+	case http.MethodGet:
+		if name == "" {
+			respondList(w, r, s, func() []*corev1.ServiceAccount { return s.config.Store.ServiceAccounts(ns) }, serviceAccountsToTable,
+				func(items []corev1.ServiceAccount) *corev1.ServiceAccountList {
+					return &corev1.ServiceAccountList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccountList"}, Items: items}
+				})
+			return
+		}
+		sa, err := s.config.Store.GetServiceAccount(ns, name)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		if isTableRequest(r) {
+			encodeTable(w, serviceAccountsToTable([]*corev1.ServiceAccount{sa}, s.rv()))
+			return
+		}
+		encode(w, sa, http.StatusOK)
+	case http.MethodPost:
+		var sa corev1.ServiceAccount
+		if !s.decodeOrRespond(w, r, &sa) {
+			return
+		}
+		sa.APIVersion = "v1"
+		sa.Kind = "ServiceAccount"
+		if sa.Namespace == "" {
+			sa.Namespace = ns
+		}
+		if err := validateName("namespace", sa.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", sa.Name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		created, err := s.config.Store.CreateServiceAccount(&sa)
+		if err != nil {
+			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			return
+		}
+		encode(w, created, http.StatusCreated)
+	case http.MethodPut:
+		var sa corev1.ServiceAccount
+		if !s.decodeOrRespond(w, r, &sa) {
+			return
+		}
+		sa.APIVersion = "v1"
+		sa.Kind = "ServiceAccount"
+		if sa.Namespace == "" {
+			sa.Namespace = ns
+		}
+		if sa.Name == "" {
+			sa.Name = name
+		}
+		if err := validatePatchedIdentity("serviceaccount", sa.Namespace, sa.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		updated, err := s.config.Store.UpdateServiceAccount(&sa)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		encode(w, updated, http.StatusOK)
+	case http.MethodPatch:
+		sa, err := s.config.Store.GetServiceAccount(ns, name)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
+		existing, _ := json.Marshal(sa)
+		var base map[string]interface{}
+		json.Unmarshal(existing, &base)
+		if isJSONPatch(r) {
+			var ops []map[string]interface{}
+			if err := json.Unmarshal(body, &ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			if err := applyJSONPatch(base, ops); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+		} else {
+			var overlay map[string]interface{}
+			if err := json.Unmarshal(body, &overlay); err != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+				return
+			}
+			jsonMerge(base, overlay)
+		}
+		merged, _ := json.Marshal(base)
+		var patched corev1.ServiceAccount
+		if err := json.Unmarshal(merged, &patched); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
+			return
+		}
+		if err := validatePatchedIdentity("serviceaccount", patched.Namespace, patched.Name, ns, name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		updated, err := s.config.Store.UpdateServiceAccount(&patched)
+		if err != nil {
+			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			return
+		}
+		encode(w, updated, http.StatusOK)
+	case http.MethodDelete:
+		if name == "" {
+			s.deleteCollection(w,
+				func() []string {
+					var names []string
+					for _, sa := range s.config.Store.ServiceAccounts(ns) {
+						names = append(names, sa.Name)
+					}
+					return names
+				},
+				func(n string) error { return s.config.Store.DeleteServiceAccount(ns, n) })
+			return
+		}
+		if err := s.config.Store.DeleteServiceAccount(ns, name); err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // --- Events ---
 
 // handleEvents is GET/watch-only: events are synthetic, generated by the
@@ -2168,6 +2312,11 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, resou
 			func(items []corev1.Secret) *corev1.SecretList {
 				return &corev1.SecretList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "SecretList"}, Items: items}
 			})
+	case "serviceaccounts":
+		respondList(w, r, s, s.config.Store.AllServiceAccounts, serviceAccountsToTable,
+			func(items []corev1.ServiceAccount) *corev1.ServiceAccountList {
+				return &corev1.ServiceAccountList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccountList"}, Items: items}
+			})
 	case "events":
 		respondList(w, r, s, s.config.Store.AllEvents, eventsToTable,
 			func(items []corev1.Event) *corev1.EventList {
@@ -2480,7 +2629,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodProbes("job spec.template.spec", &job.Spec.Template.Spec); err != nil {
+		if err := validatePodSpecShape("job spec.template.spec", &job.Spec.Template.Spec); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2522,7 +2671,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodProbes("job spec.template.spec", &job.Spec.Template.Spec); err != nil {
+		if err := validatePodSpecShape("job spec.template.spec", &job.Spec.Template.Spec); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2607,7 +2756,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodProbes("job spec.template.spec", &patched.Spec.Template.Spec); err != nil {
+		if err := validatePodSpecShape("job spec.template.spec", &patched.Spec.Template.Spec); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2623,7 +2772,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if s.config.QuadletDir != "" {
 			if resolved, envFile, err := s.resolvedJobEnv(updated); err == nil {
-				if content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile); err == nil {
+				if content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile, s.workloadMount(resolved.Namespace, &resolved.Spec.Template.Spec)); err == nil {
 					writeQuadletFilesTracked(s.config.QuadletDir, map[string][]byte{
 						fmt.Sprintf("%s-%s-job.container", resolved.Namespace, resolved.Name): content,
 					})
@@ -2699,7 +2848,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodProbes("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec); err != nil {
+		if err := validatePodSpecShape("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2744,7 +2893,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodProbes("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec); err != nil {
+		if err := validatePodSpecShape("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2822,7 +2971,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodProbes("cronjob spec.jobTemplate.spec.template.spec", &patched.Spec.JobTemplate.Spec.Template.Spec); err != nil {
+		if err := validatePodSpecShape("cronjob spec.jobTemplate.spec.template.spec", &patched.Spec.JobTemplate.Spec.Template.Spec); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -3450,7 +3599,7 @@ func (s *Server) ReconcileQuadlets() {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
 			}
-			files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile, s.networkAttachments(resolved))
+			files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(dep.Namespace, &resolved.Spec))
 			if err != nil {
 				fmt.Printf("reconcile deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 				continue
@@ -3483,7 +3632,7 @@ func (s *Server) ReconcileQuadlets() {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
 		}
-		files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved))
+		files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(pod.Namespace, &resolved.Spec))
 		if err != nil {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)
 			continue
@@ -3550,7 +3699,7 @@ func (s *Server) ReconcileQuadlets() {
 			fmt.Printf("reconcile job %s/%s: %v\n", job.Namespace, job.Name, err)
 			continue
 		}
-		content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile)
+		content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile, s.workloadMount(resolved.Namespace, &resolved.Spec.Template.Spec))
 		if err != nil {
 			fmt.Printf("reconcile job %s/%s: %v\n", job.Namespace, job.Name, err)
 			continue
@@ -3575,7 +3724,7 @@ func (s *Server) ReconcileQuadlets() {
 				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
 				continue
 			}
-			content, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec), envFile)
+			content, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec), envFile, s.workloadMount(resolved.Namespace, &resolved.Spec.JobTemplate.Spec.Template.Spec))
 			if err != nil {
 				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
 				continue
@@ -3644,6 +3793,50 @@ func (s *Server) ReconcileQuadlets() {
 
 // --- Quadlet integration ---
 
+// workloadMount returns the ServiceAccount workload mount settings for a pod
+// spec. An empty Config.WorkloadDir or a pod that did not opt in disables it.
+func (s *Server) workloadMount(ns string, spec *corev1.PodSpec) quadlet.WorkloadMount {
+	w := quadlet.WorkloadMountFor(spec, s.config.WorkloadDir, s.config.WorkloadBinDir)
+	w.Namespace = ns
+	if w.Enabled && w.Dir != "" {
+		s.ensureWorkloadKubeconfig(ns)
+	}
+	return w
+}
+
+// ensureWorkloadKubeconfig writes <WorkloadDir>/ns/<ns>/kubeconfig, the
+// kubeconfig the pods of one namespace use. It differs from the host-wide one
+// only by the context namespace, which is what lets `kubectl get pods` in a
+// pod default to the pod's own namespace (in Kubernetes the namespace comes
+// from the service account mount). Written only when the content changes.
+func (s *Server) ensureWorkloadKubeconfig(ns string) {
+	if s.config.WorkloadKubeconfig == nil || ns == "" {
+		return
+	}
+	data, err := s.config.WorkloadKubeconfig(ns)
+	if err != nil {
+		fmt.Printf("workload kubeconfig for %s: %v\n", ns, err)
+		return
+	}
+	dir := filepath.Join(s.config.WorkloadDir, "ns", ns)
+	path := filepath.Join(dir, "kubeconfig")
+	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) {
+		return
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fmt.Printf("workload kubeconfig for %s: %v\n", ns, err)
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		fmt.Printf("workload kubeconfig for %s: %v\n", ns, err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		fmt.Printf("workload kubeconfig for %s: %v\n", ns, err)
+	}
+}
+
 // podPVCMap builds a map from PVC claim name to PVC object for all PVC
 // volumes referenced in the given pod spec. This lets the quadlet generator
 // inspect storageClassName and annotations when emitting volume directives.
@@ -3685,7 +3878,7 @@ func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
 		s.podMaterializeFailed(pod, "resolving env references", err)
 		return
 	}
-	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved))
+	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(pod.Namespace, &resolved.Spec))
 	if err != nil {
 		s.podMaterializeFailed(pod, "generating quadlet", err)
 		return
@@ -3727,7 +3920,7 @@ func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
 		s.podMaterializeFailed(pod, "resolving env references", err)
 		return
 	}
-	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved))
+	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(pod.Namespace, &resolved.Spec))
 	if err != nil {
 		s.podMaterializeFailed(pod, "generating quadlet", err)
 		return
@@ -3856,7 +4049,7 @@ func (s *Server) generateJobQuadlet(job *batchv1.Job) {
 		fmt.Printf("job quadlet %s: %v\n", job.Name, err)
 		return
 	}
-	content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile)
+	content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile, s.workloadMount(resolved.Namespace, &resolved.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("job quadlet %s: %v\n", job.Name, err)
 		return
@@ -3894,7 +4087,7 @@ func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
 		fmt.Printf("cronjob container %s: %v\n", cj.Name, err)
 		return
 	}
-	containerContent, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec), envFile)
+	containerContent, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec), envFile, s.workloadMount(resolved.Namespace, &resolved.Spec.JobTemplate.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("cronjob container %s: %v\n", cj.Name, err)
 		return
@@ -4346,7 +4539,7 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return
 	}
-	files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile, s.networkAttachments(resolved))
+	files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(dep.Namespace, &resolved.Spec))
 	if err != nil {
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
 		return

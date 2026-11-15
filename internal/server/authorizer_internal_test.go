@@ -320,6 +320,70 @@ func TestAuthorize(t *testing.T) {
 			want: false,
 		},
 		{
+			name:  "service account subject matches the certificate identity",
+			user:  userInfo{Name: "system:serviceaccount:demo:worker", Groups: []string{"system:serviceaccounts", "system:serviceaccounts:demo", "system:authenticated"}},
+			attrs: resourceAttrs("", "demo", "pods", "", "", "list"),
+			setup: func(t *testing.T, s *Server) {
+				addRole(t, s, "demo", "read-pods", allowRule("", "pods", "list"))
+				addRoleBinding(t, s, "demo", "worker-read-pods", "Role", "read-pods", rbacv1.Subject{
+					Kind: "ServiceAccount", Name: "worker", Namespace: "demo",
+				})
+			},
+			want: true,
+		},
+		{
+			name:  "service account subject in another namespace does not match",
+			user:  userInfo{Name: "system:serviceaccount:demo:worker", Groups: []string{"system:authenticated"}},
+			attrs: resourceAttrs("", "demo", "pods", "", "", "list"),
+			setup: func(t *testing.T, s *Server) {
+				addRole(t, s, "demo", "read-pods", allowRule("", "pods", "list"))
+				addRoleBinding(t, s, "demo", "worker-read-pods", "Role", "read-pods", rbacv1.Subject{
+					Kind: "ServiceAccount", Name: "worker", Namespace: "other",
+				})
+			},
+			want: false,
+		},
+		{
+			name:  "service account subject with another name does not match",
+			user:  userInfo{Name: "system:serviceaccount:demo:worker", Groups: []string{"system:authenticated"}},
+			attrs: resourceAttrs("", "demo", "pods", "", "", "list"),
+			setup: func(t *testing.T, s *Server) {
+				addRole(t, s, "demo", "read-pods", allowRule("", "pods", "list"))
+				addRoleBinding(t, s, "demo", "worker-read-pods", "Role", "read-pods", rbacv1.Subject{
+					Kind: "ServiceAccount", Name: "alice", Namespace: "demo",
+				})
+			},
+			want: false,
+		},
+		{
+			name:  "serviceaccounts group matches through the certificate groups",
+			user:  userInfo{Name: "system:serviceaccount:demo:worker", Groups: []string{"system:serviceaccounts", "system:serviceaccounts:demo", "system:authenticated"}},
+			attrs: resourceAttrs("", "demo", "pods", "", "", "list"),
+			setup: func(t *testing.T, s *Server) {
+				addClusterRole(t, s, "read-pods", nil, allowRule("", "pods", "list"))
+				addClusterRoleBinding(t, s, "all-serviceaccounts", "read-pods", groupSubject("system:serviceaccounts"))
+			},
+			want: true,
+		},
+		{
+			name:  "built-in view reads serviceaccounts",
+			user:  alice,
+			attrs: resourceAttrs("", "demo", "serviceaccounts", "", "", "list"),
+			setup: func(t *testing.T, s *Server) {
+				addClusterRoleBinding(t, s, "alice-view", "view", userSubject("alice"))
+			},
+			want: true,
+		},
+		{
+			name:  "built-in edit writes serviceaccounts",
+			user:  alice,
+			attrs: resourceAttrs("", "demo", "serviceaccounts", "", "worker", "create"),
+			setup: func(t *testing.T, s *Server) {
+				addClusterRoleBinding(t, s, "alice-edit", "edit", userSubject("alice"))
+			},
+			want: true,
+		},
+		{
 			name:  "wildcard api group and resource",
 			user:  alice,
 			attrs: resourceAttrs("apps", "demo", "deployments", "", "web", "get"),

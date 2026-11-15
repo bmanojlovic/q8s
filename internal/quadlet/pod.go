@@ -67,6 +67,7 @@ type containerRender struct {
 	pvcMap         map[string]*corev1.PersistentVolumeClaim
 	envFile        string
 	standalone     bool
+	workload       WorkloadMount
 }
 
 // PodUnits renders the quadlet files for a multi-container pod: one
@@ -75,7 +76,7 @@ type containerRender struct {
 // keyed by filename (the caller writes each file into the quadlet dir).
 // Single-container pods must keep using Container, whose output is
 // byte-identical to q8s before pods existed.
-func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []NetworkAttachment) (map[string][]byte, error) {
+func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []string, pvcMap map[string]*corev1.PersistentVolumeClaim, envFile string, networks []NetworkAttachment, workload ...WorkloadMount) (map[string][]byte, error) {
 	if err := validateRefName("pod name", name); err != nil {
 		return nil, err
 	}
@@ -95,6 +96,7 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 	if err != nil {
 		return nil, err
 	}
+	workloadMount := workloadMountArg(workload)
 	podName := fmt.Sprintf("%s-%s", pod.Namespace, name)
 	files := map[string][]byte{
 		podName + ".pod": withTemplateHash(podContent),
@@ -120,6 +122,7 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 			pvcMap:         pvcMap,
 			envFile:        envFile,
 			standalone:     false,
+			workload:       workloadMount,
 		})
 		if err != nil {
 			return nil, err
@@ -325,6 +328,10 @@ func renderContainer(r containerRender) ([]byte, error) {
 			return nil, err
 		}
 		b.WriteString(line)
+	}
+
+	if err := writeWorkloadMount(&b, r.workload, c, podUsesUserNS(pod.Spec)); err != nil {
+		return nil, err
 	}
 
 	// Published ports and network are pod-level in the pod shape; the

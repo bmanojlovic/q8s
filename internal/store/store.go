@@ -30,6 +30,7 @@ type snapshot struct {
 	PVCs                []*corev1.PersistentVolumeClaim `json:"pvcs,omitempty"`
 	ConfigMaps          []*corev1.ConfigMap             `json:"configMaps,omitempty"`
 	Secrets             []*corev1.Secret                `json:"secrets,omitempty"`
+	ServiceAccounts     []*corev1.ServiceAccount        `json:"serviceAccounts,omitempty"`
 	Namespaces          []*corev1.Namespace             `json:"namespaces,omitempty"`
 	Jobs                []*batchv1.Job                  `json:"jobs,omitempty"`
 	CronJobs            []*batchv1.CronJob              `json:"cronJobs,omitempty"`
@@ -53,6 +54,7 @@ type Store struct {
 	pvcs                map[types.NamespacedName]*corev1.PersistentVolumeClaim
 	configmaps          map[types.NamespacedName]*corev1.ConfigMap
 	secrets             map[types.NamespacedName]*corev1.Secret
+	serviceAccounts     map[types.NamespacedName]*corev1.ServiceAccount
 	namespaces          map[types.NamespacedName]*corev1.Namespace
 	jobs                map[types.NamespacedName]*batchv1.Job
 	cronjobs            map[types.NamespacedName]*batchv1.CronJob
@@ -176,6 +178,7 @@ func newEmpty() *Store {
 		pvcs:                make(map[types.NamespacedName]*corev1.PersistentVolumeClaim),
 		configmaps:          make(map[types.NamespacedName]*corev1.ConfigMap),
 		secrets:             make(map[types.NamespacedName]*corev1.Secret),
+		serviceAccounts:     make(map[types.NamespacedName]*corev1.ServiceAccount),
 		namespaces:          make(map[types.NamespacedName]*corev1.Namespace),
 		jobs:                make(map[types.NamespacedName]*batchv1.Job),
 		cronjobs:            make(map[types.NamespacedName]*batchv1.CronJob),
@@ -268,6 +271,9 @@ func Load(dataFile string) (*Store, error) {
 		// normalized secret (StringData nil) is left untouched. See tic-c627.
 		normalizeSecret(sec)
 		s.secrets[types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}] = sec
+	}
+	for _, sa := range snap.ServiceAccounts {
+		s.serviceAccounts[types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}] = sa
 	}
 	for _, ns := range snap.Namespaces {
 		s.namespaces[types.NamespacedName{Name: ns.Name}] = ns
@@ -396,6 +402,9 @@ func (s *Store) snapshot() snapshot {
 	for _, sec := range s.secrets {
 		snap.Secrets = append(snap.Secrets, sec.DeepCopy())
 	}
+	for _, sa := range s.serviceAccounts {
+		snap.ServiceAccounts = append(snap.ServiceAccounts, sa.DeepCopy())
+	}
 	for _, ns := range s.namespaces {
 		snap.Namespaces = append(snap.Namespaces, ns.DeepCopy())
 	}
@@ -493,6 +502,9 @@ func (s *Store) Namespaces() []*corev1.Namespace {
 		phantom(k.Namespace)
 	}
 	for k := range s.secrets {
+		phantom(k.Namespace)
+	}
+	for k := range s.serviceAccounts {
 		phantom(k.Namespace)
 	}
 	for k := range s.pvcs {
@@ -612,6 +624,11 @@ func (s *Store) PurgeNamespace(name string) {
 	for key := range s.secrets {
 		if key.Namespace == name {
 			delete(s.secrets, key)
+		}
+	}
+	for key := range s.serviceAccounts {
+		if key.Namespace == name {
+			delete(s.serviceAccounts, key)
 		}
 	}
 	for key := range s.deployments {
@@ -1785,6 +1802,100 @@ func (s *Store) UpdateSecret(sec *corev1.Secret) (*corev1.Secret, error) {
 	s.mu.Unlock()
 	go s.save()
 	return sec.DeepCopy(), nil
+}
+
+// --- ServiceAccounts ---
+
+// AllServiceAccounts returns all ServiceAccounts across all namespaces.
+func (s *Store) AllServiceAccounts() []*corev1.ServiceAccount {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*corev1.ServiceAccount, 0, len(s.serviceAccounts))
+	for _, sa := range s.serviceAccounts {
+		result = append(result, sa.DeepCopy())
+	}
+	return result
+}
+
+// ServiceAccounts returns all ServiceAccounts in a namespace.
+func (s *Store) ServiceAccounts(ns string) []*corev1.ServiceAccount {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*corev1.ServiceAccount
+	for key, sa := range s.serviceAccounts {
+		if key.Namespace == ns {
+			result = append(result, sa.DeepCopy())
+		}
+	}
+	return result
+}
+
+// CreateServiceAccount creates a ServiceAccount.
+func (s *Store) CreateServiceAccount(sa *corev1.ServiceAccount) (*corev1.ServiceAccount, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}
+	if _, ok := s.serviceAccounts[key]; ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("serviceaccount %q already exists in namespace %q", sa.Name, sa.Namespace)
+	}
+	sa.ResourceVersion = s.incRV()
+	sa.UID = types.UID(fmt.Sprintf("q8s-serviceaccount-%s-%s", sa.Namespace, sa.Name))
+	if sa.Labels == nil {
+		sa.Labels = make(map[string]string)
+	}
+	if sa.CreationTimestamp.IsZero() {
+		sa.CreationTimestamp = metav1.Now()
+	}
+	s.serviceAccounts[key] = sa
+	s.mu.Unlock()
+	go s.save()
+	return sa.DeepCopy(), nil
+}
+
+// GetServiceAccount gets a ServiceAccount.
+func (s *Store) GetServiceAccount(ns, name string) (*corev1.ServiceAccount, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sa, ok := s.serviceAccounts[types.NamespacedName{Namespace: ns, Name: name}]
+	if !ok {
+		return nil, fmt.Errorf("serviceaccount %q not found in namespace %q", name, ns)
+	}
+	return sa.DeepCopy(), nil
+}
+
+// DeleteServiceAccount deletes a ServiceAccount.
+func (s *Store) DeleteServiceAccount(ns, name string) error {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: ns, Name: name}
+	if _, ok := s.serviceAccounts[key]; !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("serviceaccount %q not found in namespace %q", name, ns)
+	}
+	delete(s.serviceAccounts, key)
+	s.mu.Unlock()
+	go s.save()
+	return nil
+}
+
+// UpdateServiceAccount replaces a ServiceAccount in-place, preserving UID and
+// creation timestamp.
+func (s *Store) UpdateServiceAccount(sa *corev1.ServiceAccount) (*corev1.ServiceAccount, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}
+	existing, ok := s.serviceAccounts[key]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("serviceaccount %q not found in namespace %q", sa.Name, sa.Namespace)
+	}
+	sa.UID = existing.UID
+	if sa.CreationTimestamp.IsZero() {
+		sa.CreationTimestamp = existing.CreationTimestamp
+	}
+	sa.ResourceVersion = s.incRV()
+	s.serviceAccounts[key] = sa
+	s.mu.Unlock()
+	go s.save()
+	return sa.DeepCopy(), nil
 }
 
 // --- Jobs ---

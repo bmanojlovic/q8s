@@ -444,11 +444,43 @@ func validateSingleContainer(kind string, spec *corev1.PodSpec, allowMultipleCon
 // outside their own namespace.
 const annAttachAllNetworks = "q8s.io/attach-all-networks"
 
+// validatePodSpecShape applies the q8s-only pod spec restrictions shared by
+// Pods, Deployments, Jobs and CronJobs. Besides the probe shapes, it rejects
+// a user volume mount at the path reserved for the ServiceAccount workload
+// directory, which would collide with the mount q8s adds for opted-in pods.
+func validatePodSpecShape(kind string, spec *corev1.PodSpec) error {
+	if err := validateWorkloadMountConflict(kind, spec); err != nil {
+		return err
+	}
+	return validatePodProbes(kind, spec)
+}
+
+// validateWorkloadMountConflict rejects a container that mounts a volume at
+// quadlet.WorkloadMountPath. The path is reserved even when the feature is
+// disabled, so a manifest that works on one host keeps working when the
+// workload dir is enabled later.
+func validateWorkloadMountConflict(kind string, spec *corev1.PodSpec) error {
+	if spec == nil {
+		return nil
+	}
+	containers := append([]corev1.Container(nil), spec.Containers...)
+	containers = append(containers, spec.InitContainers...)
+	for _, c := range containers {
+		for _, vm := range c.VolumeMounts {
+			if vm.MountPath == quadlet.WorkloadMountPath || vm.MountPath == quadlet.WorkloadBinMountPath {
+				return fmt.Errorf("%s: container %q: volumeMount %q is reserved for the ServiceAccount workload directory", kind, c.Name, vm.MountPath)
+			}
+		}
+	}
+	return nil
+}
+
 // validatePodProbes rejects probe shapes q8s cannot translate, using the
-// same rules as the quadlet generator (quadlet.ValidateProbes). Called from
-// the create/update/patch handlers for Pods, Deployments, Jobs and CronJobs
-// so an unsupported probe fails with 422 at the API instead of being
-// accepted and then silently ignored when the unit is rendered.
+// same rules as the quadlet generator (quadlet.ValidateProbes). Called by
+// validatePodSpecShape, which the create/update/patch handlers for Pods,
+// Deployments, Jobs and CronJobs all run, so an unsupported probe fails with
+// 422 at the API instead of being accepted and then silently ignored when the
+// unit is rendered.
 func validatePodProbes(kind string, spec *corev1.PodSpec) error {
 	if spec == nil {
 		return nil
@@ -495,14 +527,15 @@ func validateCronJobTimeZone(timeZone *string) error {
 }
 
 // validatePodAnnotations rejects q8s pod annotations that cannot be honored
-// by the requested shape. replicas is 0 for a bare Pod. Probe handlers are
-// checked here too, because Pods and Deployments share this choke point and
-// an unsupported probe is the same kind of unrepresentable spec.
+// by the requested shape. replicas is 0 for a bare Pod. Probe handlers and
+// the reserved ServiceAccount workload mount path are checked here too,
+// because Pods and Deployments share this choke point and both are the same
+// kind of unrepresentable spec.
 func validatePodAnnotations(kind string, spec *corev1.PodSpec, annotations map[string]string, replicas int32) error {
 	if err := validateUserNSSizeAnnotation(kind, annotations); err != nil {
 		return err
 	}
-	if err := validatePodProbes(kind, spec); err != nil {
+	if err := validatePodSpecShape(kind, spec); err != nil {
 		return err
 	}
 	containers := 0
