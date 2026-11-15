@@ -251,6 +251,7 @@ func Load(dataFile string) (*Store, error) {
 	}
 
 	s.resourceVer = snap.ResourceVer
+	backfillCreationTimestamps(&snap, dataFile)
 	for _, p := range snap.Pods {
 		s.pods[types.NamespacedName{Namespace: p.Namespace, Name: p.Name}] = p
 	}
@@ -1432,6 +1433,9 @@ func (s *Store) CreateService(svc *corev1.Service) (*corev1.Service, error) {
 	if svc.Labels == nil {
 		svc.Labels = make(map[string]string)
 	}
+	if svc.CreationTimestamp.IsZero() {
+		svc.CreationTimestamp = metav1.Now()
+	}
 	defaultServiceFields(svc)
 	s.services[key] = svc
 	s.mu.Unlock()
@@ -1556,6 +1560,9 @@ func (s *Store) CreatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 	}
 	pvc.ResourceVersion = s.incRV()
 	pvc.UID = types.UID(fmt.Sprintf("q8s-pvc-%s-%s", pvc.Namespace, pvc.Name))
+	if pvc.CreationTimestamp.IsZero() {
+		pvc.CreationTimestamp = metav1.Now()
+	}
 	if pvc.Labels == nil {
 		pvc.Labels = make(map[string]string)
 	}
@@ -1621,6 +1628,9 @@ func (s *Store) UpdatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 		return nil, fmt.Errorf("PVC %q not found in namespace %q", pvc.Name, pvc.Namespace)
 	}
 	pvc.UID = existing.UID
+	if pvc.CreationTimestamp.IsZero() {
+		pvc.CreationTimestamp = existing.CreationTimestamp
+	}
 	pvc.ResourceVersion = s.incRV()
 	s.pvcs[key] = pvc
 	s.mu.Unlock()
@@ -1667,6 +1677,9 @@ func (s *Store) CreateConfigMap(cm *corev1.ConfigMap) (*corev1.ConfigMap, error)
 	if cm.Labels == nil {
 		cm.Labels = make(map[string]string)
 	}
+	if cm.CreationTimestamp.IsZero() {
+		cm.CreationTimestamp = metav1.Now()
+	}
 	s.configmaps[key] = cm
 	s.mu.Unlock()
 	go s.save()
@@ -1683,6 +1696,9 @@ func (s *Store) UpdateConfigMap(cm *corev1.ConfigMap) (*corev1.ConfigMap, error)
 		return nil, fmt.Errorf("configmap %q not found in namespace %q", cm.Name, cm.Namespace)
 	}
 	cm.UID = existing.UID
+	if cm.CreationTimestamp.IsZero() {
+		cm.CreationTimestamp = existing.CreationTimestamp
+	}
 	cm.ResourceVersion = s.incRV()
 	s.configmaps[key] = cm
 	s.mu.Unlock()
@@ -1755,6 +1771,9 @@ func (s *Store) CreateSecret(sec *corev1.Secret) (*corev1.Secret, error) {
 	if sec.Labels == nil {
 		sec.Labels = make(map[string]string)
 	}
+	if sec.CreationTimestamp.IsZero() {
+		sec.CreationTimestamp = metav1.Now()
+	}
 	s.secrets[key] = sec
 	s.mu.Unlock()
 	go s.save()
@@ -1797,6 +1816,9 @@ func (s *Store) UpdateSecret(sec *corev1.Secret) (*corev1.Secret, error) {
 		return nil, fmt.Errorf("secret %q not found in namespace %q", sec.Name, sec.Namespace)
 	}
 	sec.UID = existing.UID
+	if sec.CreationTimestamp.IsZero() {
+		sec.CreationTimestamp = existing.CreationTimestamp
+	}
 	sec.ResourceVersion = s.incRV()
 	s.secrets[key] = sec
 	s.mu.Unlock()
@@ -2976,4 +2998,32 @@ func writeFileSync(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	return f.Close()
+}
+
+// backfillCreationTimestamps gives objects stored by an older q8s, which did
+// not set creationTimestamp on ConfigMaps, Secrets, PVCs and Services, the
+// store file's modification time: a lower bound for their real age, better
+// than AGE <unknown>. It is persisted with the next save.
+func backfillCreationTimestamps(snap *snapshot, dataFile string) {
+	ts := metav1.Now()
+	if info, err := os.Stat(dataFile); err == nil {
+		ts = metav1.NewTime(info.ModTime())
+	}
+	fill := func(m *metav1.ObjectMeta) {
+		if m.CreationTimestamp.IsZero() {
+			m.CreationTimestamp = ts
+		}
+	}
+	for _, o := range snap.ConfigMaps {
+		fill(&o.ObjectMeta)
+	}
+	for _, o := range snap.Secrets {
+		fill(&o.ObjectMeta)
+	}
+	for _, o := range snap.PVCs {
+		fill(&o.ObjectMeta)
+	}
+	for _, o := range snap.Services {
+		fill(&o.ObjectMeta)
+	}
 }
