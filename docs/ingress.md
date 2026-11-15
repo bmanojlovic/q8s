@@ -224,6 +224,84 @@ middleware reference must be `name` or `name@provider` (provider
 `router.priority` must be a non-negative integer. An invalid value is rejected
 with HTTP 400 rather than written into the config file Traefik loads.
 
+## Off-host backends (ExternalName)
+
+A Service with `spec.type: ExternalName` points an Ingress path at a host
+outside the q8s podman networks. q8s writes exactly one server URL,
+`<scheme>://<externalName>:<port>`, and Traefik performs the DNS lookup and
+dials the host itself. No controller and no DNS records are involved.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  annotations:
+    traefik.ingress.kubernetes.io/service.serversscheme: https
+    traefik.ingress.kubernetes.io/service.serverstransport: backend-ca@file
+spec:
+  type: ExternalName
+  externalName: backend.example.com
+  ports:
+    - name: https
+      port: 8443
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app
+spec:
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  name: https
+```
+
+renders:
+
+```yaml
+http:
+  services:
+    default-app-0:
+      loadBalancer:
+        servers:
+          - url: "https://backend.example.com:8443"
+        serversTransport: "backend-ca@file"
+```
+
+The port is the Ingress backend port number. When the Ingress names the port,
+the matching `spec.ports[].port` of the Service is used. If the name does not
+resolve, the path is skipped and a log line is written; an ExternalName
+backend is never replaced by the `localhost` fallback. IPv6 literals are
+bracketed (`http://[2001:db8::10]:8443`), and an IPv4 literal is accepted as
+`externalName` just as Kubernetes accepts it (`externalName: 192.0.2.10`).
+
+Both annotations are read from the backend Service and apply to selector-based
+Services too:
+
+| annotation | value | effect |
+|---|---|---|
+| `traefik.ingress.kubernetes.io/service.serversscheme` | `http`, `https` or `h2c` (default `http`) | scheme of every generated backend URL |
+| `traefik.ingress.kubernetes.io/service.serverstransport` | `<name>@<provider>` | `serversTransport:` in the generated service |
+
+`serversscheme` and `serverstransport` must already exist in Traefik's
+dynamic configuration; q8s only references a transport, it never generates
+one. An invalid value is rejected with HTTP 422 on Service create, update or
+patch, and an invalid value found in the store is ignored when rendering.
+
+**In-pod DNS is not provided for ExternalName.** q8s pods resolve names
+through podman's aardvark-dns, which has no static-record feature, so a pod
+cannot resolve `backend` to `backend.example.com` the way Kubernetes DNS
+does. ExternalName is translated for Ingress traffic only; in-pod clients
+should use the external name directly.
+
 ## Port resolution (selector-based, like Endpoints)
 
 When the referenced Service exists, q8s resolves backends the way real k8s
@@ -258,4 +336,6 @@ Key points:
   server list. Nothing is published on the host and no replica ports are
   allocated.
 - If the Service doesn't exist (or no matching pod yields an address), q8s
-  falls back to a single `localhost:{ingress port}` backend.
+  falls back to a single `localhost:{ingress port}` backend. An ExternalName
+  Service never uses that fallback: it either renders its external URL or the
+  path is skipped (see "Off-host backends (ExternalName)").

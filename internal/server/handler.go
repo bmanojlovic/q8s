@@ -1142,6 +1142,12 @@ func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request, ns, name 
 func (s *Server) matchingServiceAliases(ns string, labels map[string]string) []string {
 	var aliases []string
 	for _, svc := range s.config.Store.Services(ns) {
+		// An ExternalName Service names a host outside the pod network; it
+		// is not a selector-based alias for q8s pods, even if a selector
+		// was left on the object.
+		if svc.Spec.Type == corev1.ServiceTypeExternalName {
+			continue
+		}
 		if matchesEqualitySelector(labels, svc.Spec.Selector) {
 			aliases = append(aliases, svc.Name)
 		}
@@ -1188,6 +1194,10 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		if err := validateName("name", svc.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateService(&svc); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		created, err := s.config.Store.CreateService(&svc)
@@ -1262,6 +1272,10 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		if err := validatePatchedIdentity("service", patched.Namespace, patched.Name, ns, name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateService(&patched); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		updated, err := s.config.Store.UpdateService(&patched)
@@ -3090,6 +3104,29 @@ func middlewareReferenceForFileProvider(ref string) string {
 	return ref
 }
 
+// serviceServersScheme returns the scheme Service backends are dialed with.
+// Values that fail the validation the API applies are ignored defensively, so
+// a Service stored by an older q8s or edited directly in the store cannot
+// inject config here. The default is http.
+func serviceServersScheme(annotations map[string]string) string {
+	if v, ok := annotations[annServiceServersScheme]; ok && validateServiceServersScheme(v) == nil {
+		return v
+	}
+	return "http"
+}
+
+// serviceServersTransport returns the serversTransport reference the backend
+// Service asks for, or "" when it has none or the stored value is invalid.
+// q8s never generates the transport itself; it only references one that the
+// admin defined in Traefik's dynamic configuration.
+func serviceServersTransport(annotations map[string]string) string {
+	v := annotations[annServiceServersTransport]
+	if validateTraefikTransportRef(annServiceServersTransport, v) != nil {
+		return ""
+	}
+	return v
+}
+
 // yamlFlowList renders items as a quoted YAML flow sequence, the same quoting
 // the url lines use, so no item can break out of its scalar.
 func yamlFlowList(items []string) string {
@@ -3125,6 +3162,9 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 
 	var routers, services strings.Builder
 	idx := 0
+	// keyed by service:portName so one render logs a broken ExternalName
+	// backend once, not once per path.
+	skippedExternalName := map[string]bool{}
 
 	for _, rule := range ing.Spec.Rules {
 		if rule.HTTP == nil {
@@ -3139,24 +3179,38 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 			if path.Backend.Service == nil {
 				continue
 			}
-			routerName := fmt.Sprintf("%s-%s-%d", ing.Namespace, ing.Name, idx)
-			idx++
 			svcName := path.Backend.Service.Name
 			svcPort := int32(80)
 			if path.Backend.Service.Port.Number != 0 {
 				svcPort = path.Backend.Service.Port.Number
 			}
+			portName := path.Backend.Service.Port.Name
 
 			// Resolve backend addresses via the Service's selector — the
 			// same Endpoints model real k8s uses: every pod the selector
-			// matches contributes one server, each with its own port.
-			servers := s.ingressBackendServers(ing.Namespace, svcName, svcPort, path.Backend.Service.Port.Name)
+			// matches contributes one server, each with its own port. An
+			// ExternalName Service resolves to its external name instead.
+			servers := s.ingressBackendServers(ing.Namespace, svcName, svcPort, portName)
 			if len(servers) == 0 {
+				if s.externalNameService(ing.Namespace, svcName) {
+					// An ExternalName Service is never dialed through
+					// Traefik's own loopback. A port name that does not
+					// resolve to one of the Service's ports leaves the path
+					// without a backend, so skip it and say so once.
+					key := svcName + ":" + portName
+					if !skippedExternalName[key] {
+						fmt.Printf("traefik config: %s/%s: ExternalName Service %q has no resolvable backend port, skipping path\n", ing.Namespace, ing.Name, svcName)
+						skippedExternalName[key] = true
+					}
+					continue
+				}
 				// No Service (or none with reachable pods): fall back to the
 				// ingress-declared port on localhost, preserving the
 				// pre-selector behavior.
 				servers = []string{fmt.Sprintf("http://localhost:%d", svcPort)}
 			}
+			routerName := fmt.Sprintf("%s-%s-%d", ing.Namespace, ing.Name, idx)
+			idx++
 
 			// Build router rule
 			var ruleParts []string
@@ -3192,6 +3246,9 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 			services.WriteString("        servers:\n")
 			for _, url := range servers {
 				services.WriteString(fmt.Sprintf("          - url: %q\n", url))
+			}
+			if transport := serviceServersTransport(s.backendServiceAnnotations(ing.Namespace, svcName)); transport != "" {
+				services.WriteString(fmt.Sprintf("        serversTransport: %q\n", transport))
 			}
 		}
 	}
@@ -4900,6 +4957,12 @@ func (s *Server) serviceBackendTargets(ns, svcName string, svcPort int32, portNa
 	if err != nil {
 		return nil
 	}
+	// An ExternalName Service has no endpoints in this cluster; its
+	// external name is resolved by the Traefik renderer instead. Ignore a
+	// selector left on the object rather than selecting pods through it.
+	if svc.Spec.Type == corev1.ServiceTypeExternalName {
+		return nil
+	}
 
 	// Which ServicePort (and thus targetPort) the ingress refers to.
 	// targetPort may be numeric or a container-port name; resolve both.
@@ -4955,12 +5018,30 @@ func (s *Server) serviceBackendTargets(ns, svcName string, svcPort int32, portNa
 // their cluster DNS name, <pod>.<ns>:<containerPort>, which resolves on every
 // namespace network Traefik is attached to (no host publish involved).
 //
+// A Service of type ExternalName has no pods to resolve: it yields exactly
+// one URL, <scheme>://<externalName>:<port>, and Traefik performs the DNS
+// lookup itself. The serversscheme annotation selects http, https or h2c for
+// both kinds of backend.
+//
 // hostNetwork without a hostPort yields no server: the pod is on the host
 // netns but publishes nothing addressable.
 //
-// Returns nil when there is no such Service or no pod yields an address;
-// callers fall back to the ingress-declared port.
+// Returns nil when there is no such Service, when no pod yields an address,
+// or when an ExternalName Service has no resolvable port; callers fall back
+// to the ingress-declared port only for selector-based Services.
 func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portName string) []string {
+	scheme := "http"
+	if svc, err := s.config.Store.GetService(ns, svcName); err == nil {
+		scheme = serviceServersScheme(svc.Annotations)
+		if svc.Spec.Type == corev1.ServiceTypeExternalName {
+			url, ok := externalNameBackendURL(svc, scheme, svcPort, portName)
+			if !ok {
+				return nil
+			}
+			return []string{url}
+		}
+	}
+
 	var servers []string
 	for _, target := range s.serviceBackendTargets(ns, svcName, svcPort, portName) {
 		// Traefik is a container on the namespace networks, so a pod on those
@@ -4970,12 +5051,55 @@ func (s *Server) ingressBackendServers(ns, svcName string, svcPort int32, portNa
 		// is reached through the host.
 		switch {
 		case !target.hostNetwork:
-			servers = append(servers, fmt.Sprintf("http://%s.%s:%d", target.podName, ns, target.containerPort))
+			servers = append(servers, fmt.Sprintf("%s://%s.%s:%d", scheme, target.podName, ns, target.containerPort))
 		case target.hostPort != 0:
-			servers = append(servers, "http://"+backendHostPort(target.hostIP, target.hostPort))
+			servers = append(servers, scheme+"://"+backendHostPort(target.hostIP, target.hostPort))
 		}
 	}
 	return servers
+}
+
+// externalNameBackendURL builds the single backend URL for an ExternalName
+// Service. The port is the Ingress-declared number, or, when the Ingress
+// names the port, the matching spec.ports[].port. The second result is false
+// when the Service has no usable externalName or the named port does not
+// resolve, so the caller can skip the path instead of dialing anything else.
+func externalNameBackendURL(svc *corev1.Service, scheme string, svcPort int32, portName string) (string, bool) {
+	if err := validateExternalName(svc.Spec.ExternalName); err != nil {
+		return "", false
+	}
+	port := svcPort
+	if portName != "" {
+		port = 0
+		for _, p := range svc.Spec.Ports {
+			if p.Name == portName {
+				port = p.Port
+				break
+			}
+		}
+	}
+	if port < 1 || port > 65535 {
+		return "", false
+	}
+	// net.JoinHostPort brackets an IPv6 literal and leaves a DNS name alone.
+	return fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(svc.Spec.ExternalName, strconv.Itoa(int(port)))), true
+}
+
+// externalNameService reports whether the backend Service exists and is of
+// type ExternalName. Such a backend never uses the localhost fallback.
+func (s *Server) externalNameService(ns, svcName string) bool {
+	svc, err := s.config.Store.GetService(ns, svcName)
+	return err == nil && svc.Spec.Type == corev1.ServiceTypeExternalName
+}
+
+// backendServiceAnnotations returns the annotations of the Ingress backend
+// Service, or nil when it does not exist.
+func (s *Server) backendServiceAnnotations(ns, svcName string) map[string]string {
+	svc, err := s.config.Store.GetService(ns, svcName)
+	if err != nil {
+		return nil
+	}
+	return svc.Annotations
 }
 
 // backendHostPort is the address an on-host Traefik dials for a published

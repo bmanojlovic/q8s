@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -178,6 +179,13 @@ const (
 	annRouterPriority        = "traefik.ingress.kubernetes.io/router.priority"
 )
 
+// Traefik's own Service annotations. They select how Traefik dials a backend
+// Service and are read from the backend Service, not the Ingress.
+const (
+	annServiceServersScheme    = "traefik.ingress.kubernetes.io/service.serversscheme"
+	annServiceServersTransport = "traefik.ingress.kubernetes.io/service.serverstransport"
+)
+
 // traefikNameRE matches an entrypoint, certresolver or middleware name;
 // traefikProviderRE matches the provider suffix of a middleware reference.
 // Both values are spliced into the generated YAML, so anything that could
@@ -193,6 +201,92 @@ func validateTraefikName(annotation, value string) error {
 	}
 	if !traefikNameRE.MatchString(value) {
 		return fmt.Errorf("annotation %s: value %q is invalid: must start with an alphanumeric character and contain only alphanumeric characters, '.', '_' or '-'", annotation, value)
+	}
+	return nil
+}
+
+// dns1123SubdomainRE matches an RFC 1123 DNS subdomain without the wildcard
+// prefix hostRE accepts. externalName uses it: Kubernetes validates the field
+// as a DNS subdomain (an IPv4 literal passes that syntax) or an IPv6 literal.
+var dns1123SubdomainRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+
+// validateExternalName checks spec.externalName for a type: ExternalName
+// Service. The value is spliced into a backend URL in a YAML file Traefik
+// loads, so a quote, newline or colon there would be a config-injection
+// shape. IPv4 literals pass the DNS1123 subdomain syntax, exactly as in
+// Kubernetes; IPv6 literals are accepted explicitly and bracketed when the
+// URL is rendered.
+func validateExternalName(value string) error {
+	if len(value) == 0 {
+		return fmt.Errorf("spec.externalName is required when spec.type is ExternalName")
+	}
+	if ip := net.ParseIP(value); ip != nil && ip.To4() == nil {
+		return nil
+	}
+	if len(value) > 253 {
+		return fmt.Errorf("spec.externalName must be at most 253 characters")
+	}
+	if !dns1123SubdomainRE.MatchString(value) {
+		return fmt.Errorf("spec.externalName %q is invalid: must be a DNS-1123 subdomain or an IPv6 literal", value)
+	}
+	return nil
+}
+
+func validateServiceServersScheme(value string) error {
+	switch value {
+	case "http", "https", "h2c":
+		return nil
+	default:
+		return fmt.Errorf("annotation %s: value %q is invalid: must be one of http, https or h2c", annServiceServersScheme, value)
+	}
+}
+
+// validateTraefikTransportRef validates a serversTransport reference. Both
+// name and provider are spliced into the generated YAML, so the same rules as
+// middleware references apply: name matches traefikNameRE, provider matches
+// traefikProviderRE, and a provider is required.
+func validateTraefikTransportRef(annotation, value string) error {
+	if len(value) == 0 || len(value) > 253 {
+		return fmt.Errorf("annotation %s: transport reference must be between 1 and 253 characters", annotation)
+	}
+	i := strings.IndexByte(value, '@')
+	if i <= 0 || i == len(value)-1 {
+		return fmt.Errorf("annotation %s: transport reference %q is invalid: expected <name>@<provider>", annotation, value)
+	}
+	name, provider := value[:i], value[i+1:]
+	if !traefikNameRE.MatchString(name) || !traefikProviderRE.MatchString(provider) {
+		return fmt.Errorf("annotation %s: transport reference %q is invalid: expected <name>@<provider>", annotation, value)
+	}
+	return nil
+}
+
+// validateServiceAnnotations vets the Service annotations q8s translates
+// into Traefik configuration. Their values land in a YAML file Traefik loads,
+// so an invalid one is rejected at the API rather than written there.
+func validateServiceAnnotations(annotations map[string]string) error {
+	if v, ok := annotations[annServiceServersScheme]; ok {
+		if err := validateServiceServersScheme(v); err != nil {
+			return err
+		}
+	}
+	if v, ok := annotations[annServiceServersTransport]; ok {
+		if err := validateTraefikTransportRef(annServiceServersTransport, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateService checks the fields q8s translates into Traefik config or
+// names outside the pod network on Service create/update/patch.
+func validateService(svc *corev1.Service) error {
+	if err := validateServiceAnnotations(svc.Annotations); err != nil {
+		return err
+	}
+	if svc.Spec.Type == corev1.ServiceTypeExternalName {
+		if err := validateExternalName(svc.Spec.ExternalName); err != nil {
+			return err
+		}
 	}
 	return nil
 }
