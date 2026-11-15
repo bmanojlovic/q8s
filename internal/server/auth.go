@@ -58,6 +58,7 @@ func userInfoFromCertificate(cert *x509.Certificate) userInfo {
 type AuthMiddleware struct {
 	caCertPool *x509.CertPool
 	enabled    bool
+	revoked    *revokedCache
 }
 
 // NewAuthMiddleware creates an auth middleware with the given CA cert PEM data.
@@ -66,6 +67,12 @@ type AuthMiddleware struct {
 // client-cert verification because the CA file was truncated or corrupt would
 // fail open — the opposite of what an mTLS deployment expects.
 func NewAuthMiddleware(caCert []byte) (*AuthMiddleware, error) {
+	return NewAuthMiddlewareWithRevocation(caCert, "")
+}
+
+// NewAuthMiddlewareWithRevocation is NewAuthMiddleware plus certificate
+// revocation from revokedFile. An empty revokedFile disables revocation.
+func NewAuthMiddlewareWithRevocation(caCert []byte, revokedFile string) (*AuthMiddleware, error) {
 	if len(caCert) == 0 {
 		return &AuthMiddleware{enabled: false}, nil
 	}
@@ -78,6 +85,7 @@ func NewAuthMiddleware(caCert []byte) (*AuthMiddleware, error) {
 	return &AuthMiddleware{
 		caCertPool: pool,
 		enabled:    true,
+		revoked:    newRevokedCache(revokedFile),
 	}, nil
 }
 
@@ -102,6 +110,11 @@ func (a *AuthMiddleware) Handler(next http.Handler) http.Handler {
 		})
 		if err != nil {
 			http.Error(w, fmt.Sprintf("invalid client certificate: %v", err), http.StatusUnauthorized)
+			return
+		}
+
+		if a.revoked.isRevoked(cert) {
+			http.Error(w, "client certificate revoked", http.StatusUnauthorized)
 			return
 		}
 

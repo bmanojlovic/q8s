@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,8 +27,14 @@ type Config struct {
 	SystemdDir string // systemd user unit dir for .timer/.service files
 	ConfigDir  string // base dir for ConfigMap files: {ConfigDir}/{ns}/{cm-name}/
 	TraefikDir string // Traefik dynamic config dir for Ingress routing
-	Mode       systemd.Mode
-	Manager    *systemd.Manager
+	// DataDir is the q8s data directory. When RevokedFile is empty it is
+	// used to locate revoked.json. Empty disables certificate revocation.
+	DataDir string
+	// RevokedFile overrides <DataDir>/revoked.json. Empty means derive it
+	// from DataDir, and if that is empty too, revocation is disabled.
+	RevokedFile string
+	Mode        systemd.Mode
+	Manager     *systemd.Manager
 	// CronRuns, when set, derives CronJob run Jobs and Pods from the systemd
 	// journal. Nil disables the synthetic objects entirely.
 	CronRuns *cronruns.Source
@@ -72,7 +79,11 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("TLS certificate and key are required")
 	}
 
-	auth, err := NewAuthMiddleware(cfg.CACert)
+	revokedFile := cfg.RevokedFile
+	if revokedFile == "" && cfg.DataDir != "" {
+		revokedFile = filepath.Join(cfg.DataDir, "revoked.json")
+	}
+	auth, err := NewAuthMiddlewareWithRevocation(cfg.CACert, revokedFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set up client-cert auth: %w", err)
 	}
@@ -217,6 +228,13 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/apis/traefik.io/v1alpha1", s.handleTraefikV1Alpha1)
 	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io", s.handleRBACRoot)
 	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io/v1", s.handleRBACV1)
+	s.mux.HandleFunc("/apis/authorization.k8s.io", s.handleAuthorizationRoot)
+	s.mux.HandleFunc("/apis/authorization.k8s.io/v1", s.handleAuthorizationV1)
+	s.mux.HandleFunc("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", s.handleSelfSubjectAccessReview)
+	s.mux.HandleFunc("/apis/authorization.k8s.io/v1/subjectaccessreviews", s.handleSubjectAccessReview)
+	s.mux.HandleFunc("/apis/authentication.k8s.io", s.handleAuthenticationRoot)
+	s.mux.HandleFunc("/apis/authentication.k8s.io/v1", s.handleAuthenticationV1)
+	s.mux.HandleFunc("/apis/authentication.k8s.io/v1/selfsubjectreviews", s.handleSelfSubjectReview)
 	s.mux.HandleFunc("/apis/apiextensions.k8s.io", s.handleAPIExtensionsRoot)
 	s.mux.HandleFunc("/apis/apiextensions.k8s.io/v1", s.handleAPIExtensionsV1)
 	s.mux.HandleFunc(crdPath, s.handleCRDs)

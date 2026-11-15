@@ -52,8 +52,9 @@ type gvk struct {
 
 // servedGVKs is the single place listing the Kubernetes resource kinds q8s
 // serves. It must stay in sync with discovery: handleAPIV1, handleAppsV1,
-// handleBatchV1, handleNetworkingV1, handleStorageV1, handleCoordinationV1
-// and the deployments/scale subresource. autoscaling/v1 Scale is served as
+// handleBatchV1, handleNetworkingV1, handleStorageV1, handleCoordinationV1,
+// handleAuthorizationV1, handleAuthenticationV1 and the deployments/scale
+// subresource. autoscaling/v1 Scale is served as
 // that subresource even though q8s has no autoscaling group root. The
 // traefik.io/v1alpha1 kinds are not in the upstream swagger; addCRDDefinitions
 // adds them from the Traefik CRD file.
@@ -77,6 +78,9 @@ var servedGVKs = []gvk{
 	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"},
 	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"},
 	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"},
+	{Group: "authorization.k8s.io", Version: "v1", Kind: "SelfSubjectAccessReview"},
+	{Group: "authorization.k8s.io", Version: "v1", Kind: "SubjectAccessReview"},
+	{Group: "authentication.k8s.io", Version: "v1", Kind: "SelfSubjectReview"},
 	{Group: "storage.k8s.io", Version: "v1", Kind: "StorageClass"},
 	{Group: "autoscaling", Version: "v1", Kind: "Scale"},
 	{Group: "coordination.k8s.io", Version: "v1", Kind: "Lease"},

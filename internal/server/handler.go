@@ -19,6 +19,8 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -43,6 +45,8 @@ func init() {
 	batchv1.AddToScheme(scheme)
 	networkingv1.AddToScheme(scheme)
 	rbacv1.AddToScheme(scheme)
+	authorizationv1.AddToScheme(scheme)
+	authenticationv1.AddToScheme(scheme)
 	codecs = serializer.NewCodecFactory(scheme)
 }
 

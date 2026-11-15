@@ -150,6 +150,26 @@ func (s *Server) handleAPIsRoot(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 			{
+				Name: "authorization.k8s.io",
+				Versions: []metav1.GroupVersionForDiscovery{
+					{GroupVersion: "authorization.k8s.io/v1", Version: "v1"},
+				},
+				PreferredVersion: metav1.GroupVersionForDiscovery{
+					GroupVersion: "authorization.k8s.io/v1",
+					Version:      "v1",
+				},
+			},
+			{
+				Name: "authentication.k8s.io",
+				Versions: []metav1.GroupVersionForDiscovery{
+					{GroupVersion: "authentication.k8s.io/v1", Version: "v1"},
+				},
+				PreferredVersion: metav1.GroupVersionForDiscovery{
+					GroupVersion: "authentication.k8s.io/v1",
+					Version:      "v1",
+				},
+			},
+			{
 				Name: "metrics.k8s.io",
 				Versions: []metav1.GroupVersionForDiscovery{
 					{GroupVersion: "metrics.k8s.io/v1beta1", Version: "v1beta1"},

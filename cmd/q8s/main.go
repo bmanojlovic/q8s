@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -571,52 +570,6 @@ func cmdDisable() {
 	fmt.Println("q8s.socket disabled and stopped")
 }
 
-func cmdKubeconfig() {
-	d := resolveDirs(os.Getuid() == 0)
-	certDir := d.dataDir + "/certs"
-	port := resolvePort(d)
-
-	name := "q8s"
-	serverURL := fmt.Sprintf("https://localhost:%d", port)
-	if cfg, err := install.LoadConfig(d.dataDir); err == nil {
-		if cfg.ServerURL != "" {
-			serverURL = cfg.ServerURL
-		}
-		if cfg.Name != "" {
-			name = cfg.Name
-		}
-	}
-
-	readB64 := func(path string) string {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to read %s: %v\n", path, err)
-			os.Exit(1)
-		}
-		return base64.StdEncoding.EncodeToString(b)
-	}
-	fmt.Printf(`apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    certificate-authority-data: %s
-    server: %s
-  name: %s
-contexts:
-- context:
-    cluster: %s
-    user: %s
-  name: %s
-current-context: %s
-preferences: {}
-users:
-- name: %s
-  user:
-    client-certificate-data: %s
-    client-key-data: %s
-`, readB64(certDir+"/ca.crt"), serverURL, name, name, name, name, name, name, readB64(certDir+"/client.crt"), readB64(certDir+"/client.key"))
-}
-
 // --- Server ---
 
 // runJournalStream starts journalctl for a follow request and returns its
@@ -713,16 +666,18 @@ func cmdServe() {
 	}
 
 	srv, err := server.New(server.Config{
-		Store:      st,
-		CACert:     caCert,
-		CertPEM:    certPEM,
-		KeyPEM:     keyPEM,
-		QuadletDir: d.quadletDir,
-		SystemdDir: d.systemdDir,
-		ConfigDir:  d.configDir,
-		TraefikDir: d.dataDir + "/traefik",
-		Mode:       mode,
-		Manager:    mgr,
+		Store:       st,
+		CACert:      caCert,
+		CertPEM:     certPEM,
+		KeyPEM:      keyPEM,
+		QuadletDir:  d.quadletDir,
+		SystemdDir:  d.systemdDir,
+		ConfigDir:   d.configDir,
+		TraefikDir:  d.dataDir + "/traefik",
+		DataDir:     d.dataDir,
+		RevokedFile: install.RevokedPath(d.dataDir),
+		Mode:        mode,
+		Manager:     mgr,
 		CronRuns: &cronruns.Source{
 			Rootful: rootful,
 			Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {

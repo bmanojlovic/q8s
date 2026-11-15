@@ -32,6 +32,14 @@ func (s *Server) authorize(u userInfo, a requestAttributes) (allowed bool, reaso
 		return false, "only administrators may modify rbac.authorization.k8s.io resources"
 	}
 
+	if isSubjectAccessReview(a) {
+		return false, "only administrators may create SubjectAccessReviews"
+	}
+
+	if isBasicUserRequest(a) {
+		return true, "allowed by the system:basic-user role"
+	}
+
 	if s.resourceAllowed(u, a) {
 		return true, "allowed by a bound role"
 	}
@@ -48,6 +56,30 @@ func isRBACWrite(a requestAttributes) bool {
 	switch a.Verb {
 	case "create", "update", "patch", "delete", "deletecollection":
 		return true
+	default:
+		return false
+	}
+}
+
+// isSubjectAccessReview reports whether a creates a SubjectAccessReview.
+// Reviewing another user's access is admin-only in q8s; there is no
+// escalation path that could grant it.
+func isSubjectAccessReview(a requestAttributes) bool {
+	return a.APIGroup == "authorization.k8s.io" && a.Resource == "subjectaccessreviews" && a.Subresource == ""
+}
+
+// isBasicUserRequest reports whether a is a self-review every authenticated
+// user may create, the way the system:basic-user ClusterRole works in
+// Kubernetes.
+func isBasicUserRequest(a requestAttributes) bool {
+	if a.Verb != "create" || a.Subresource != "" || a.Name != "" || a.Namespace != "" {
+		return false
+	}
+	switch a.APIGroup {
+	case "authorization.k8s.io":
+		return a.Resource == "selfsubjectaccessreviews"
+	case "authentication.k8s.io":
+		return a.Resource == "selfsubjectreviews"
 	default:
 		return false
 	}
@@ -289,6 +321,19 @@ func (s *Server) authorizeMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		impersonated, err := applyImpersonation(r, u)
+		if err != nil {
+			status := http.StatusBadRequest
+			reason := "BadRequest"
+			if err.forbidden {
+				status = http.StatusForbidden
+				reason = "Forbidden"
+			}
+			s.respondStatus(w, status, reason, "%s", err.message)
+			return
+		}
+		u = impersonated
+		r = r.WithContext(withUserInfo(r.Context(), u))
 		a := parseRequestAttributes(r)
 		if allowed, _ := s.authorize(u, a); allowed {
 			next.ServeHTTP(w, r)
