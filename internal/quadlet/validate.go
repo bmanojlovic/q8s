@@ -148,6 +148,9 @@ func validateLabelPair(key, value string) error {
 	if key == "" || len(key) > 253 || !labelKeyRE.MatchString(key) {
 		return fmt.Errorf("label key %q is invalid", key)
 	}
+	if reservedContainerLabel(key) {
+		return fmt.Errorf("label key %q is reserved for q8s and podman", key)
+	}
 	if err := noControlChars("label value", value); err != nil {
 		return err
 	}
@@ -284,4 +287,24 @@ func expandCronField(f string, min, max int) ([]int, error) {
 		}
 	}
 	return out, nil
+}
+
+// reservedContainerLabel reports whether a pod label key would collide with
+// the labels q8s and podman put on the container itself. Pod labels are
+// copied onto the container after q8s's own, and podman keeps the last value
+// of a repeated key, so a pod labelled io.kubernetes.pod.name=<other pod>
+// would otherwise be identified as that other pod: by status sync and by the
+// ServiceAccount credential socket, which issues a credential for the pod the
+// container labels name.
+func reservedContainerLabel(key string) bool {
+	for _, prefix := range []string{"io.kubernetes.", "io.podman.", "io.containers.", "PODMAN_", "q8s.io/"} {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	switch key {
+	case "app.kubernetes.io/managed-by", TemplateHashLabel:
+		return true
+	}
+	return false
 }
