@@ -205,6 +205,15 @@ func New() *Store {
 	return s
 }
 
+// DataDir returns the directory holding the store file, or "" when the store
+// is memory only.
+func (s *Store) DataDir() string {
+	if s.dataFile == "" {
+		return ""
+	}
+	return filepath.Dir(s.dataFile)
+}
+
 // Load reads the store from dataFile if it exists; otherwise returns a fresh Store.
 // The returned store will persist changes back to dataFile on every mutation.
 func Load(dataFile string) (*Store, error) {

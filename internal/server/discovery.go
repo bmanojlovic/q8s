@@ -460,7 +460,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 				"node.kubernetes.io/instance-type": "q8s",
 			},
 		},
-		"spec": map[string]interface{}{},
+		"spec": s.nodeSpec(),
 		"status": map[string]interface{}{
 			"conditions": []map[string]interface{}{
 				{
@@ -479,14 +479,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 					"reason":             "KubeletHasSufficientMemory",
 					"message":            "q8s has sufficient memory available",
 				},
-				{
-					"type":               "DiskPressure",
-					"status":             "False",
-					"lastHeartbeatTime":  now.Format(time.RFC3339),
-					"lastTransitionTime": bootTime.Format(time.RFC3339),
-					"reason":             "KubeletHasNoDiskPressure",
-					"message":            "q8s has no disk pressure",
-				},
+				s.diskPressureCondition(now, bootTime),
 				{
 					"type":               "PIDPressure",
 					"status":             "False",
@@ -584,12 +577,12 @@ func (s *Server) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 				"node.kubernetes.io/instance-type": "q8s",
 			},
 		},
-		"spec": map[string]interface{}{},
+		"spec": s.nodeSpec(),
 		"status": map[string]interface{}{
 			"conditions": []map[string]interface{}{
 				{"type": "Ready", "status": "True", "lastHeartbeatTime": now.Format(time.RFC3339), "lastTransitionTime": bootTime.Format(time.RFC3339), "reason": "KubeletReady", "message": "q8s node is always ready"},
 				{"type": "MemoryPressure", "status": "False", "lastHeartbeatTime": now.Format(time.RFC3339), "lastTransitionTime": bootTime.Format(time.RFC3339), "reason": "KubeletHasSufficientMemory", "message": "q8s has sufficient memory available"},
-				{"type": "DiskPressure", "status": "False", "lastHeartbeatTime": now.Format(time.RFC3339), "lastTransitionTime": bootTime.Format(time.RFC3339), "reason": "KubeletHasNoDiskPressure", "message": "q8s has no disk pressure"},
+				s.diskPressureCondition(now, bootTime),
 				{"type": "PIDPressure", "status": "False", "lastHeartbeatTime": now.Format(time.RFC3339), "lastTransitionTime": bootTime.Format(time.RFC3339), "reason": "KubeletHasSufficientPID", "message": "q8s has sufficient PID available"},
 			},
 			"addresses": []map[string]string{

@@ -54,6 +54,8 @@ type Server struct {
 	// ops stay nil in tests (Manager nil), so nothing can reach real podman
 	// unless cmd/q8s installed the CLI-backed implementation through New.
 	network *networkState
+	// disk caches the short-lived disk pressure check for write requests.
+	disk diskPressureCache
 }
 
 // maxRequestBodyBytes caps request bodies (same order of magnitude as real
@@ -152,7 +154,42 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "dryRun is only supported for pods")
 		return
 	}
+	if isDiskWrite(r.Method) && !isStreamingSubresource(r.URL.Path) {
+		if low, detail := s.diskPressureLow(); low {
+			s.respondStatus(w, http.StatusInsufficientStorage, "InsufficientStorage",
+				"q8s refuses changes: low disk space (%s); free space and retry", detail)
+			return
+		}
+	}
 	s.handler.ServeHTTP(w, r)
+}
+
+// isDiskWrite reports whether method changes stored state. DELETE is left out
+// on purpose: deleting must stay possible so an operator can free space.
+func isDiskWrite(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		return true
+	default:
+		return false
+	}
+}
+
+// isStreamingSubresource reports whether path is a pod exec, attach or
+// portforward request. They write nothing, so the disk guard must not block
+// them.
+func isStreamingSubresource(path string) bool {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for i, part := range parts {
+		if part != "pods" || i+2 >= len(parts) {
+			continue
+		}
+		switch parts[i+2] {
+		case "exec", "attach", "portforward":
+			return true
+		}
+	}
+	return false
 }
 
 // isPodWritePath reports whether path is /api/v1/namespaces/NS/pods or

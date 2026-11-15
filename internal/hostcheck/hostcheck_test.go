@@ -31,6 +31,7 @@ type fake struct {
 	cmds      map[string]cmdResult
 	fs        map[string]string
 	writable  map[string]bool
+	diskFree  map[string][2]uint64
 	lingerOn  bool
 	lingerErr error
 	env       Env
@@ -97,6 +98,7 @@ func newFake(t *testing.T, rootful bool) *fake {
 		f.fs["/run/user/1000/q8s"] = "ext4"
 	}
 	f.writable = map[string]bool{dirs.Traefik: true}
+	f.diskFree = make(map[string][2]uint64)
 	f.lingerOn = true
 
 	f.env = Env{
@@ -130,6 +132,12 @@ func newFake(t *testing.T, rootful bool) *fake {
 		},
 		Writable: func(path string) bool {
 			return f.writable[path]
+		},
+		DiskFree: func(path string) (uint64, uint64, error) {
+			if v, ok := f.diskFree[path]; ok {
+				return v[0], v[1], nil
+			}
+			return 10 << 30, 100 << 20, nil
 		},
 		Linger: func() (bool, error) {
 			return f.lingerOn, f.lingerErr
@@ -657,14 +665,14 @@ func TestFirewallReloadCheck(t *testing.T) {
 func TestCheckOrderAndRootfulSkipsLinger(t *testing.T) {
 	rootful := newFake(t, true)
 	got := checkIDs(Run(rootful.env))
-	want := []string{"podman", "kernel", "userns", "idmap", "cgroups", "network", "firewall-reload", "certificates", "traefik-dir"}
+	want := []string{"podman", "kernel", "userns", "idmap", "cgroups", "network", "firewall-reload", "certificates", "traefik-dir", "disk"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rootful check ids = %v, want %v", got, want)
 	}
 
 	rootless := newFake(t, false)
 	got = checkIDs(Run(rootless.env))
-	want = []string{"podman", "kernel", "userns", "idmap", "linger", "cgroups", "network", "certificates", "traefik-dir"}
+	want = []string{"podman", "kernel", "userns", "idmap", "linger", "cgroups", "network", "certificates", "traefik-dir", "disk"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rootless check ids = %v, want %v", got, want)
 	}
@@ -695,6 +703,48 @@ func TestTraefikDirCheck(t *testing.T) {
 		}
 		if !strings.Contains(c.Loss, "Ingress changes cannot be written") {
 			t.Errorf("loss %q should explain the failure", c.Loss)
+		}
+	})
+}
+
+func TestDiskSpaceCheck(t *testing.T) {
+	t.Run("enough free", func(t *testing.T) {
+		f := newFake(t, true)
+		c := getCheck(t, Run(f.env), "disk")
+		if c.Status != StatusOK {
+			t.Fatalf("status = %q, want ok (detail %q)", c.Status, c.Detail)
+		}
+		if !strings.Contains(c.Detail, f.env.Dirs.Quadlet) {
+			t.Errorf("detail %q should mention the quadlet dir", c.Detail)
+		}
+	})
+	t.Run("low data dir", func(t *testing.T) {
+		f := newFake(t, true)
+		f.diskFree[f.env.Dirs.Data] = [2]uint64{10 << 20, 100 << 20}
+		c := getCheck(t, Run(f.env), "disk")
+		if c.Status != StatusWarn {
+			t.Fatalf("status = %q, want warn", c.Status)
+		}
+		if !strings.Contains(c.Fix, f.env.Dirs.Data) {
+			t.Errorf("fix %q should name the low path", c.Fix)
+		}
+	})
+	t.Run("no statfs", func(t *testing.T) {
+		f := newFake(t, true)
+		f.env.DiskFree = nil
+		c := getCheck(t, Run(f.env), "disk")
+		if c.Status != StatusInfo {
+			t.Fatalf("status = %q, want info", c.Status)
+		}
+	})
+	t.Run("statfs unavailable", func(t *testing.T) {
+		f := newFake(t, true)
+		f.env.DiskFree = func(string) (uint64, uint64, error) {
+			return 0, 0, fmt.Errorf("boom")
+		}
+		c := getCheck(t, Run(f.env), "disk")
+		if c.Status != StatusInfo {
+			t.Fatalf("status = %q, want info when no path could be checked", c.Status)
 		}
 	})
 }

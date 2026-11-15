@@ -65,6 +65,10 @@ type Env struct {
 	Command  func(name string, args ...string) ([]byte, error) // stdout only
 	FSType   func(path string) (string, error)                 // "ext4","xfs","btrfs","tmpfs","overlay","zfs","nfs","other:0x..."
 	Writable func(path string) bool
+	// DiskFree reports free bytes and the required free bytes for a path,
+	// using the same thresholds as the API server's write guard. Optional:
+	// nil means the check reports that it could not inspect the host.
+	DiskFree func(path string) (free, need uint64, err error)
 	Linger   func() (bool, error) // rootless only
 	Now      time.Time
 	Dirs     Dirs
@@ -162,6 +166,7 @@ func Run(env Env) Report {
 	certCheck, certInfo := checkCertificates(env)
 	r.Checks = append(r.Checks, certCheck)
 	r.Checks = append(r.Checks, checkTraefikDir(env))
+	r.Checks = append(r.Checks, checkDiskSpace(env))
 
 	r.Summary = buildSummary(env, r.Checks, certInfo)
 	if r.Summary == nil {
@@ -748,6 +753,77 @@ func checkTraefikDir(env Env) Check {
 	c.Loss = "Ingress changes cannot be written: " + env.Dirs.Traefik + " is not writable"
 	c.Fix = "chown " + userLabel(env) + " " + env.Dirs.Traefik
 	return c
+}
+
+// checkDiskSpace reports low free space on the directories q8s persists to.
+// It reads the thresholds through Env.DiskFree so it cannot drift from the
+// API server's write guard.
+func checkDiskSpace(env Env) Check {
+	c := Check{ID: "disk", Title: "disk space"}
+	if env.DiskFree == nil {
+		c.Status = StatusInfo
+		c.Detail = "not checked (no statfs)"
+		return c
+	}
+	paths := make([]string, 0, 2)
+	if env.Dirs.Data != "" {
+		paths = append(paths, env.Dirs.Data)
+	}
+	if env.Dirs.Quadlet != "" && env.Dirs.Quadlet != env.Dirs.Data {
+		paths = append(paths, env.Dirs.Quadlet)
+	}
+	if len(paths) == 0 {
+		c.Status = StatusInfo
+		c.Detail = "no data directory to check"
+		return c
+	}
+
+	var parts, low []string
+	checked := 0
+	for _, path := range paths {
+		free, need, err := env.DiskFree(path)
+		if err != nil {
+			parts = append(parts, path+": statfs unavailable")
+			continue
+		}
+		checked++
+		parts = append(parts, path+": "+humanBytes(free)+" free, need "+humanBytes(need))
+		if free < need {
+			low = append(low, path)
+		}
+	}
+	c.Detail = strings.Join(parts, ", ")
+	if checked == 0 {
+		c.Status = StatusInfo
+		return c
+	}
+	if len(low) > 0 {
+		c.Status = StatusWarn
+		c.Loss = "q8s refuses API changes while free space is below the threshold; running containers keep running"
+		c.Fix = "free space on " + strings.Join(low, " and ")
+		return c
+	}
+	c.Status = StatusOK
+	c.Gain = "q8s can persist changes"
+	return c
+}
+
+func humanBytes(n uint64) string {
+	const (
+		kib = 1 << 10
+		mib = 1 << 20
+		gib = 1 << 30
+	)
+	switch {
+	case n >= gib:
+		return fmt.Sprintf("%.1f GiB", float64(n)/gib)
+	case n >= mib:
+		return fmt.Sprintf("%.1f MiB", float64(n)/mib)
+	case n >= kib:
+		return fmt.Sprintf("%.1f KiB", float64(n)/kib)
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 func buildSummary(env Env, checks []Check, cert certInfo) []SummaryLine {

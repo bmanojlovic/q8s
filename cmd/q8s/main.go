@@ -460,6 +460,7 @@ func cmdDoctor() {
 		},
 		FSType:   realFSType,
 		Writable: func(path string) bool { return unix.Access(path, unix.W_OK) == nil },
+		DiskFree: server.DiskFree,
 		Linger:   install.LingerEnabled,
 		Now:      time.Now(),
 		Dirs: hostcheck.Dirs{
