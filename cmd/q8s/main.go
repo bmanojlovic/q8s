@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/cronruns"
+	"q8s/internal/fsutil"
 	"q8s/internal/hostcheck"
 	"q8s/internal/podman"
 	"q8s/internal/quadlet"
@@ -341,9 +342,10 @@ func cmdUninstall() {
 	// The certs directory includes the CA private key — an "uninstall" that
 	// leaves a CA key on disk is not an uninstall.
 	for _, p := range []string{
-		d.dataDir + "/certs",    // ca.key, server/client keys
-		d.dataDir + "/traefik",  // generated ingress dynamic configs
-		d.dataDir + "/quadlets", // legacy empty dir from old installs
+		d.dataDir + "/certs",     // ca.key, server/client keys
+		d.dataDir + "/traefik",   // generated ingress dynamic configs
+		d.dataDir + "/quadlets",  // legacy empty dir from old installs
+		d.dataDir + "/snapshots", // gzip store snapshots, derived from store.json
 		d.dataDir + "/config.json",
 	} {
 		if err := os.RemoveAll(p); err != nil {
@@ -791,7 +793,7 @@ func ensureNamespaceNetworks(quadletDir string, mgr *systemd.Manager, st *store.
 		if err := os.MkdirAll(quadletDir, 0755); err != nil {
 			continue
 		}
-		if err := os.WriteFile(filename, content, 0644); err != nil {
+		if err := fsutil.WriteFileAtomic(filename, content, 0644); err != nil {
 			fmt.Printf("failed to write network quadlet for namespace %s: %v\n", ns.Name, err)
 			continue
 		}
@@ -816,7 +818,7 @@ func restoreSecretFiles(secretDir string, st *store.Store) {
 			continue
 		}
 		for key, val := range sec.Data {
-			if err := os.WriteFile(dir+"/"+key, val, 0600); err != nil {
+			if err := fsutil.WriteFileAtomic(dir+"/"+key, val, 0600); err != nil {
 				fmt.Printf("restore secret %s/%s key %s: %v\n", sec.Namespace, sec.Name, key, err)
 			}
 		}
@@ -835,12 +837,12 @@ func restoreConfigMapFiles(configDir string, st *store.Store) {
 			continue
 		}
 		for key, val := range cm.Data {
-			if err := os.WriteFile(filepath.Join(dir, key), []byte(val), 0644); err != nil {
+			if err := fsutil.WriteFileAtomic(filepath.Join(dir, key), []byte(val), 0644); err != nil {
 				fmt.Printf("restore configmap %s/%s key %s: %v\n", cm.Namespace, cm.Name, key, err)
 			}
 		}
 		for key, val := range cm.BinaryData {
-			if err := os.WriteFile(filepath.Join(dir, key), val, 0644); err != nil {
+			if err := fsutil.WriteFileAtomic(filepath.Join(dir, key), val, 0644); err != nil {
 				fmt.Printf("restore configmap %s/%s key %s: %v\n", cm.Namespace, cm.Name, key, err)
 			}
 		}

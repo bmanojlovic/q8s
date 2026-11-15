@@ -1,11 +1,17 @@
 package store
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,9 +52,13 @@ type snapshot struct {
 
 // Store is an in-memory store for k8s resources.
 type Store struct {
-	mu                  sync.RWMutex
-	saveMu              sync.Mutex // serialises file writes
-	dataFile            string
+	mu       sync.RWMutex
+	saveMu   sync.Mutex // serialises file writes
+	dataFile string
+	// lastGood is the JSON of the state that was last successfully written
+	// to dataFile (or loaded from it). A failed write restores the in-memory
+	// maps from it so memory never gets ahead of disk.
+	lastGood            []byte
 	pods                map[types.NamespacedName]*corev1.Pod
 	services            map[types.NamespacedName]*corev1.Service
 	pvcs                map[types.NamespacedName]*corev1.PersistentVolumeClaim
@@ -230,15 +240,34 @@ func (s *Store) DataDir() string {
 	return filepath.Dir(s.dataFile)
 }
 
+// ErrPersist marks a store mutation that could not be written to disk. The
+// in-memory state has already been rolled back to the last persisted state
+// when it is returned.
+var ErrPersist = errors.New("store: could not persist change")
+
+// snapshotRetain is how many gzip snapshots are kept next to store.json.
+const snapshotRetain = 20
+
 // Load reads the store from dataFile if it exists; otherwise returns a fresh Store.
 // The returned store will persist changes back to dataFile on every mutation.
+//
+// If store.json is missing or unparseable but a gzip snapshot can be read,
+// Load recovers the newest readable snapshot, keeps the unreadable file as
+// store.json.corrupt-<unix time> and rewrites store.json immediately.
 func Load(dataFile string) (*Store, error) {
 	s := newEmpty()
 	s.dataFile = dataFile
 
 	data, err := os.ReadFile(dataFile)
 	if os.IsNotExist(err) {
+		if file, snap, raw, ok := s.newestValidSnapshot(); ok {
+			s.adoptSnapshot(file, snap, raw, err)
+			return s, nil
+		}
+		s.mu.Lock()
 		s.ensureDefaultNamespace()
+		s.mu.Unlock()
+		s.setLastGoodFromState()
 		return s, nil
 	}
 	if err != nil {
@@ -247,70 +276,392 @@ func Load(dataFile string) (*Store, error) {
 
 	var snap snapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil, fmt.Errorf("parsing store file: %w", err)
+		parseErr := fmt.Errorf("parsing store file: %w", err)
+		file, good, raw, ok := s.newestValidSnapshot()
+		if !ok {
+			return nil, parseErr
+		}
+		s.keepCorruptStoreFile()
+		s.adoptSnapshot(file, good, raw, parseErr)
+		return s, nil
 	}
 
-	s.resourceVer = snap.ResourceVer
 	backfillCreationTimestamps(&snap, dataFile)
+	s.mu.Lock()
+	s.installSnapshotLocked(&snap)
+	s.lastGood = append([]byte(nil), data...)
+	s.mu.Unlock()
+	return s, nil
+}
+
+// adoptSnapshot installs a recovered snapshot, records it as the last good
+// state, logs the recovery and rewrites store.json so the next start is clean.
+func (s *Store) adoptSnapshot(file string, snap *snapshot, raw []byte, readErr error) {
+	s.mu.Lock()
+	s.installSnapshotLocked(snap)
+	s.lastGood = append([]byte(nil), raw...)
+	s.mu.Unlock()
+
+	fmt.Printf("store: store.json unreadable (%v), recovered from snapshot %s (rv %d)\n", readErr, file, snap.ResourceVer)
+	if err := s.persist(); err != nil {
+		fmt.Printf("store: rewriting store.json after snapshot recovery failed: %v\n", err)
+	}
+}
+
+// keepCorruptStoreFile renames an unreadable store.json instead of deleting
+// it, so its contents can still be inspected after the recovery.
+func (s *Store) keepCorruptStoreFile() {
+	base := s.dataFile + ".corrupt-" + strconv.FormatInt(time.Now().Unix(), 10)
+	path := base
+	for i := 1; ; i++ {
+		if _, err := os.Stat(path); err != nil {
+			break
+		}
+		path = fmt.Sprintf("%s.%d", base, i)
+	}
+	if err := os.Rename(s.dataFile, path); err != nil {
+		fmt.Printf("store: keeping unreadable store file: %v\n", err)
+		return
+	}
+	fmt.Printf("store: kept unreadable store file as %s\n", path)
+}
+
+// installSnapshotLocked replaces every resource map with the contents of
+// snap. It is the single per-kind loop shared by Load, snapshot recovery and
+// rollback after a failed write, so all three restore state identically.
+// s.mu must be held. The resourceVersion never goes backwards.
+func (s *Store) installSnapshotLocked(snap *snapshot) {
+	pods := make(map[types.NamespacedName]*corev1.Pod, len(snap.Pods))
 	for _, p := range snap.Pods {
-		s.pods[types.NamespacedName{Namespace: p.Namespace, Name: p.Name}] = p
+		pods[types.NamespacedName{Namespace: p.Namespace, Name: p.Name}] = p
 	}
+	services := make(map[types.NamespacedName]*corev1.Service, len(snap.Services))
 	for _, svc := range snap.Services {
-		s.services[types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}] = svc
+		services[types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}] = svc
 	}
+	pvcs := make(map[types.NamespacedName]*corev1.PersistentVolumeClaim, len(snap.PVCs))
 	for _, pvc := range snap.PVCs {
-		s.pvcs[types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}] = pvc
+		pvcs[types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}] = pvc
 	}
+	configmaps := make(map[types.NamespacedName]*corev1.ConfigMap, len(snap.ConfigMaps))
 	for _, cm := range snap.ConfigMaps {
-		s.configmaps[types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}] = cm
+		configmaps[types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}] = cm
 	}
+	secrets := make(map[types.NamespacedName]*corev1.Secret, len(snap.Secrets))
 	for _, sec := range snap.Secrets {
 		// Self-heal legacy secrets stored before the tic-b31a fix: fold any
 		// StringData into Data at load time so a bare restart's
 		// restoreSecretFiles (which writes only from Data) rewrites real
-		// content instead of empty placeholders. Idempotent — a
-		// normalized secret (StringData nil) is left untouched. See tic-c627.
+		// content instead of empty placeholders. Idempotent: a normalized
+		// secret (StringData nil) is left untouched. See tic-c627.
 		normalizeSecret(sec)
-		s.secrets[types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}] = sec
+		secrets[types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}] = sec
 	}
+	serviceAccounts := make(map[types.NamespacedName]*corev1.ServiceAccount, len(snap.ServiceAccounts))
 	for _, sa := range snap.ServiceAccounts {
-		s.serviceAccounts[types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}] = sa
+		serviceAccounts[types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}] = sa
 	}
+	namespaces := make(map[types.NamespacedName]*corev1.Namespace, len(snap.Namespaces))
 	for _, ns := range snap.Namespaces {
-		s.namespaces[types.NamespacedName{Name: ns.Name}] = ns
+		namespaces[types.NamespacedName{Name: ns.Name}] = ns
 	}
+	jobs := make(map[types.NamespacedName]*batchv1.Job, len(snap.Jobs))
 	for _, j := range snap.Jobs {
-		s.jobs[types.NamespacedName{Namespace: j.Namespace, Name: j.Name}] = j
+		jobs[types.NamespacedName{Namespace: j.Namespace, Name: j.Name}] = j
 	}
+	cronjobs := make(map[types.NamespacedName]*batchv1.CronJob, len(snap.CronJobs))
 	for _, cj := range snap.CronJobs {
-		s.cronjobs[types.NamespacedName{Namespace: cj.Namespace, Name: cj.Name}] = cj
+		cronjobs[types.NamespacedName{Namespace: cj.Namespace, Name: cj.Name}] = cj
 	}
+	deployments := make(map[types.NamespacedName]*appsv1.Deployment, len(snap.Deployments))
 	for _, dep := range snap.Deployments {
-		s.deployments[types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}] = dep
+		deployments[types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}] = dep
 	}
+	ingresses := make(map[types.NamespacedName]*networkingv1.Ingress, len(snap.Ingresses))
 	for _, ing := range snap.Ingresses {
-		s.ingresses[types.NamespacedName{Namespace: ing.Namespace, Name: ing.Name}] = ing
+		ingresses[types.NamespacedName{Namespace: ing.Namespace, Name: ing.Name}] = ing
 	}
+	middlewares := make(map[types.NamespacedName]*traefik.Middleware, len(snap.Middlewares))
 	for _, mw := range snap.Middlewares {
-		s.middlewares[types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}] = mw
+		middlewares[types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}] = mw
 	}
+	ingressRouteTCPs := make(map[types.NamespacedName]*traefik.IngressRouteTCP, len(snap.IngressRouteTCPs))
 	for _, irt := range snap.IngressRouteTCPs {
-		s.ingressRouteTCPs[types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}] = irt
+		ingressRouteTCPs[types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}] = irt
 	}
+	roles := make(map[types.NamespacedName]*rbacv1.Role, len(snap.Roles))
 	for _, role := range snap.Roles {
-		s.roles[types.NamespacedName{Namespace: role.Namespace, Name: role.Name}] = role
+		roles[types.NamespacedName{Namespace: role.Namespace, Name: role.Name}] = role
 	}
+	roleBindings := make(map[types.NamespacedName]*rbacv1.RoleBinding, len(snap.RoleBindings))
 	for _, rb := range snap.RoleBindings {
-		s.roleBindings[types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}] = rb
+		roleBindings[types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}] = rb
 	}
+	clusterRoles := make(map[string]*rbacv1.ClusterRole, len(snap.ClusterRoles))
 	for _, cr := range snap.ClusterRoles {
-		s.clusterRoles[cr.Name] = cr
+		clusterRoles[cr.Name] = cr
 	}
+	clusterRoleBindings := make(map[string]*rbacv1.ClusterRoleBinding, len(snap.ClusterRoleBindings))
 	for _, crb := range snap.ClusterRoleBindings {
-		s.clusterRoleBindings[crb.Name] = crb
+		clusterRoleBindings[crb.Name] = crb
 	}
+
+	s.pods = pods
+	s.services = services
+	s.pvcs = pvcs
+	s.configmaps = configmaps
+	s.secrets = secrets
+	s.serviceAccounts = serviceAccounts
+	s.namespaces = namespaces
+	s.jobs = jobs
+	s.cronjobs = cronjobs
+	s.deployments = deployments
+	s.ingresses = ingresses
+	s.middlewares = middlewares
+	s.ingressRouteTCPs = ingressRouteTCPs
+	s.roles = roles
+	s.roleBindings = roleBindings
+	s.clusterRoles = clusterRoles
+	s.clusterRoleBindings = clusterRoleBindings
 	s.ensureDefaultNamespace()
-	return s, nil
+	if snap.ResourceVer > s.resourceVer {
+		s.resourceVer = snap.ResourceVer
+	}
+}
+
+// setLastGoodFromState records the current state as the last persisted one.
+// Used by Load for a fresh store, which is never written until its first
+// mutation.
+func (s *Store) setLastGoodFromState() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := json.Marshal(s.snapshot())
+	if err != nil {
+		fmt.Printf("store: marshal error: %v\n", err)
+		return
+	}
+	s.lastGood = data
+}
+
+// snapshotsDir is the directory holding the gzip snapshots next to store.json.
+func (s *Store) snapshotsDir() string {
+	return filepath.Join(filepath.Dir(s.dataFile), "snapshots")
+}
+
+// snapshotFile is one store.<rv>.json.gz in snapshotsDir.
+type snapshotFile struct {
+	path string
+	rv   int
+}
+
+func parseSnapshotName(name string) (int, bool) {
+	if !strings.HasPrefix(name, "store.") || !strings.HasSuffix(name, ".json.gz") {
+		return 0, false
+	}
+	rv, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "store."), ".json.gz"))
+	if err != nil {
+		return 0, false
+	}
+	return rv, true
+}
+
+// listSnapshotFiles returns the snapshots newest first by numeric
+// resourceVersion. Unreadable directory means no snapshots.
+func (s *Store) listSnapshotFiles() []snapshotFile {
+	entries, err := os.ReadDir(s.snapshotsDir())
+	if err != nil {
+		return nil
+	}
+	var files []snapshotFile
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		rv, ok := parseSnapshotName(e.Name())
+		if !ok {
+			continue
+		}
+		files = append(files, snapshotFile{path: filepath.Join(s.snapshotsDir(), e.Name()), rv: rv})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].rv > files[j].rv })
+	return files
+}
+
+func readSnapshotFile(path string) (*snapshot, []byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, nil, err
+	}
+	data, err := io.ReadAll(zr)
+	zr.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+	var snap snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, nil, err
+	}
+	return &snap, data, nil
+}
+
+// newestValidSnapshot returns the newest snapshot that decompresses and
+// parses. Corrupt snapshots are skipped and reported.
+func (s *Store) newestValidSnapshot() (string, *snapshot, []byte, bool) {
+	for _, f := range s.listSnapshotFiles() {
+		snap, data, err := readSnapshotFile(f.path)
+		if err != nil {
+			fmt.Printf("store: snapshot %s unreadable: %v\n", f.path, err)
+			continue
+		}
+		backfillCreationTimestamps(snap, s.dataFile)
+		return f.path, snap, data, true
+	}
+	return "", nil, nil, false
+}
+
+// writeSnapshot stores the just-persisted JSON as snapshots/store.<rv>.json.gz
+// and prunes older snapshots. Snapshot failures are logged but never fail the
+// persist that produced them.
+// writeSnapshot returns the compressed size, or 0 when no snapshot was written.
+func (s *Store) writeSnapshot(rv int, data []byte) int {
+	dir := s.snapshotsDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fmt.Printf("store: snapshot mkdir %s: %v\n", dir, err)
+		return 0
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		fmt.Printf("store: snapshot compress: %v\n", err)
+		return 0
+	}
+	if err := zw.Close(); err != nil {
+		fmt.Printf("store: snapshot compress: %v\n", err)
+		return 0
+	}
+	path := filepath.Join(dir, fmt.Sprintf("store.%d.json.gz", rv))
+	tmp := path + ".tmp"
+	if err := writeFileSync(tmp, buf.Bytes(), 0600); err != nil {
+		fmt.Printf("store: snapshot write %s: %v\n", tmp, err)
+		return 0
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		fmt.Printf("store: snapshot rename %s: %v\n", tmp, err)
+		return 0
+	}
+	s.pruneSnapshots()
+	return buf.Len()
+}
+
+// pruneSnapshots keeps only the newest snapshotRetain snapshots by rv.
+func (s *Store) pruneSnapshots() {
+	files := s.listSnapshotFiles()
+	if len(files) <= snapshotRetain {
+		return
+	}
+	for _, f := range files[snapshotRetain:] {
+		if err := os.Remove(f.path); err != nil {
+			fmt.Printf("store: removing old snapshot %s: %v\n", f.path, err)
+		}
+	}
+}
+
+// persist writes the store to disk atomically (temp file + fsync + rename)
+// and keeps a gzip snapshot of every successful write.
+//
+// saveMu is acquired first so that concurrent saves always write the latest
+// state: the winner of saveMu captures a fresh snapshot under mu.RLock,
+// so a stale snapshot can never overwrite a newer one. Callers must not hold
+// s.mu. On a write failure the in-memory maps are rolled back to lastGood
+// before the error is returned.
+func (s *Store) persist() error {
+	s.notifyChanged()
+
+	if s.dataFile == "" {
+		return nil
+	}
+
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
+	start := time.Now()
+	s.mu.RLock()
+	snap := s.snapshot()
+	s.mu.RUnlock()
+
+	data, err := json.Marshal(snap)
+	if err != nil {
+		fmt.Printf("store: marshal error: %v\n", err)
+		return fmt.Errorf("%w: %v", ErrPersist, err)
+	}
+
+	if err := s.writeStoreFile(data); err != nil {
+		s.rollback(err)
+		return fmt.Errorf("%w: %v", ErrPersist, err)
+	}
+
+	s.mu.Lock()
+	s.lastGood = append([]byte(nil), data...)
+	s.mu.Unlock()
+
+	written := time.Since(start)
+	if gz := s.writeSnapshot(snap.ResourceVer, data); gz > 0 {
+		fmt.Printf("store: saved rv %d (%d KB, %d ms, snapshot %d KB)\n",
+			snap.ResourceVer, len(data)/1024, written.Milliseconds(), gz/1024)
+	} else {
+		fmt.Printf("store: saved rv %d (%d KB, %d ms, no snapshot)\n",
+			snap.ResourceVer, len(data)/1024, written.Milliseconds())
+	}
+	return nil
+}
+
+// writeStoreFile writes data to dataFile atomically. Every failing step is
+// part of the returned error: the caller rolls memory back when it fails.
+func (s *Store) writeStoreFile(data []byte) error {
+	dir := filepath.Dir(s.dataFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	tmp := s.dataFile + ".tmp"
+	// Sync before the rename: without it a power loss right after the
+	// rename can leave an empty store.json on ext4/xfs.
+	if err := writeFileSync(tmp, data, 0600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, s.dataFile); err != nil {
+		return fmt.Errorf("rename %s: %w", tmp, err)
+	}
+	return nil
+}
+
+// rollback restores the resource maps from the last successfully persisted
+// JSON after a failed write. The resourceVersion only moves forward, so a
+// version handed out to a client is never reused. Watchers are woken so they
+// re-read the restored objects.
+func (s *Store) rollback(writeErr error) {
+	s.mu.Lock()
+	if len(s.lastGood) == 0 {
+		s.mu.Unlock()
+		fmt.Printf("store: write failed, rolled back to last persisted state: %v\n", writeErr)
+		s.notifyChanged()
+		return
+	}
+	var snap snapshot
+	if err := json.Unmarshal(s.lastGood, &snap); err != nil {
+		s.mu.Unlock()
+		fmt.Printf("store: write failed (%v), could not restore last persisted state: %v\n", writeErr, err)
+		s.notifyChanged()
+		return
+	}
+	s.installSnapshotLocked(&snap)
+	s.mu.Unlock()
+	fmt.Printf("store: write failed, rolled back to last persisted state: %v\n", writeErr)
+	s.notifyChanged()
 }
 
 // normalizeSecret folds a Secret's StringData into Data so Data is the single
@@ -341,47 +692,6 @@ func (s *Store) ensureDefaultNamespace() {
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Namespace"},
 			ObjectMeta: metav1.ObjectMeta{Name: "default", UID: "q8s-default-ns"},
 		}
-	}
-}
-
-// save writes the store to disk atomically (temp file + rename).
-// saveMu is acquired first so that concurrent saves always write the latest
-// state: the winner of saveMu captures a fresh snapshot under mu.RLock,
-// so a stale snapshot can never overwrite a newer one.
-func (s *Store) save() {
-	s.notifyChanged()
-
-	if s.dataFile == "" {
-		return
-	}
-
-	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
-
-	s.mu.RLock()
-	snap := s.snapshot()
-	s.mu.RUnlock()
-
-	data, err := json.Marshal(snap)
-	if err != nil {
-		fmt.Printf("store: marshal error: %v\n", err)
-		return
-	}
-
-	dir := filepath.Dir(s.dataFile)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Printf("store: mkdir %s: %v\n", dir, err)
-		return
-	}
-	tmp := s.dataFile + ".tmp"
-	// Sync before the rename: without it a power loss right after the
-	// rename can leave an empty store.json on ext4/xfs.
-	if err := writeFileSync(tmp, data, 0600); err != nil {
-		fmt.Printf("store: write %s: %v\n", tmp, err)
-		return
-	}
-	if err := os.Rename(tmp, s.dataFile); err != nil {
-		fmt.Printf("store: rename %s: %v\n", tmp, err)
 	}
 }
 
@@ -544,7 +854,9 @@ func (s *Store) CreateNamespace(ns *corev1.Namespace) (*corev1.Namespace, error)
 	}
 	s.namespaces[key] = ns
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return ns.DeepCopy(), nil
 }
 
@@ -578,7 +890,9 @@ func (s *Store) UpdateNamespace(ns *corev1.Namespace) (*corev1.Namespace, error)
 	}
 	s.namespaces[key] = ns
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return ns.DeepCopy(), nil
 }
 
@@ -592,7 +906,9 @@ func (s *Store) DeleteNamespace(name string) error {
 	}
 	delete(s.namespaces, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -681,7 +997,7 @@ func (s *Store) PurgeNamespace(name string) {
 	}
 	s.resourceVer++
 	s.mu.Unlock()
-	go s.save()
+	s.persist()
 }
 
 // --- Pods ---
@@ -729,7 +1045,9 @@ func (s *Store) CreatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 	}
 	s.pods[key] = pod
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	s.recordEvent("Pod", pod.Namespace, pod.Name, pod.UID, corev1.EventTypeNormal, "Created",
 		fmt.Sprintf("Created pod %s/%s", pod.Namespace, pod.Name))
 	return pod.DeepCopy(), nil
@@ -759,7 +1077,9 @@ func (s *Store) DeletePod(ns, name string) error {
 	delete(s.pods, key)
 	s.forgetRunStarts(key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	s.recordEvent("Pod", ns, name, pod.UID, corev1.EventTypeNormal, "Deleted",
 		fmt.Sprintf("Deleted pod %s/%s", ns, name))
 	return nil
@@ -778,7 +1098,9 @@ func (s *Store) UpdatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 	pod.ResourceVersion = s.incRV()
 	s.pods[key] = pod
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return pod.DeepCopy(), nil
 }
 
@@ -815,7 +1137,7 @@ func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
 	updated.ResourceVersion = s.incRV()
 	s.pods[key] = updated
 	s.mu.Unlock()
-	go s.save()
+	s.persist()
 	return true
 }
 
@@ -901,7 +1223,7 @@ func (s *Store) UpdatePodPhaseState(ns, name string, phase corev1.PodPhase, obs 
 	uid := pod.UID
 	s.mu.Unlock()
 	if changed {
-		go s.save()
+		s.persist()
 		if phaseChanged {
 			if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
 				s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
@@ -1143,7 +1465,7 @@ func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase,
 	uid := pod.UID
 	s.mu.Unlock()
 	if changed {
-		go s.save()
+		s.persist()
 		if phaseChanged {
 			if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
 				s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
@@ -1241,7 +1563,7 @@ func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCo
 	}
 	s.mu.Unlock()
 	if changed {
-		go s.save()
+		s.persist()
 	}
 }
 
@@ -1382,7 +1704,7 @@ func (s *Store) ResetPodForRestart(ns, name string) {
 	syncPodConditions(pod)
 	pod.ResourceVersion = s.incRV()
 	s.mu.Unlock()
-	go s.save()
+	s.persist()
 }
 
 // previousContainer reports whether an observed container started before the
@@ -1439,7 +1761,9 @@ func (s *Store) CreateService(svc *corev1.Service) (*corev1.Service, error) {
 	defaultServiceFields(svc)
 	s.services[key] = svc
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return svc.DeepCopy(), nil
 }
 
@@ -1496,7 +1820,9 @@ func (s *Store) DeleteService(ns, name string) error {
 	}
 	delete(s.services, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1520,7 +1846,9 @@ func (s *Store) UpdateService(svc *corev1.Service) (*corev1.Service, error) {
 	defaultServiceFields(svc)
 	s.services[key] = svc
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return svc.DeepCopy(), nil
 }
 
@@ -1582,7 +1910,9 @@ func (s *Store) CreatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 	}
 	s.pvcs[key] = pvc
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	msg := "Bound (hostpath backing)"
 	if pvc.Spec.VolumeName != "" {
 		msg = fmt.Sprintf("Bound to podman volume %q", pvc.Spec.VolumeName)
@@ -1614,7 +1944,9 @@ func (s *Store) DeletePVC(ns, name string) error {
 	}
 	delete(s.pvcs, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1634,7 +1966,9 @@ func (s *Store) UpdatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 	pvc.ResourceVersion = s.incRV()
 	s.pvcs[key] = pvc
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return pvc.DeepCopy(), nil
 }
 
@@ -1682,7 +2016,9 @@ func (s *Store) CreateConfigMap(cm *corev1.ConfigMap) (*corev1.ConfigMap, error)
 	}
 	s.configmaps[key] = cm
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return cm.DeepCopy(), nil
 }
 
@@ -1702,7 +2038,9 @@ func (s *Store) UpdateConfigMap(cm *corev1.ConfigMap) (*corev1.ConfigMap, error)
 	cm.ResourceVersion = s.incRV()
 	s.configmaps[key] = cm
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return cm.DeepCopy(), nil
 }
 
@@ -1728,7 +2066,9 @@ func (s *Store) DeleteConfigMap(ns, name string) error {
 	}
 	delete(s.configmaps, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1776,7 +2116,9 @@ func (s *Store) CreateSecret(sec *corev1.Secret) (*corev1.Secret, error) {
 	}
 	s.secrets[key] = sec
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return sec.DeepCopy(), nil
 }
 
@@ -1802,7 +2144,9 @@ func (s *Store) DeleteSecret(ns, name string) error {
 	}
 	delete(s.secrets, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1822,7 +2166,9 @@ func (s *Store) UpdateSecret(sec *corev1.Secret) (*corev1.Secret, error) {
 	sec.ResourceVersion = s.incRV()
 	s.secrets[key] = sec
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return sec.DeepCopy(), nil
 }
 
@@ -1870,7 +2216,9 @@ func (s *Store) CreateServiceAccount(sa *corev1.ServiceAccount) (*corev1.Service
 	}
 	s.serviceAccounts[key] = sa
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return sa.DeepCopy(), nil
 }
 
@@ -1895,7 +2243,9 @@ func (s *Store) DeleteServiceAccount(ns, name string) error {
 	}
 	delete(s.serviceAccounts, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1916,7 +2266,9 @@ func (s *Store) UpdateServiceAccount(sa *corev1.ServiceAccount) (*corev1.Service
 	sa.ResourceVersion = s.incRV()
 	s.serviceAccounts[key] = sa
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return sa.DeepCopy(), nil
 }
 
@@ -1964,7 +2316,9 @@ func (s *Store) CreateJob(job *batchv1.Job) (*batchv1.Job, error) {
 	}
 	s.jobs[key] = job
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	s.recordEvent("Job", job.Namespace, job.Name, job.UID, corev1.EventTypeNormal, "Created",
 		fmt.Sprintf("Created job %s/%s", job.Namespace, job.Name))
 	return job.DeepCopy(), nil
@@ -1993,7 +2347,9 @@ func (s *Store) DeleteJob(ns, name string) error {
 	}
 	delete(s.jobs, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	s.recordEvent("Job", ns, name, job.UID, corev1.EventTypeNormal, "Deleted",
 		fmt.Sprintf("Deleted job %s/%s", ns, name))
 	return nil
@@ -2012,7 +2368,9 @@ func (s *Store) UpdateJob(job *batchv1.Job) (*batchv1.Job, error) {
 	job.ResourceVersion = s.incRV()
 	s.jobs[key] = job
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return job.DeepCopy(), nil
 }
 
@@ -2035,7 +2393,7 @@ func (s *Store) UpdateJobStatus(ns, name string, active, succeeded, failed int32
 	uid := job.UID
 	s.mu.Unlock()
 	if changed {
-		go s.save()
+		s.persist()
 		switch {
 		case failed > 0:
 			s.recordEvent("Job", ns, name, uid, corev1.EventTypeWarning, "Failed",
@@ -2094,7 +2452,9 @@ func (s *Store) CreateCronJob(cj *batchv1.CronJob) (*batchv1.CronJob, error) {
 	}
 	s.cronjobs[key] = cj
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return cj.DeepCopy(), nil
 }
 
@@ -2120,7 +2480,9 @@ func (s *Store) DeleteCronJob(ns, name string) error {
 	}
 	delete(s.cronjobs, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2137,7 +2499,9 @@ func (s *Store) UpdateCronJob(cj *batchv1.CronJob) (*batchv1.CronJob, error) {
 	cj.ResourceVersion = s.incRV()
 	s.cronjobs[key] = cj
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return cj.DeepCopy(), nil
 }
 
@@ -2185,7 +2549,9 @@ func (s *Store) CreateIngress(ing *networkingv1.Ingress) (*networkingv1.Ingress,
 	}
 	s.ingresses[key] = ing
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return ing.DeepCopy(), nil
 }
 
@@ -2211,7 +2577,9 @@ func (s *Store) DeleteIngress(ns, name string) error {
 	}
 	delete(s.ingresses, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2228,7 +2596,9 @@ func (s *Store) UpdateIngress(ing *networkingv1.Ingress) (*networkingv1.Ingress,
 	ing.ResourceVersion = s.incRV()
 	s.ingresses[key] = ing
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return ing.DeepCopy(), nil
 }
 
@@ -2276,7 +2646,9 @@ func (s *Store) CreateMiddleware(mw *traefik.Middleware) (*traefik.Middleware, e
 	}
 	s.middlewares[key] = mw
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return mw.DeepCopy(), nil
 }
 
@@ -2301,7 +2673,9 @@ func (s *Store) DeleteMiddleware(ns, name string) error {
 	}
 	delete(s.middlewares, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2321,7 +2695,9 @@ func (s *Store) UpdateMiddleware(mw *traefik.Middleware) (*traefik.Middleware, e
 	mw.ResourceVersion = s.incRV()
 	s.middlewares[key] = mw
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return mw.DeepCopy(), nil
 }
 
@@ -2369,7 +2745,9 @@ func (s *Store) CreateIngressRouteTCP(irt *traefik.IngressRouteTCP) (*traefik.In
 	}
 	s.ingressRouteTCPs[key] = irt
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return irt.DeepCopy(), nil
 }
 
@@ -2394,7 +2772,9 @@ func (s *Store) DeleteIngressRouteTCP(ns, name string) error {
 	}
 	delete(s.ingressRouteTCPs, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2414,7 +2794,9 @@ func (s *Store) UpdateIngressRouteTCP(irt *traefik.IngressRouteTCP) (*traefik.In
 	irt.ResourceVersion = s.incRV()
 	s.ingressRouteTCPs[key] = irt
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return irt.DeepCopy(), nil
 }
 
@@ -2467,7 +2849,9 @@ func (s *Store) CreateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, er
 	dep.Generation = 1
 	s.deployments[key] = dep
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	s.recordEvent("Deployment", dep.Namespace, dep.Name, dep.UID, corev1.EventTypeNormal, "Created",
 		fmt.Sprintf("Created deployment %s/%s", dep.Namespace, dep.Name))
 	return dep.DeepCopy(), nil
@@ -2499,7 +2883,9 @@ func (s *Store) UpdateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, er
 	}
 	s.deployments[key] = dep
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return dep.DeepCopy(), nil
 }
 
@@ -2526,7 +2912,9 @@ func (s *Store) DeleteDeployment(ns, name string) error {
 	}
 	delete(s.deployments, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	s.recordEvent("Deployment", ns, name, dep.UID, corev1.EventTypeNormal, "Deleted",
 		fmt.Sprintf("Deleted deployment %s/%s", ns, name))
 	return nil
@@ -2561,7 +2949,7 @@ func (s *Store) UpdateDeploymentStatus(ns, name string, ready int32) {
 	uid := dep.UID
 	s.mu.Unlock()
 	if changed {
-		go s.save()
+		s.persist()
 		s.recordEvent("Deployment", ns, name, uid, corev1.EventTypeNormal, "ScalingReplicaSet",
 			fmt.Sprintf("Deployment %s/%s: %d/%d replicas ready", ns, name, ready, desired))
 	}
@@ -2611,7 +2999,9 @@ func (s *Store) CreateRole(role *rbacv1.Role) (*rbacv1.Role, error) {
 	}
 	s.roles[key] = role
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return role.DeepCopy(), nil
 }
 
@@ -2636,7 +3026,9 @@ func (s *Store) DeleteRole(ns, name string) error {
 	}
 	delete(s.roles, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2656,7 +3048,9 @@ func (s *Store) UpdateRole(role *rbacv1.Role) (*rbacv1.Role, error) {
 	role.ResourceVersion = s.incRV()
 	s.roles[key] = role
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return role.DeepCopy(), nil
 }
 
@@ -2704,7 +3098,9 @@ func (s *Store) CreateRoleBinding(rb *rbacv1.RoleBinding) (*rbacv1.RoleBinding, 
 	}
 	s.roleBindings[key] = rb
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return rb.DeepCopy(), nil
 }
 
@@ -2729,7 +3125,9 @@ func (s *Store) DeleteRoleBinding(ns, name string) error {
 	}
 	delete(s.roleBindings, key)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2749,7 +3147,9 @@ func (s *Store) UpdateRoleBinding(rb *rbacv1.RoleBinding) (*rbacv1.RoleBinding, 
 	rb.ResourceVersion = s.incRV()
 	s.roleBindings[key] = rb
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return rb.DeepCopy(), nil
 }
 
@@ -2783,7 +3183,9 @@ func (s *Store) CreateClusterRole(cr *rbacv1.ClusterRole) (*rbacv1.ClusterRole, 
 	}
 	s.clusterRoles[cr.Name] = cr
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return cr.DeepCopy(), nil
 }
 
@@ -2807,7 +3209,9 @@ func (s *Store) DeleteClusterRole(name string) error {
 	}
 	delete(s.clusterRoles, name)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2826,7 +3230,9 @@ func (s *Store) UpdateClusterRole(cr *rbacv1.ClusterRole) (*rbacv1.ClusterRole, 
 	cr.ResourceVersion = s.incRV()
 	s.clusterRoles[cr.Name] = cr
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return cr.DeepCopy(), nil
 }
 
@@ -2860,7 +3266,9 @@ func (s *Store) CreateClusterRoleBinding(crb *rbacv1.ClusterRoleBinding) (*rbacv
 	}
 	s.clusterRoleBindings[crb.Name] = crb
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return crb.DeepCopy(), nil
 }
 
@@ -2884,7 +3292,9 @@ func (s *Store) DeleteClusterRoleBinding(name string) error {
 	}
 	delete(s.clusterRoleBindings, name)
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -2903,7 +3313,9 @@ func (s *Store) UpdateClusterRoleBinding(crb *rbacv1.ClusterRoleBinding) (*rbacv
 	crb.ResourceVersion = s.incRV()
 	s.clusterRoleBindings[crb.Name] = crb
 	s.mu.Unlock()
-	go s.save()
+	if err := s.persist(); err != nil {
+		return nil, err
+	}
 	return crb.DeepCopy(), nil
 }
 

@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	"q8s/internal/fsutil"
 )
 
 func TestWorkloadKubeconfigFor(t *testing.T) {
@@ -122,10 +124,10 @@ func TestWriteWorkloadFiles(t *testing.T) {
 func TestWriteFileAtomicReplacesContent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "file")
-	if err := writeFileAtomic(path, []byte("old"), 0644); err != nil {
+	if err := fsutil.WriteFileAtomic(path, []byte("old"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeFileAtomic(path, []byte("new"), 0600); err != nil {
+	if err := fsutil.WriteFileAtomic(path, []byte("new"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(path)

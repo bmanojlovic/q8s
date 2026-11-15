@@ -32,6 +32,7 @@ import (
 	jsonser "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"q8s/internal/fsutil"
 	"q8s/internal/quadlet"
 	"q8s/internal/store"
 )
@@ -131,11 +132,23 @@ func (s *Server) respondStatus(w http.ResponseWriter, code int, reason string, f
 	}, code)
 }
 
+// respondStoreError maps a store mutation error to an HTTP Status. A failed
+// disk write is a server-side failure and answers 500 InternalError; any
+// other store error keeps the handler's usual create/update/delete mapping
+// (for example 409 AlreadyExists or 404 NotFound).
+func (s *Server) respondStoreError(w http.ResponseWriter, err error, code int, reason string) {
+	if errors.Is(err, store.ErrPersist) {
+		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+		return
+	}
+	s.respondStatus(w, code, reason, "%s", err.Error())
+}
+
 func writeQuadletFile(dir, filename string, content []byte) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(dir+"/"+filename, content, 0644)
+	return fsutil.WriteFileAtomic(filepath.Join(dir, filename), content, 0644)
 }
 
 func (s *Server) rv() string {
@@ -665,7 +678,9 @@ func (s *Server) removeStaleOwnedUnits(dir, ns, podName string, keep map[string]
 			continue
 		}
 		name := entry.Name()
-		if keep[name] {
+		// Temporary files from an atomic write start with a dot; they are
+		// not units and must never be treated as one.
+		if strings.HasPrefix(name, ".") || keep[name] {
 			continue
 		}
 		path := filepath.Join(dir, name)
@@ -923,7 +938,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		created, err := s.config.Store.CreatePod(&pod)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.generatePodQuadlet(created)
@@ -996,7 +1011,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		updated, err := s.config.Store.UpdatePod(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.redeployPodQuadlet(updated)
@@ -1243,7 +1258,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		created, err := s.config.Store.CreateService(&svc)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		// An explicit nodePort is checked before allocation so a collision
@@ -1321,7 +1336,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		updated, err := s.config.Store.UpdateService(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		// An explicit nodePort is checked before allocation so a collision
@@ -1415,7 +1430,7 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		created, err := s.config.Store.CreatePVC(&pvc)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.generatePVCVolume(created)
@@ -1463,7 +1478,7 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		updated, err := s.config.Store.UpdatePVC(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -1540,7 +1555,7 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		created, err := s.config.Store.CreateConfigMap(&cm)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.writeConfigMapFiles(created)
@@ -1576,7 +1591,7 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		updated, err := s.config.Store.UpdateConfigMap(&cm)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		s.writeConfigMapFiles(updated)
@@ -1632,7 +1647,7 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		updated, err := s.config.Store.UpdateConfigMap(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.writeConfigMapFiles(updated)
@@ -1711,7 +1726,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		normalizeSecret(&secret)
 		created, err := s.config.Store.CreateSecret(&secret)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.writeSecretFiles(created)
@@ -1771,7 +1786,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		normalizeSecret(&patched)
 		updated, err := s.config.Store.UpdateSecret(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.removeStaleSecretFiles(updated)
@@ -1845,7 +1860,7 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 		}
 		created, err := s.config.Store.CreateServiceAccount(&sa)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		encode(w, created, http.StatusCreated)
@@ -1868,7 +1883,7 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 		}
 		updated, err := s.config.Store.UpdateServiceAccount(&sa)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -1915,7 +1930,7 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 		}
 		updated, err := s.config.Store.UpdateServiceAccount(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -1933,7 +1948,7 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 			return
 		}
 		if err := s.config.Store.DeleteServiceAccount(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -2114,7 +2129,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		created, err := s.config.Store.CreateDeployment(&dep)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.generateDeploymentQuadlets(created)
@@ -2166,7 +2181,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		oldR := deploymentReplicas(existing)
 		updated, err := s.config.Store.UpdateDeployment(&dep)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		newR := deploymentReplicas(updated)
@@ -2236,7 +2251,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		updated, err := s.config.Store.UpdateDeployment(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		newR := deploymentReplicas(updated)
@@ -2311,7 +2326,7 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 		}
 		updated, err := s.config.Store.UpdateDeployment(dep)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.scaleDeployment(updated, oldR, deploymentReplicas(updated))
@@ -2435,7 +2450,7 @@ func (s *Server) handleNamespacePatch(w http.ResponseWriter, r *http.Request, na
 	}
 	updated, err := s.config.Store.UpdateNamespace(&patched)
 	if err != nil {
-		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+		s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 		return
 	}
 	encode(w, updated, http.StatusOK)
@@ -2454,7 +2469,7 @@ func (s *Server) handleNamespaceCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.config.Store.CreateNamespace(&ns)
 	if err != nil {
-		s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+		s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 		return
 	}
 	s.generateNamespaceNetwork(created.Name)
@@ -2576,7 +2591,7 @@ func (s *Server) handleNamespaceDelete(w http.ResponseWriter, r *http.Request, n
 	}
 	s.purgeNamespaceResources(name)
 	if err := s.config.Store.DeleteNamespace(name); err != nil {
-		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 		return
 	}
 	// Disconnect and re-render before the network unit disappears: podman
@@ -2679,7 +2694,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		ensureJobPodIdentity(&job)
 		created, err := s.config.Store.CreateJob(&job)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.generateJobQuadlet(created)
@@ -2746,7 +2761,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		job.Status = existing.Status
 		updated, err := s.config.Store.UpdateJob(&job)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -2806,7 +2821,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		ensureJobPodIdentity(&patched)
 		updated, err := s.config.Store.UpdateJob(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		if s.config.QuadletDir != "" {
@@ -2901,7 +2916,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		created, err := s.config.Store.CreateCronJob(&cj)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.generateCronJobQuadlets(created)
@@ -2960,7 +2975,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		cj.Status = existing.Status
 		updated, err := s.config.Store.UpdateCronJob(&cj)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.generateCronJobQuadlets(updated)
@@ -3024,7 +3039,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		updated, err := s.config.Store.UpdateCronJob(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.generateCronJobQuadlets(updated)
@@ -3124,7 +3139,7 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		}
 		created, err := s.config.Store.CreateIngress(&ing)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.generateTraefikConfig(created)
@@ -3156,7 +3171,7 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		}
 		updated, err := s.config.Store.UpdateIngress(&ing)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		s.generateTraefikConfig(updated)
@@ -3208,7 +3223,7 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		}
 		updated, err := s.config.Store.UpdateIngress(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.generateTraefikConfig(updated)
@@ -3455,14 +3470,8 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 		return
 	}
 	// Write-then-rename so Traefik never reads a half-written file.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
-		fmt.Printf("traefik config: write %s: %v\n", tmp, err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		fmt.Printf("traefik config: rename %s: %v\n", path, err)
+	if err := fsutil.WriteFileAtomic(path, []byte(content), 0644); err != nil {
+		fmt.Printf("traefik config: write %s: %v\n", path, err)
 		return
 	}
 	fmt.Printf("traefik config: wrote %s\n", filename)
@@ -3866,12 +3875,7 @@ func (s *Server) ensureWorkloadKubeconfig(ns string) {
 		fmt.Printf("workload kubeconfig for %s: %v\n", ns, err)
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		fmt.Printf("workload kubeconfig for %s: %v\n", ns, err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := fsutil.WriteFileAtomic(path, data, 0644); err != nil {
 		fmt.Printf("workload kubeconfig for %s: %v\n", ns, err)
 	}
 }
@@ -4852,13 +4856,17 @@ func (s *Server) writeConfigMapFiles(cm *corev1.ConfigMap) {
 		fmt.Printf("configmap dir %s: %v\n", dir, err)
 		return
 	}
+	// ConfigMap directories are bind-mounted into containers as directories.
+	// The atomic write renames a file inside this directory and never replaces
+	// the directory itself, so the inode the container holds stays valid and
+	// the container sees the new file content.
 	for k, v := range cm.Data {
-		if err := os.WriteFile(filepath.Join(dir, k), []byte(v), 0644); err != nil {
+		if err := fsutil.WriteFileAtomic(filepath.Join(dir, k), []byte(v), 0644); err != nil {
 			fmt.Printf("write configmap %s/%s/%s: %v\n", cm.Namespace, cm.Name, k, err)
 		}
 	}
 	for k, v := range cm.BinaryData {
-		if err := os.WriteFile(filepath.Join(dir, k), v, 0644); err != nil {
+		if err := fsutil.WriteFileAtomic(filepath.Join(dir, k), v, 0644); err != nil {
 			fmt.Printf("write configmap %s/%s/%s: %v\n", cm.Namespace, cm.Name, k, err)
 		}
 	}
@@ -4915,7 +4923,7 @@ func (s *Server) writeSecretFiles(sec *corev1.Secret) {
 	// Data is the single source of truth — StringData is folded into it by
 	// normalizeSecret before the object is ever stored.
 	for k, v := range sec.Data {
-		if err := os.WriteFile(filepath.Join(dir, k), v, 0600); err != nil {
+		if err := fsutil.WriteFileAtomic(filepath.Join(dir, k), v, 0600); err != nil {
 			fmt.Printf("write secret %s/%s/%s: %v\n", sec.Namespace, sec.Name, k, err)
 		}
 	}
@@ -4943,7 +4951,7 @@ func (s *Server) removeStaleSecretFiles(sec *corev1.Secret) {
 		live[k] = true
 	}
 	for _, e := range entries {
-		if e.IsDir() || live[e.Name()] {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") || live[e.Name()] {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
@@ -5163,7 +5171,7 @@ func (s *Server) writeEnvFile(ns, name string, containers []corev1.Container, se
 		return "", fmt.Errorf("env dir %s: %w", dir, err)
 	}
 	path := filepath.Join(dir, name+".env")
-	if err := os.WriteFile(path, []byte(lines.String()), 0600); err != nil {
+	if err := fsutil.WriteFileAtomic(path, []byte(lines.String()), 0600); err != nil {
 		return "", fmt.Errorf("write env file %s: %w", path, err)
 	}
 	return path, nil

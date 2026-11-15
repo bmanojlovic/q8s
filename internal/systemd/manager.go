@@ -12,6 +12,8 @@ import (
 
 	"github.com/coreos/go-systemd/v22/dbus"
 	godbus "github.com/godbus/dbus/v5"
+
+	"q8s/internal/fsutil"
 )
 
 // UnitState holds the relevant systemd unit state for a container.
@@ -217,7 +219,7 @@ func (m *Manager) WriteUnitFile(name, content string) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := fsutil.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("failed to write unit file: %w", err)
 	}
 	return nil

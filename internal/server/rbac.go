@@ -222,7 +222,7 @@ func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request, ns, name st
 		}
 		created, err := s.config.Store.CreateRole(&role)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		encode(w, created, http.StatusCreated)
@@ -249,7 +249,7 @@ func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request, ns, name st
 		}
 		updated, err := s.config.Store.UpdateRole(&role)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -271,7 +271,7 @@ func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request, ns, name st
 		}
 		updated, err := s.config.Store.UpdateRole(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -289,7 +289,7 @@ func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request, ns, name st
 			return
 		}
 		if err := s.config.Store.DeleteRole(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -344,7 +344,7 @@ func (s *Server) handleRoleBindings(w http.ResponseWriter, r *http.Request, ns, 
 		}
 		created, err := s.config.Store.CreateRoleBinding(&rb)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		encode(w, created, http.StatusCreated)
@@ -376,7 +376,7 @@ func (s *Server) handleRoleBindings(w http.ResponseWriter, r *http.Request, ns, 
 		}
 		updated, err := s.config.Store.UpdateRoleBinding(&rb)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -398,7 +398,7 @@ func (s *Server) handleRoleBindings(w http.ResponseWriter, r *http.Request, ns, 
 		}
 		updated, err := s.config.Store.UpdateRoleBinding(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -416,7 +416,7 @@ func (s *Server) handleRoleBindings(w http.ResponseWriter, r *http.Request, ns, 
 			return
 		}
 		if err := s.config.Store.DeleteRoleBinding(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -469,7 +469,7 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 		}
 		created, err := s.config.Store.CreateClusterRole(&cr)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		encode(w, created, http.StatusCreated)
@@ -501,7 +501,7 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 		}
 		updated, err := s.config.Store.UpdateClusterRole(&cr)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -527,7 +527,7 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 		}
 		updated, err := s.config.Store.UpdateClusterRole(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -549,7 +549,7 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.config.Store.DeleteClusterRole(name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -598,7 +598,7 @@ func (s *Server) handleClusterRoleBindings(w http.ResponseWriter, r *http.Reques
 		}
 		created, err := s.config.Store.CreateClusterRoleBinding(&crb)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		encode(w, created, http.StatusCreated)
@@ -627,7 +627,7 @@ func (s *Server) handleClusterRoleBindings(w http.ResponseWriter, r *http.Reques
 		}
 		updated, err := s.config.Store.UpdateClusterRoleBinding(&crb)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -649,7 +649,7 @@ func (s *Server) handleClusterRoleBindings(w http.ResponseWriter, r *http.Reques
 		}
 		updated, err := s.config.Store.UpdateClusterRoleBinding(&patched)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		encode(w, updated, http.StatusOK)
@@ -667,7 +667,7 @@ func (s *Server) handleClusterRoleBindings(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		if err := s.config.Store.DeleteClusterRoleBinding(name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)

@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/yaml"
 
+	"q8s/internal/fsutil"
 	"q8s/internal/traefik"
 )
 
@@ -88,7 +89,7 @@ func (s *Server) handleMiddlewares(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		created, err := s.config.Store.CreateMiddleware(&mw)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.generateMiddlewareConfig(created)
@@ -116,7 +117,7 @@ func (s *Server) handleMiddlewares(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		updated, err := s.config.Store.UpdateMiddleware(&mw)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		s.generateMiddlewareConfig(updated)
@@ -144,7 +145,7 @@ func (s *Server) handleMiddlewares(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		updated, err := s.config.Store.UpdateMiddleware(mw)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.generateMiddlewareConfig(updated)
@@ -222,7 +223,7 @@ func (s *Server) handleIngressRouteTCPs(w http.ResponseWriter, r *http.Request, 
 		}
 		created, err := s.config.Store.CreateIngressRouteTCP(&irt)
 		if err != nil {
-			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
 		s.generateTCPConfig(created)
@@ -254,7 +255,7 @@ func (s *Server) handleIngressRouteTCPs(w http.ResponseWriter, r *http.Request, 
 		}
 		updated, err := s.config.Store.UpdateIngressRouteTCP(&irt)
 		if err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		s.generateTCPConfig(updated)
@@ -286,7 +287,7 @@ func (s *Server) handleIngressRouteTCPs(w http.ResponseWriter, r *http.Request, 
 		}
 		updated, err := s.config.Store.UpdateIngressRouteTCP(irt)
 		if err != nil {
-			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
 		}
 		s.generateTCPConfig(updated)
@@ -613,14 +614,8 @@ func (s *Server) writeTraefikConfigFile(filename string, content []byte) {
 	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, content) {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, content, 0644); err != nil {
-		fmt.Printf("traefik config: write %s: %v\n", tmp, err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		fmt.Printf("traefik config: rename %s: %v\n", path, err)
+	if err := fsutil.WriteFileAtomic(path, content, 0644); err != nil {
+		fmt.Printf("traefik config: write %s: %v\n", path, err)
 		return
 	}
 	fmt.Printf("traefik config: wrote %s\n", filename)

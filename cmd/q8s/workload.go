@@ -9,6 +9,7 @@ import (
 
 	"sigs.k8s.io/yaml"
 
+	"q8s/internal/fsutil"
 	"q8s/pkg/install"
 )
 
@@ -107,7 +108,7 @@ func writeWorkloadFiles(dir, binDir string, port int, caPEM []byte) error {
 	}
 	binPath := filepath.Join(binDir, "q8s")
 	if old, err := os.ReadFile(binPath); err != nil || !bytes.Equal(old, binary) {
-		if err := writeFileAtomic(binPath, binary, 0755); err != nil {
+		if err := fsutil.WriteFileAtomic(binPath, binary, 0755); err != nil {
 			return fmt.Errorf("write workload q8s binary: %w", err)
 		}
 	}
@@ -115,7 +116,7 @@ func writeWorkloadFiles(dir, binDir string, port int, caPEM []byte) error {
 	if err != nil {
 		return fmt.Errorf("render workload kubeconfig: %w", err)
 	}
-	if err := writeFileAtomic(filepath.Join(dir, "kubeconfig"), kubeconfig, 0644); err != nil {
+	if err := fsutil.WriteFileAtomic(filepath.Join(dir, "kubeconfig"), kubeconfig, 0644); err != nil {
 		return fmt.Errorf("write workload kubeconfig: %w", err)
 	}
 	// Per-namespace kubeconfigs written by earlier runs are refreshed too, so
@@ -129,37 +130,11 @@ func writeWorkloadFiles(dir, binDir string, port int, caPEM []byte) error {
 		if err != nil {
 			return fmt.Errorf("render workload kubeconfig for %s: %w", e.Name(), err)
 		}
-		if err := writeFileAtomic(filepath.Join(dir, "ns", e.Name(), "kubeconfig"), data, 0644); err != nil {
+		if err := fsutil.WriteFileAtomic(filepath.Join(dir, "ns", e.Name(), "kubeconfig"), data, 0644); err != nil {
 			return fmt.Errorf("write workload kubeconfig for %s: %w", e.Name(), err)
 		}
 	}
 	return nil
-}
-
-// writeFileAtomic writes data to path through a temporary file in the same
-// directory and renames it into place.
-func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, mode); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
 }
 
 // workloadKubeconfigDoc is the kubeconfig shape q8s generates for pods. It
