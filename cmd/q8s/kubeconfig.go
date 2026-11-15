@@ -27,6 +27,11 @@ type kubeconfigOptions struct {
 	revokeSerialSet bool
 	listRevoked     bool
 	help            bool
+	// name and server override the cluster/context name and server URL
+	// that otherwise come from config.json. v0.8.x accepted (and ignored)
+	// any argument, and installers pass --name, so it must keep working.
+	name   string
+	server string
 }
 
 // cmdKubeconfig prints a kubeconfig or manages the revocation list.
@@ -69,6 +74,13 @@ func runKubeconfig(args []string, d dirs, stdout, stderr io.Writer) error {
 		if cfg.Name != "" {
 			clusterName = cfg.Name
 		}
+	}
+
+	if opts.name != "" {
+		clusterName = opts.name
+	}
+	if opts.server != "" {
+		serverURL = opts.server
 	}
 
 	if opts.user == "" {
@@ -134,6 +146,24 @@ func parseKubeconfigArgs(args []string) (kubeconfigOptions, error) {
 			}
 			opts.help = true
 			return opts, nil
+		case "--name":
+			value, err := nextValue(flagName)
+			if err != nil {
+				return opts, err
+			}
+			if strings.TrimSpace(value) == "" {
+				return opts, fmt.Errorf("--name must not be empty")
+			}
+			opts.name = value
+		case "--server":
+			value, err := nextValue(flagName)
+			if err != nil {
+				return opts, err
+			}
+			if !strings.HasPrefix(value, "https://") {
+				return opts, fmt.Errorf("--server must be an https:// URL, got %q", value)
+			}
+			opts.server = value
 		case "--user":
 			value, err := nextValue(flagName)
 			if err != nil {
@@ -282,6 +312,8 @@ const kubeconfigUsage = `Usage: q8s kubeconfig [flags]
 Without --user, prints the administrator kubeconfig created by q8s install.
 
 Flags:
+  --name NAME            Cluster and context name (default: the name from q8s install)
+  --server URL           Server URL (default: the URL from q8s install)
   --user NAME            Issue a client certificate and kubeconfig for NAME
   --group GROUP          Add GROUP to the certificate; repeat for several groups
   --days N               Certificate lifetime in days (default 365, max 3650)

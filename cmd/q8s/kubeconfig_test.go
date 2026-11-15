@@ -326,3 +326,36 @@ func TestParseKubeconfigArgsHelp(t *testing.T) {
 		t.Errorf("inline flags parsed as %+v", opts)
 	}
 }
+
+// TestRunKubeconfigNameAndServerOverride covers the installer call
+// `q8s kubeconfig --name HOST`: v0.8.x accepted it, so it must keep working
+// and now names the cluster, context and user.
+func TestRunKubeconfigNameAndServerOverride(t *testing.T) {
+	t.Setenv("Q8S_PORT", "6443")
+	dir := t.TempDir()
+	certDir := filepath.Join(dir, "certs")
+	if err := os.MkdirAll(certDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{"ca.crt": "ca", "client.crt": "cert", "client.key": "key"} {
+		if err := os.WriteFile(filepath.Join(certDir, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	args := []string{"--name", "edge", "--server=https://q8s.example.com:6443"}
+	if err := runKubeconfig(args, dirs{dataDir: dir}, &stdout, &stderr); err != nil {
+		t.Fatalf("runKubeconfig: %v", err)
+	}
+	out := stdout.String()
+	for _, want := range []string{"  name: edge\n", "current-context: edge\n", "- name: edge\n", "server: https://q8s.example.com:6443\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+	for _, bad := range [][]string{{"--name", ""}, {"--server", "http://q8s.example.com"}} {
+		if err := runKubeconfig(bad, dirs{dataDir: dir}, &stdout, &stderr); err == nil {
+			t.Errorf("runKubeconfig(%q) succeeded, want an error", bad)
+		}
+	}
+}
