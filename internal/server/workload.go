@@ -74,10 +74,14 @@ func (s *Server) ServeWorkloadSocket(ctx context.Context, dir string) error {
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove stale workload socket %s: %w", socketPath, err)
 	}
-	ln, err := listenWorkloadSocket(socketPath)
+	ln, label, err := listenWorkloadSocket(socketPath)
 	if err != nil {
 		return fmt.Errorf("listen on workload socket %s: %w", socketPath, err)
 	}
+	if label == "" {
+		label = "none"
+	}
+	fmt.Printf("workload socket: listening on %s (SELinux socket label %s)\n", socketPath, label)
 	if err := os.Chmod(socketPath, 0666); err != nil {
 		ln.Close()
 		os.Remove(socketPath)
@@ -129,11 +133,13 @@ func (s *Server) handleWorkloadConn(conn net.Conn) {
 		fmt.Fprint(conn, "error: invalid credential request\n")
 		return
 	}
-	data, err := s.credentialForConnection(conn)
+	data, who, err := s.credentialForConnection(conn)
 	if err != nil {
+		fmt.Printf("workload credential: refused %s: %v\n", who, err)
 		fmt.Fprintf(conn, "error: %s\n", err)
 		return
 	}
+	fmt.Printf("workload credential: issued %s, valid %s\n", who, workloadCredentialTTL)
 	conn.Write(data)
 }
 
@@ -177,16 +183,28 @@ func peerPID(conn net.Conn) (int, error) {
 
 // credentialForConnection resolves the peer to a container and issues its
 // pod's service account credential.
-func (s *Server) credentialForConnection(conn net.Conn) ([]byte, error) {
+// credentialForConnection also returns a short description of the caller for
+// the log line: the pid when nothing more is known, else namespace/pod and
+// the ServiceAccount the pod asks for.
+func (s *Server) credentialForConnection(conn net.Conn) ([]byte, string, error) {
 	pid, err := peerPID(conn)
 	if err != nil {
-		return nil, err
+		return nil, "unknown peer", err
 	}
+	who := fmt.Sprintf("pid %d", pid)
 	labels, err := s.workloadResolver().LabelsForPID(pid)
 	if err != nil {
-		return nil, fmt.Errorf("resolve peer container: %w", err)
+		return nil, who, fmt.Errorf("resolve peer container: %w", err)
 	}
-	return s.credentialForLabels(labels)
+	ns, name := labels["io.kubernetes.pod.namespace"], labels["io.kubernetes.pod.name"]
+	if ns != "" && name != "" {
+		who = fmt.Sprintf("pod %s/%s", ns, name)
+		if pod, err := s.config.Store.GetPod(ns, name); err == nil && pod.Spec.ServiceAccountName != "" {
+			who += " serviceaccount " + pod.Spec.ServiceAccountName
+		}
+	}
+	data, err := s.credentialForLabels(labels)
+	return data, who, err
 }
 
 // credentialForLabels is the policy part of the socket: the labels must name
@@ -266,7 +284,7 @@ func issueServiceAccountCredential(caCertPEM, caKeyPEM []byte, namespace, name s
 	}
 	at = at.Truncate(time.Second)
 	notBefore := at.Add(-time.Minute)
-	notAfter := at.Add(time.Hour)
+	notAfter := at.Add(workloadCredentialTTL)
 	issued, err := install.IssueClientCertificateAt(
 		caCertPEM,
 		caKeyPEM,
@@ -384,9 +402,10 @@ func fullContainerID(s string) (string, bool) {
 // attribute is per thread, so the thread is locked for the set, the listen
 // and the reset. Without SELinux, or if the label cannot be set, the socket
 // is created normally (pods then get a clear permission error on connect).
-func listenWorkloadSocket(path string) (net.Listener, error) {
+func listenWorkloadSocket(path string) (net.Listener, string, error) {
 	if _, err := os.Stat("/sys/fs/selinux/enforce"); err != nil {
-		return net.Listen("unix", path)
+		ln, err := net.Listen("unix", path)
+		return ln, "", err
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -396,13 +415,14 @@ func listenWorkloadSocket(path string) (net.Listener, error) {
 	}
 	if err != nil {
 		fmt.Printf("workload socket: SELinux label not set (%v); containers may be denied\n", err)
-		return net.Listen("unix", path)
+		ln, err := net.Listen("unix", path)
+		return ln, "", err
 	}
 	ln, listenErr := net.Listen("unix", path)
 	if err := os.WriteFile("/proc/thread-self/attr/sockcreate", nil, 0); err != nil {
 		fmt.Printf("workload socket: reset SELinux sockcreate: %v\n", err)
 	}
-	return ln, listenErr
+	return ln, label, listenErr
 }
 
 // workloadSocketLabel keeps the SELinux user of the current process and asks
@@ -419,3 +439,7 @@ func workloadSocketLabel() (string, error) {
 	}
 	return user + ":system_r:spc_t:s0", nil
 }
+
+// workloadCredentialTTL is how long an issued ServiceAccount certificate is
+// valid; the exec credential plugin is asked again after it expires.
+const workloadCredentialTTL = time.Hour
