@@ -140,6 +140,16 @@ func (s *Server) handleAPIsRoot(w http.ResponseWriter, r *http.Request) {
 				},
 			},
 			{
+				Name: "rbac.authorization.k8s.io",
+				Versions: []metav1.GroupVersionForDiscovery{
+					{GroupVersion: "rbac.authorization.k8s.io/v1", Version: "v1"},
+				},
+				PreferredVersion: metav1.GroupVersionForDiscovery{
+					GroupVersion: "rbac.authorization.k8s.io/v1",
+					Version:      "v1",
+				},
+			},
+			{
 				Name: "metrics.k8s.io",
 				Versions: []metav1.GroupVersionForDiscovery{
 					{GroupVersion: "metrics.k8s.io/v1beta1", Version: "v1beta1"},
@@ -311,6 +321,43 @@ func (s *Server) handleTraefikV1Alpha1(w http.ResponseWriter, r *http.Request) {
 		APIResources: []metav1.APIResource{
 			{Name: "middlewares", SingularName: "middleware", Namespaced: true, Kind: "Middleware", Verbs: verbList()},
 			{Name: "ingressroutetcps", SingularName: "ingressroutetcp", Namespaced: true, Kind: "IngressRouteTCP", Verbs: verbList()},
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+func (s *Server) handleRBACRoot(w http.ResponseWriter, r *http.Request) {
+	data, _ := json.Marshal(metav1.APIGroup{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "APIGroup",
+		},
+		Name: "rbac.authorization.k8s.io",
+		Versions: []metav1.GroupVersionForDiscovery{
+			{GroupVersion: "rbac.authorization.k8s.io/v1", Version: "v1"},
+		},
+		PreferredVersion: metav1.GroupVersionForDiscovery{
+			GroupVersion: "rbac.authorization.k8s.io/v1",
+			Version:      "v1",
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+func (s *Server) handleRBACV1(w http.ResponseWriter, r *http.Request) {
+	data, _ := json.Marshal(metav1.APIResourceList{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "APIResourceList",
+		},
+		GroupVersion: "rbac.authorization.k8s.io/v1",
+		APIResources: []metav1.APIResource{
+			{Name: "roles", SingularName: "role", Namespaced: true, Kind: "Role", Verbs: verbList()},
+			{Name: "rolebindings", SingularName: "rolebinding", Namespaced: true, Kind: "RoleBinding", Verbs: verbList()},
+			{Name: "clusterroles", SingularName: "clusterrole", Namespaced: false, Kind: "ClusterRole", Verbs: verbList()},
+			{Name: "clusterrolebindings", SingularName: "clusterrolebinding", Namespaced: false, Kind: "ClusterRoleBinding", Verbs: verbList()},
 		},
 	})
 	w.Header().Set("Content-Type", "application/json")
@@ -904,6 +951,10 @@ func DiscoveryResources() []schema.GroupVersionResource {
 		{Group: "networking.k8s.io", Version: "v1", Resource: "ingresses"},
 		{Group: "traefik.io", Version: "v1alpha1", Resource: "middlewares"},
 		{Group: "traefik.io", Version: "v1alpha1", Resource: "ingressroutetcps"},
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"},
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"},
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterroles"},
+		{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "clusterrolebindings"},
 		{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"},
 	}
 }

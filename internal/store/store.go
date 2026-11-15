@@ -14,6 +14,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -23,39 +24,47 @@ import (
 
 // snapshot is the on-disk JSON format for the store.
 type snapshot struct {
-	ResourceVer      int                             `json:"resourceVersion"`
-	Pods             []*corev1.Pod                   `json:"pods,omitempty"`
-	Services         []*corev1.Service               `json:"services,omitempty"`
-	PVCs             []*corev1.PersistentVolumeClaim `json:"pvcs,omitempty"`
-	ConfigMaps       []*corev1.ConfigMap             `json:"configMaps,omitempty"`
-	Secrets          []*corev1.Secret                `json:"secrets,omitempty"`
-	Namespaces       []*corev1.Namespace             `json:"namespaces,omitempty"`
-	Jobs             []*batchv1.Job                  `json:"jobs,omitempty"`
-	CronJobs         []*batchv1.CronJob              `json:"cronJobs,omitempty"`
-	Deployments      []*appsv1.Deployment            `json:"deployments,omitempty"`
-	Ingresses        []*networkingv1.Ingress         `json:"ingresses,omitempty"`
-	Middlewares      []*traefik.Middleware           `json:"middlewares,omitempty"`
-	IngressRouteTCPs []*traefik.IngressRouteTCP      `json:"ingressRouteTCPs,omitempty"`
+	ResourceVer         int                             `json:"resourceVersion"`
+	Pods                []*corev1.Pod                   `json:"pods,omitempty"`
+	Services            []*corev1.Service               `json:"services,omitempty"`
+	PVCs                []*corev1.PersistentVolumeClaim `json:"pvcs,omitempty"`
+	ConfigMaps          []*corev1.ConfigMap             `json:"configMaps,omitempty"`
+	Secrets             []*corev1.Secret                `json:"secrets,omitempty"`
+	Namespaces          []*corev1.Namespace             `json:"namespaces,omitempty"`
+	Jobs                []*batchv1.Job                  `json:"jobs,omitempty"`
+	CronJobs            []*batchv1.CronJob              `json:"cronJobs,omitempty"`
+	Deployments         []*appsv1.Deployment            `json:"deployments,omitempty"`
+	Ingresses           []*networkingv1.Ingress         `json:"ingresses,omitempty"`
+	Middlewares         []*traefik.Middleware           `json:"middlewares,omitempty"`
+	IngressRouteTCPs    []*traefik.IngressRouteTCP      `json:"ingressRouteTCPs,omitempty"`
+	Roles               []*rbacv1.Role                  `json:"roles,omitempty"`
+	RoleBindings        []*rbacv1.RoleBinding           `json:"roleBindings,omitempty"`
+	ClusterRoles        []*rbacv1.ClusterRole           `json:"clusterRoles,omitempty"`
+	ClusterRoleBindings []*rbacv1.ClusterRoleBinding    `json:"clusterRoleBindings,omitempty"`
 }
 
 // Store is an in-memory store for k8s resources.
 type Store struct {
-	mu               sync.RWMutex
-	saveMu           sync.Mutex // serialises file writes
-	dataFile         string
-	pods             map[types.NamespacedName]*corev1.Pod
-	services         map[types.NamespacedName]*corev1.Service
-	pvcs             map[types.NamespacedName]*corev1.PersistentVolumeClaim
-	configmaps       map[types.NamespacedName]*corev1.ConfigMap
-	secrets          map[types.NamespacedName]*corev1.Secret
-	namespaces       map[types.NamespacedName]*corev1.Namespace
-	jobs             map[types.NamespacedName]*batchv1.Job
-	cronjobs         map[types.NamespacedName]*batchv1.CronJob
-	deployments      map[types.NamespacedName]*appsv1.Deployment
-	ingresses        map[types.NamespacedName]*networkingv1.Ingress
-	middlewares      map[types.NamespacedName]*traefik.Middleware
-	ingressRouteTCPs map[types.NamespacedName]*traefik.IngressRouteTCP
-	resourceVer      int
+	mu                  sync.RWMutex
+	saveMu              sync.Mutex // serialises file writes
+	dataFile            string
+	pods                map[types.NamespacedName]*corev1.Pod
+	services            map[types.NamespacedName]*corev1.Service
+	pvcs                map[types.NamespacedName]*corev1.PersistentVolumeClaim
+	configmaps          map[types.NamespacedName]*corev1.ConfigMap
+	secrets             map[types.NamespacedName]*corev1.Secret
+	namespaces          map[types.NamespacedName]*corev1.Namespace
+	jobs                map[types.NamespacedName]*batchv1.Job
+	cronjobs            map[types.NamespacedName]*batchv1.CronJob
+	deployments         map[types.NamespacedName]*appsv1.Deployment
+	ingresses           map[types.NamespacedName]*networkingv1.Ingress
+	middlewares         map[types.NamespacedName]*traefik.Middleware
+	ingressRouteTCPs    map[types.NamespacedName]*traefik.IngressRouteTCP
+	roles               map[types.NamespacedName]*rbacv1.Role
+	roleBindings        map[types.NamespacedName]*rbacv1.RoleBinding
+	clusterRoles        map[string]*rbacv1.ClusterRole
+	clusterRoleBindings map[string]*rbacv1.ClusterRoleBinding
+	resourceVer         int
 
 	// runStarts remembers, in memory only, when each container's current
 	// run started (ns/pod/container). By the time a restart is recorded the
@@ -161,20 +170,24 @@ func (s *Store) Events(ns string) []*corev1.Event {
 
 func newEmpty() *Store {
 	return &Store{
-		runStarts:        make(map[string]runStart),
-		pods:             make(map[types.NamespacedName]*corev1.Pod),
-		services:         make(map[types.NamespacedName]*corev1.Service),
-		pvcs:             make(map[types.NamespacedName]*corev1.PersistentVolumeClaim),
-		configmaps:       make(map[types.NamespacedName]*corev1.ConfigMap),
-		secrets:          make(map[types.NamespacedName]*corev1.Secret),
-		namespaces:       make(map[types.NamespacedName]*corev1.Namespace),
-		jobs:             make(map[types.NamespacedName]*batchv1.Job),
-		cronjobs:         make(map[types.NamespacedName]*batchv1.CronJob),
-		deployments:      make(map[types.NamespacedName]*appsv1.Deployment),
-		ingresses:        make(map[types.NamespacedName]*networkingv1.Ingress),
-		middlewares:      make(map[types.NamespacedName]*traefik.Middleware),
-		ingressRouteTCPs: make(map[types.NamespacedName]*traefik.IngressRouteTCP),
-		notifyCh:         make(chan struct{}),
+		runStarts:           make(map[string]runStart),
+		pods:                make(map[types.NamespacedName]*corev1.Pod),
+		services:            make(map[types.NamespacedName]*corev1.Service),
+		pvcs:                make(map[types.NamespacedName]*corev1.PersistentVolumeClaim),
+		configmaps:          make(map[types.NamespacedName]*corev1.ConfigMap),
+		secrets:             make(map[types.NamespacedName]*corev1.Secret),
+		namespaces:          make(map[types.NamespacedName]*corev1.Namespace),
+		jobs:                make(map[types.NamespacedName]*batchv1.Job),
+		cronjobs:            make(map[types.NamespacedName]*batchv1.CronJob),
+		deployments:         make(map[types.NamespacedName]*appsv1.Deployment),
+		ingresses:           make(map[types.NamespacedName]*networkingv1.Ingress),
+		middlewares:         make(map[types.NamespacedName]*traefik.Middleware),
+		ingressRouteTCPs:    make(map[types.NamespacedName]*traefik.IngressRouteTCP),
+		roles:               make(map[types.NamespacedName]*rbacv1.Role),
+		roleBindings:        make(map[types.NamespacedName]*rbacv1.RoleBinding),
+		clusterRoles:        make(map[string]*rbacv1.ClusterRole),
+		clusterRoleBindings: make(map[string]*rbacv1.ClusterRoleBinding),
+		notifyCh:            make(chan struct{}),
 	}
 }
 
@@ -276,6 +289,18 @@ func Load(dataFile string) (*Store, error) {
 	}
 	for _, irt := range snap.IngressRouteTCPs {
 		s.ingressRouteTCPs[types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}] = irt
+	}
+	for _, role := range snap.Roles {
+		s.roles[types.NamespacedName{Namespace: role.Namespace, Name: role.Name}] = role
+	}
+	for _, rb := range snap.RoleBindings {
+		s.roleBindings[types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}] = rb
+	}
+	for _, cr := range snap.ClusterRoles {
+		s.clusterRoles[cr.Name] = cr
+	}
+	for _, crb := range snap.ClusterRoleBindings {
+		s.clusterRoleBindings[crb.Name] = crb
 	}
 	s.ensureDefaultNamespace()
 	return s, nil
@@ -392,6 +417,18 @@ func (s *Store) snapshot() snapshot {
 	for _, irt := range s.ingressRouteTCPs {
 		snap.IngressRouteTCPs = append(snap.IngressRouteTCPs, irt.DeepCopy())
 	}
+	for _, role := range s.roles {
+		snap.Roles = append(snap.Roles, role.DeepCopy())
+	}
+	for _, rb := range s.roleBindings {
+		snap.RoleBindings = append(snap.RoleBindings, rb.DeepCopy())
+	}
+	for _, cr := range s.clusterRoles {
+		snap.ClusterRoles = append(snap.ClusterRoles, cr.DeepCopy())
+	}
+	for _, crb := range s.clusterRoleBindings {
+		snap.ClusterRoleBindings = append(snap.ClusterRoleBindings, crb.DeepCopy())
+	}
 	return snap
 }
 
@@ -468,6 +505,12 @@ func (s *Store) Namespaces() []*corev1.Namespace {
 		phantom(k.Namespace)
 	}
 	for k := range s.ingressRouteTCPs {
+		phantom(k.Namespace)
+	}
+	for k := range s.roles {
+		phantom(k.Namespace)
+	}
+	for k := range s.roleBindings {
 		phantom(k.Namespace)
 	}
 	return result
@@ -606,6 +649,16 @@ func (s *Store) PurgeNamespace(name string) {
 	for key := range s.ingressRouteTCPs {
 		if key.Namespace == name {
 			delete(s.ingressRouteTCPs, key)
+		}
+	}
+	for key := range s.roles {
+		if key.Namespace == name {
+			delete(s.roles, key)
+		}
+	}
+	for key := range s.roleBindings {
+		if key.Namespace == name {
+			delete(s.roleBindings, key)
 		}
 	}
 	s.resourceVer++
@@ -2379,6 +2432,346 @@ func (s *Store) UpdateDeploymentStatus(ns, name string, ready int32) {
 		s.recordEvent("Deployment", ns, name, uid, corev1.EventTypeNormal, "ScalingReplicaSet",
 			fmt.Sprintf("Deployment %s/%s: %d/%d replicas ready", ns, name, ready, desired))
 	}
+}
+
+// --- Roles ---
+
+// AllRoles returns all Roles across all namespaces.
+func (s *Store) AllRoles() []*rbacv1.Role {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*rbacv1.Role, 0, len(s.roles))
+	for _, role := range s.roles {
+		result = append(result, role.DeepCopy())
+	}
+	return result
+}
+
+// Roles returns all Roles in a namespace.
+func (s *Store) Roles(ns string) []*rbacv1.Role {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*rbacv1.Role
+	for key, role := range s.roles {
+		if key.Namespace == ns {
+			result = append(result, role.DeepCopy())
+		}
+	}
+	return result
+}
+
+// CreateRole creates a Role.
+func (s *Store) CreateRole(role *rbacv1.Role) (*rbacv1.Role, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: role.Namespace, Name: role.Name}
+	if _, ok := s.roles[key]; ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("role %q already exists in namespace %q", role.Name, role.Namespace)
+	}
+	role.ResourceVersion = s.incRV()
+	role.UID = types.UID(fmt.Sprintf("q8s-role-%s-%s", role.Namespace, role.Name))
+	if role.Labels == nil {
+		role.Labels = make(map[string]string)
+	}
+	if role.CreationTimestamp.IsZero() {
+		role.CreationTimestamp = metav1.Now()
+	}
+	s.roles[key] = role
+	s.mu.Unlock()
+	go s.save()
+	return role.DeepCopy(), nil
+}
+
+// GetRole gets a Role.
+func (s *Store) GetRole(ns, name string) (*rbacv1.Role, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	role, ok := s.roles[types.NamespacedName{Namespace: ns, Name: name}]
+	if !ok {
+		return nil, fmt.Errorf("role %q not found in namespace %q", name, ns)
+	}
+	return role.DeepCopy(), nil
+}
+
+// DeleteRole deletes a Role.
+func (s *Store) DeleteRole(ns, name string) error {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: ns, Name: name}
+	if _, ok := s.roles[key]; !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("role %q not found in namespace %q", name, ns)
+	}
+	delete(s.roles, key)
+	s.mu.Unlock()
+	go s.save()
+	return nil
+}
+
+// UpdateRole replaces a Role in-place, preserving UID and creation timestamp.
+func (s *Store) UpdateRole(role *rbacv1.Role) (*rbacv1.Role, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: role.Namespace, Name: role.Name}
+	existing, ok := s.roles[key]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("role %q not found in namespace %q", role.Name, role.Namespace)
+	}
+	role.UID = existing.UID
+	if role.CreationTimestamp.IsZero() {
+		role.CreationTimestamp = existing.CreationTimestamp
+	}
+	role.ResourceVersion = s.incRV()
+	s.roles[key] = role
+	s.mu.Unlock()
+	go s.save()
+	return role.DeepCopy(), nil
+}
+
+// --- RoleBindings ---
+
+// AllRoleBindings returns all RoleBindings across all namespaces.
+func (s *Store) AllRoleBindings() []*rbacv1.RoleBinding {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*rbacv1.RoleBinding, 0, len(s.roleBindings))
+	for _, rb := range s.roleBindings {
+		result = append(result, rb.DeepCopy())
+	}
+	return result
+}
+
+// RoleBindings returns all RoleBindings in a namespace.
+func (s *Store) RoleBindings(ns string) []*rbacv1.RoleBinding {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*rbacv1.RoleBinding
+	for key, rb := range s.roleBindings {
+		if key.Namespace == ns {
+			result = append(result, rb.DeepCopy())
+		}
+	}
+	return result
+}
+
+// CreateRoleBinding creates a RoleBinding.
+func (s *Store) CreateRoleBinding(rb *rbacv1.RoleBinding) (*rbacv1.RoleBinding, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}
+	if _, ok := s.roleBindings[key]; ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("rolebinding %q already exists in namespace %q", rb.Name, rb.Namespace)
+	}
+	rb.ResourceVersion = s.incRV()
+	rb.UID = types.UID(fmt.Sprintf("q8s-rb-%s-%s", rb.Namespace, rb.Name))
+	if rb.Labels == nil {
+		rb.Labels = make(map[string]string)
+	}
+	if rb.CreationTimestamp.IsZero() {
+		rb.CreationTimestamp = metav1.Now()
+	}
+	s.roleBindings[key] = rb
+	s.mu.Unlock()
+	go s.save()
+	return rb.DeepCopy(), nil
+}
+
+// GetRoleBinding gets a RoleBinding.
+func (s *Store) GetRoleBinding(ns, name string) (*rbacv1.RoleBinding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rb, ok := s.roleBindings[types.NamespacedName{Namespace: ns, Name: name}]
+	if !ok {
+		return nil, fmt.Errorf("rolebinding %q not found in namespace %q", name, ns)
+	}
+	return rb.DeepCopy(), nil
+}
+
+// DeleteRoleBinding deletes a RoleBinding.
+func (s *Store) DeleteRoleBinding(ns, name string) error {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: ns, Name: name}
+	if _, ok := s.roleBindings[key]; !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("rolebinding %q not found in namespace %q", name, ns)
+	}
+	delete(s.roleBindings, key)
+	s.mu.Unlock()
+	go s.save()
+	return nil
+}
+
+// UpdateRoleBinding replaces a RoleBinding in-place, preserving UID and creation timestamp.
+func (s *Store) UpdateRoleBinding(rb *rbacv1.RoleBinding) (*rbacv1.RoleBinding, error) {
+	s.mu.Lock()
+	key := types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}
+	existing, ok := s.roleBindings[key]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("rolebinding %q not found in namespace %q", rb.Name, rb.Namespace)
+	}
+	rb.UID = existing.UID
+	if rb.CreationTimestamp.IsZero() {
+		rb.CreationTimestamp = existing.CreationTimestamp
+	}
+	rb.ResourceVersion = s.incRV()
+	s.roleBindings[key] = rb
+	s.mu.Unlock()
+	go s.save()
+	return rb.DeepCopy(), nil
+}
+
+// --- ClusterRoles ---
+
+// AllClusterRoles returns all ClusterRoles.
+func (s *Store) AllClusterRoles() []*rbacv1.ClusterRole {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*rbacv1.ClusterRole, 0, len(s.clusterRoles))
+	for _, cr := range s.clusterRoles {
+		result = append(result, cr.DeepCopy())
+	}
+	return result
+}
+
+// CreateClusterRole creates a ClusterRole.
+func (s *Store) CreateClusterRole(cr *rbacv1.ClusterRole) (*rbacv1.ClusterRole, error) {
+	s.mu.Lock()
+	if _, ok := s.clusterRoles[cr.Name]; ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("clusterrole %q already exists", cr.Name)
+	}
+	cr.ResourceVersion = s.incRV()
+	cr.UID = types.UID(fmt.Sprintf("q8s-cr-%s", cr.Name))
+	if cr.Labels == nil {
+		cr.Labels = make(map[string]string)
+	}
+	if cr.CreationTimestamp.IsZero() {
+		cr.CreationTimestamp = metav1.Now()
+	}
+	s.clusterRoles[cr.Name] = cr
+	s.mu.Unlock()
+	go s.save()
+	return cr.DeepCopy(), nil
+}
+
+// GetClusterRole gets a ClusterRole.
+func (s *Store) GetClusterRole(name string) (*rbacv1.ClusterRole, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cr, ok := s.clusterRoles[name]
+	if !ok {
+		return nil, fmt.Errorf("clusterrole %q not found", name)
+	}
+	return cr.DeepCopy(), nil
+}
+
+// DeleteClusterRole deletes a ClusterRole.
+func (s *Store) DeleteClusterRole(name string) error {
+	s.mu.Lock()
+	if _, ok := s.clusterRoles[name]; !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("clusterrole %q not found", name)
+	}
+	delete(s.clusterRoles, name)
+	s.mu.Unlock()
+	go s.save()
+	return nil
+}
+
+// UpdateClusterRole replaces a ClusterRole in-place, preserving UID and creation timestamp.
+func (s *Store) UpdateClusterRole(cr *rbacv1.ClusterRole) (*rbacv1.ClusterRole, error) {
+	s.mu.Lock()
+	existing, ok := s.clusterRoles[cr.Name]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("clusterrole %q not found", cr.Name)
+	}
+	cr.UID = existing.UID
+	if cr.CreationTimestamp.IsZero() {
+		cr.CreationTimestamp = existing.CreationTimestamp
+	}
+	cr.ResourceVersion = s.incRV()
+	s.clusterRoles[cr.Name] = cr
+	s.mu.Unlock()
+	go s.save()
+	return cr.DeepCopy(), nil
+}
+
+// --- ClusterRoleBindings ---
+
+// AllClusterRoleBindings returns all ClusterRoleBindings.
+func (s *Store) AllClusterRoleBindings() []*rbacv1.ClusterRoleBinding {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*rbacv1.ClusterRoleBinding, 0, len(s.clusterRoleBindings))
+	for _, crb := range s.clusterRoleBindings {
+		result = append(result, crb.DeepCopy())
+	}
+	return result
+}
+
+// CreateClusterRoleBinding creates a ClusterRoleBinding.
+func (s *Store) CreateClusterRoleBinding(crb *rbacv1.ClusterRoleBinding) (*rbacv1.ClusterRoleBinding, error) {
+	s.mu.Lock()
+	if _, ok := s.clusterRoleBindings[crb.Name]; ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("clusterrolebinding %q already exists", crb.Name)
+	}
+	crb.ResourceVersion = s.incRV()
+	crb.UID = types.UID(fmt.Sprintf("q8s-crb-%s", crb.Name))
+	if crb.Labels == nil {
+		crb.Labels = make(map[string]string)
+	}
+	if crb.CreationTimestamp.IsZero() {
+		crb.CreationTimestamp = metav1.Now()
+	}
+	s.clusterRoleBindings[crb.Name] = crb
+	s.mu.Unlock()
+	go s.save()
+	return crb.DeepCopy(), nil
+}
+
+// GetClusterRoleBinding gets a ClusterRoleBinding.
+func (s *Store) GetClusterRoleBinding(name string) (*rbacv1.ClusterRoleBinding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	crb, ok := s.clusterRoleBindings[name]
+	if !ok {
+		return nil, fmt.Errorf("clusterrolebinding %q not found", name)
+	}
+	return crb.DeepCopy(), nil
+}
+
+// DeleteClusterRoleBinding deletes a ClusterRoleBinding.
+func (s *Store) DeleteClusterRoleBinding(name string) error {
+	s.mu.Lock()
+	if _, ok := s.clusterRoleBindings[name]; !ok {
+		s.mu.Unlock()
+		return fmt.Errorf("clusterrolebinding %q not found", name)
+	}
+	delete(s.clusterRoleBindings, name)
+	s.mu.Unlock()
+	go s.save()
+	return nil
+}
+
+// UpdateClusterRoleBinding replaces a ClusterRoleBinding in-place, preserving UID and creation timestamp.
+func (s *Store) UpdateClusterRoleBinding(crb *rbacv1.ClusterRoleBinding) (*rbacv1.ClusterRoleBinding, error) {
+	s.mu.Lock()
+	existing, ok := s.clusterRoleBindings[crb.Name]
+	if !ok {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("clusterrolebinding %q not found", crb.Name)
+	}
+	crb.UID = existing.UID
+	if crb.CreationTimestamp.IsZero() {
+		crb.CreationTimestamp = existing.CreationTimestamp
+	}
+	crb.ResourceVersion = s.incRV()
+	s.clusterRoleBindings[crb.Name] = crb
+	s.mu.Unlock()
+	go s.save()
+	return crb.DeepCopy(), nil
 }
 
 // ResourceVersion returns the current resource version string.

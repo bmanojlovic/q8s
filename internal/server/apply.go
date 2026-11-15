@@ -132,7 +132,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "decode existing object: %s", err.Error())
 		return
 	}
-	patchBody, err := json.Marshal(applyPatchOps(current, applied))
+	patchBody, err := json.Marshal(applyPatchOpsForKind(kind, current, applied))
 	if err != nil {
 		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "build apply patch: %s", err.Error())
 		return
@@ -174,6 +174,14 @@ func namespaceFromURLPath(urlPath string) string {
 // and other server-owned fields are never touched. A section the applier
 // omits is removed only for data-like fields; spec is never removed.
 func applyPatchOps(current, applied map[string]interface{}) []map[string]interface{} {
+	return applyPatchOpsForKind("", current, applied)
+}
+
+// applyPatchOpsForKind is applyPatchOps with the top-level user-owned fields
+// of the applied kind. RBAC objects keep their payload in rules, roleRef and
+// subjects rather than spec, so those fields are replaced as whole values
+// too. kind is the applied object's kind.
+func applyPatchOpsForKind(kind string, current, applied map[string]interface{}) []map[string]interface{} {
 	var ops []map[string]interface{}
 	set := func(path string, value interface{}) {
 		ops = append(ops, map[string]interface{}{"op": "add", "path": path, "value": value})
@@ -181,7 +189,16 @@ func applyPatchOps(current, applied map[string]interface{}) []map[string]interfa
 	remove := func(path string) {
 		ops = append(ops, map[string]interface{}{"op": "remove", "path": path})
 	}
-	for _, field := range []string{"spec", "data", "binaryData", "stringData"} {
+	fields := []string{"spec", "data", "binaryData", "stringData"}
+	switch kind {
+	case "Role":
+		fields = append(fields, "rules")
+	case "ClusterRole":
+		fields = append(fields, "rules", "aggregationRule")
+	case "RoleBinding", "ClusterRoleBinding":
+		fields = append(fields, "roleRef", "subjects")
+	}
+	for _, field := range fields {
 		appliedValue, appliedOK := applied[field]
 		currentValue, currentOK := current[field]
 		switch {

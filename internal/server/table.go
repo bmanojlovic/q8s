@@ -11,6 +11,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -463,6 +464,78 @@ func ingressesToTable(ings []*networkingv1.Ingress, rv string) *table {
 		t.Rows = append(t.Rows, tableRow{
 			Cells:  []interface{}{ing.Name, class, hostStr, strings.Join(addrs, ","), ports, age(ing.CreationTimestamp.Time)},
 			Object: partialMeta{Kind: "Ingress", APIVersion: "networking.k8s.io/v1", Metadata: ing.ObjectMeta},
+		})
+	}
+	return t
+}
+
+// --- RBAC tables ---
+
+var roleColumns = []columnDef{
+	{Name: "Name", Type: "string", Format: "name", Description: "Role name", Priority: 0},
+	{Name: "Created At", Type: "string", Description: "Time since creation", Priority: 0},
+}
+
+func rolesToTable(roles []*rbacv1.Role, rv string) *table {
+	t := newTable(rv, roleColumns)
+	for _, role := range roles {
+		t.Rows = append(t.Rows, tableRow{
+			Cells:  []interface{}{role.Name, role.CreationTimestamp.UTC().Format(time.RFC3339)},
+			Object: partialMeta{Kind: "Role", APIVersion: rbacAPIVersion, Metadata: role.ObjectMeta},
+		})
+	}
+	return t
+}
+
+var clusterRoleColumns = []columnDef{
+	{Name: "Name", Type: "string", Format: "name", Description: "ClusterRole name", Priority: 0},
+	{Name: "Created At", Type: "string", Description: "Time since creation", Priority: 0},
+}
+
+func clusterRolesToTable(roles []*rbacv1.ClusterRole, rv string) *table {
+	t := newTable(rv, clusterRoleColumns)
+	for _, role := range roles {
+		t.Rows = append(t.Rows, tableRow{
+			Cells:  []interface{}{role.Name, role.CreationTimestamp.UTC().Format(time.RFC3339)},
+			Object: partialMeta{Kind: "ClusterRole", APIVersion: rbacAPIVersion, Metadata: role.ObjectMeta},
+		})
+	}
+	return t
+}
+
+var roleBindingColumns = []columnDef{
+	{Name: "Name", Type: "string", Format: "name", Description: "RoleBinding name", Priority: 0},
+	{Name: "Role", Type: "string", Description: "Role reference", Priority: 0},
+	{Name: "Age", Type: "string", Description: "Time since creation", Priority: 0},
+}
+
+func roleBindingRoleCell(rb *rbacv1.RoleBinding) string {
+	return rb.RoleRef.Kind + "/" + rb.RoleRef.Name
+}
+
+func roleBindingsToTable(bindings []*rbacv1.RoleBinding, rv string) *table {
+	t := newTable(rv, roleBindingColumns)
+	for _, rb := range bindings {
+		t.Rows = append(t.Rows, tableRow{
+			Cells:  []interface{}{rb.Name, roleBindingRoleCell(rb), age(rb.CreationTimestamp.Time)},
+			Object: partialMeta{Kind: "RoleBinding", APIVersion: rbacAPIVersion, Metadata: rb.ObjectMeta},
+		})
+	}
+	return t
+}
+
+var clusterRoleBindingColumns = []columnDef{
+	{Name: "Name", Type: "string", Format: "name", Description: "ClusterRoleBinding name", Priority: 0},
+	{Name: "Role", Type: "string", Description: "Role reference", Priority: 0},
+	{Name: "Age", Type: "string", Description: "Time since creation", Priority: 0},
+}
+
+func clusterRoleBindingsToTable(bindings []*rbacv1.ClusterRoleBinding, rv string) *table {
+	t := newTable(rv, clusterRoleBindingColumns)
+	for _, crb := range bindings {
+		t.Rows = append(t.Rows, tableRow{
+			Cells:  []interface{}{crb.Name, crb.RoleRef.Kind + "/" + crb.RoleRef.Name, age(crb.CreationTimestamp.Time)},
+			Object: partialMeta{Kind: "ClusterRoleBinding", APIVersion: rbacAPIVersion, Metadata: crb.ObjectMeta},
 		})
 	}
 	return t

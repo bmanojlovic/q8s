@@ -253,3 +253,31 @@ func TestAddCRDDefinitions(t *testing.T) {
 		t.Fatalf("int-or-string marker was dropped: %s", raw)
 	}
 }
+
+func TestAddCRDDefinitionsFromList(t *testing.T) {
+	trimmed := []byte(`{"swagger":"2.0","info":{"title":"q8s","version":"v1"},"paths":{},"definitions":{"x":{"type":"object"}}}`)
+	list, err := buildCRDList([]byte(tinyCRDs))
+	if err != nil {
+		t.Fatalf("buildCRDList: %v", err)
+	}
+	out, err := addCRDDefinitionsFromList(trimmed, list)
+	if err != nil {
+		t.Fatalf("addCRDDefinitionsFromList: %v", err)
+	}
+	var doc struct {
+		Definitions map[string]map[string]interface{} `json:"definitions"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	for _, name := range []string{
+		"io.traefik.v1alpha1.Middleware",
+		"io.traefik.v1alpha1.MiddlewareList",
+		"io.traefik.v1alpha1.IngressRouteTCP",
+		"io.traefik.v1alpha1.IngressRouteTCPList",
+	} {
+		if _, ok := doc.Definitions[name]; !ok {
+			t.Errorf("missing definition %q", name)
+		}
+	}
+}

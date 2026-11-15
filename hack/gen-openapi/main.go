@@ -10,6 +10,10 @@
 //	    -swagger /path/to/k8s-v1.36.2-swagger.json \
 //	    -crds /path/to/traefik-v3.6-crds.yml
 //
+// -crds is optional. Without it the existing crds.json is read to keep the
+// Traefik definitions in openapi_v2.json, and crds.json itself is left alone;
+// only openapi_v2.json is regenerated.
+//
 // When bumping k8s.io/api, download the matching
 // https://github.com/kubernetes/kubernetes/blob/<tag>/api/openapi-spec/swagger.json
 // and update openapiVersion below. When bumping Traefik, point -crds at the
@@ -69,6 +73,10 @@ var servedGVKs = []gvk{
 	{Group: "batch", Version: "v1", Kind: "Job"},
 	{Group: "batch", Version: "v1", Kind: "CronJob"},
 	{Group: "networking.k8s.io", Version: "v1", Kind: "Ingress"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "Role"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"},
+	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"},
 	{Group: "storage.k8s.io", Version: "v1", Kind: "StorageClass"},
 	{Group: "autoscaling", Version: "v1", Kind: "Scale"},
 	{Group: "coordination.k8s.io", Version: "v1", Kind: "Lease"},
@@ -98,8 +106,8 @@ func main() {
 	crdsOut := flag.String("crds-out", "internal/server/crds.json", "output path for the CustomResourceDefinitionList")
 	flag.Parse()
 
-	if *swaggerPath == "" || *crdPath == "" {
-		fmt.Fprintln(os.Stderr, "gen-openapi: -swagger and -crds are required")
+	if *swaggerPath == "" {
+		fmt.Fprintln(os.Stderr, "gen-openapi: -swagger is required")
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -113,24 +121,36 @@ func main() {
 		fatalf("trim swagger: %v", err)
 	}
 
-	crdYAML, err := os.ReadFile(*crdPath)
-	if err != nil {
-		fatalf("read CRDs: %v", err)
-	}
-	openapi, err = addCRDDefinitions(openapi, crdYAML)
-	if err != nil {
-		fatalf("add CRD definitions: %v", err)
-	}
-	if err := os.WriteFile(*openapiOut, append(openapi, '\n'), 0644); err != nil {
-		fatalf("write %s: %v", *openapiOut, err)
+	if *crdPath != "" {
+		crdYAML, err := os.ReadFile(*crdPath)
+		if err != nil {
+			fatalf("read CRDs: %v", err)
+		}
+		openapi, err = addCRDDefinitions(openapi, crdYAML)
+		if err != nil {
+			fatalf("add CRD definitions: %v", err)
+		}
+
+		crds, err := buildCRDList(crdYAML)
+		if err != nil {
+			fatalf("build CRD list: %v", err)
+		}
+		if err := os.WriteFile(*crdsOut, append(crds, '\n'), 0644); err != nil {
+			fatalf("write %s: %v", *crdsOut, err)
+		}
+	} else {
+		crdList, err := os.ReadFile(*crdsOut)
+		if err != nil {
+			fatalf("read existing %s (pass -crds to regenerate it): %v", *crdsOut, err)
+		}
+		openapi, err = addCRDDefinitionsFromList(openapi, crdList)
+		if err != nil {
+			fatalf("add CRD definitions from %s: %v", *crdsOut, err)
+		}
 	}
 
-	crds, err := buildCRDList(crdYAML)
-	if err != nil {
-		fatalf("build CRD list: %v", err)
-	}
-	if err := os.WriteFile(*crdsOut, append(crds, '\n'), 0644); err != nil {
-		fatalf("write %s: %v", *crdsOut, err)
+	if err := os.WriteFile(*openapiOut, append(openapi, '\n'), 0644); err != nil {
+		fatalf("write %s: %v", *openapiOut, err)
 	}
 }
 
@@ -328,6 +348,31 @@ func addCRDDefinitions(trimmed, crdYAML []byte) ([]byte, error) {
 		doc.Definitions[definition+"List"] = list
 	}
 	return json.Marshal(doc)
+}
+
+// addCRDDefinitionsFromList adds the Traefik CRD definitions from an already
+// generated CustomResourceDefinitionList instead of the upstream CRD YAML.
+// It is used when -crds is omitted, so openapi_v2.json can be regenerated
+// without rewriting crds.json.
+func addCRDDefinitionsFromList(trimmed, crdListJSON []byte) ([]byte, error) {
+	var list struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(crdListJSON, &list); err != nil {
+		return nil, fmt.Errorf("parse existing CRD list: %w", err)
+	}
+	if len(list.Items) == 0 {
+		return nil, fmt.Errorf("existing CRD list has no items")
+	}
+	var stream []byte
+	for i, item := range list.Items {
+		if i > 0 {
+			stream = append(stream, '\n')
+			stream = append(stream, '-', '-', '-', '\n')
+		}
+		stream = append(stream, item...)
+	}
+	return addCRDDefinitions(trimmed, stream)
 }
 
 // sanitizeSwaggerSchema removes OpenAPI v3 schema-composition keywords that

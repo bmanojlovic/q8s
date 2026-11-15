@@ -9,7 +9,7 @@ q8s embeds two generated files in the server binary:
 
 Both are outputs; the upstream files are not committed. Regenerate them with
 `hack/gen-openapi`, which needs the upstream Kubernetes `swagger.json` that
-matches `k8s.io/api` and the Traefik CRD YAML.
+matches `k8s.io/api` and, for a full regeneration, the Traefik CRD YAML.
 
 ## Regenerate
 
@@ -24,6 +24,10 @@ go run ./hack/gen-openapi \
 The default output paths are `internal/server/openapi_v2.json` and
 `internal/server/crds.json`. Pass `-openapi-out` or `-crds-out` to write
 elsewhere.
+
+`-crds` is optional. Omit it to regenerate only `openapi_v2.json`, for
+example after changing `servedGVKs`: the generator reads the existing
+`crds.json` for the Traefik definitions and leaves that file unchanged.
 
 The upstream Kubernetes swagger lives at
 `https://github.com/kubernetes/kubernetes/blob/<tag>/api/openapi-spec/swagger.json`.

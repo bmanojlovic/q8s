@@ -215,6 +215,8 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/apis/networking.k8s.io/v1", s.handleNetworkingV1)
 	s.mux.HandleFunc("/apis/traefik.io", s.handleTraefikRoot)
 	s.mux.HandleFunc("/apis/traefik.io/v1alpha1", s.handleTraefikV1Alpha1)
+	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io", s.handleRBACRoot)
+	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io/v1", s.handleRBACV1)
 	s.mux.HandleFunc("/apis/apiextensions.k8s.io", s.handleAPIExtensionsRoot)
 	s.mux.HandleFunc("/apis/apiextensions.k8s.io/v1", s.handleAPIExtensionsV1)
 	s.mux.HandleFunc(crdPath, s.handleCRDs)
@@ -320,6 +322,24 @@ func (s *Server) setupRoutes() {
 
 	// traefik.io/v1alpha1 namespaced resources: /apis/traefik.io/v1alpha1/namespaces/{ns}/{resource}[/{name}]
 	s.mux.HandleFunc("/apis/traefik.io/v1alpha1/namespaces/", s.handleTraefikNamespaced)
+
+	// rbac.authorization.k8s.io/v1 cluster-wide lists for the namespaced
+	// kinds. Read-only: creation happens in a namespace.
+	for _, res := range []string{"roles", "rolebindings"} {
+		res := res
+		s.mux.HandleFunc("/apis/rbac.authorization.k8s.io/v1/"+res, func(w http.ResponseWriter, r *http.Request) {
+			s.handleRBACAllNamespaced(w, r, res)
+		})
+	}
+
+	// rbac.authorization.k8s.io/v1 namespaced resources: /apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/{resource}[/{name}]
+	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io/v1/namespaces/", s.handleRBACNamespaced)
+
+	// rbac.authorization.k8s.io/v1 cluster-scoped resources.
+	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io/v1/clusterroles", s.handleClusterRoles)
+	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io/v1/clusterroles/", s.handleClusterRoles)
+	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings", s.handleClusterRoleBindings)
+	s.mux.HandleFunc("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/", s.handleClusterRoleBindings)
 
 	// metrics.k8s.io API group (kubectl top nodes/pods)
 	s.mux.HandleFunc("/apis/metrics.k8s.io", s.handleMetricsRoot)
