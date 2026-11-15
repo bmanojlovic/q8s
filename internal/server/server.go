@@ -86,7 +86,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Manager != nil {
 		s.network.ops = podmanNetworkOps{manager: cfg.Manager}
 	}
-	s.handler = auth.Handler(s.applyMiddleware(s.mux))
+	s.handler = auth.Handler(s.authorizeMiddleware(s.applyMiddleware(s.mux)))
 
 	s.setupRoutes()
 

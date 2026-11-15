@@ -1,10 +1,58 @@
 package server
 
 import (
+	"context"
 	"crypto/x509"
 	"fmt"
 	"net/http"
 )
+
+// userInfo is the authenticated identity of a request, following the
+// Kubernetes convention: the certificate Subject CommonName is the user name
+// and every Subject Organization entry is a group.
+type userInfo struct {
+	Name   string
+	Groups []string
+}
+
+// userInfoKey is the unexported context key holding a userInfo.
+type userInfoKey struct{}
+
+// withUserInfo stores u in ctx.
+func withUserInfo(ctx context.Context, u userInfo) context.Context {
+	return context.WithValue(ctx, userInfoKey{}, u)
+}
+
+// userFromContext returns the authenticated user stored in ctx.
+func userFromContext(ctx context.Context) (userInfo, bool) {
+	u, ok := ctx.Value(userInfoKey{}).(userInfo)
+	return u, ok
+}
+
+// isAdmin reports whether u bypasses authorization entirely. system:masters is
+// the Kubernetes cluster-admin group; q8s-user is the group the certificate
+// `q8s install` has always issued.
+func isAdmin(u userInfo) bool {
+	for _, group := range u.Groups {
+		if group == "system:masters" || group == "q8s-user" {
+			return true
+		}
+	}
+	return false
+}
+
+// userInfoFromCertificate builds the identity of a verified client
+// certificate. Every authenticated user is a member of system:authenticated.
+func userInfoFromCertificate(cert *x509.Certificate) userInfo {
+	groups := make([]string, 0, len(cert.Subject.Organization)+1)
+	for _, org := range cert.Subject.Organization {
+		if org != "" {
+			groups = append(groups, org)
+		}
+	}
+	groups = append(groups, "system:authenticated")
+	return userInfo{Name: cert.Subject.CommonName, Groups: groups}
+}
 
 // AuthMiddleware validates client X.509 certificates against a trusted CA.
 type AuthMiddleware struct {
@@ -33,7 +81,8 @@ func NewAuthMiddleware(caCert []byte) (*AuthMiddleware, error) {
 	}, nil
 }
 
-// Handler returns an HTTP middleware that validates client certificates.
+// Handler returns an HTTP middleware that validates client certificates and
+// stores the authenticated identity in the request context.
 func (a *AuthMiddleware) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !a.enabled {
@@ -56,6 +105,6 @@ func (a *AuthMiddleware) Handler(next http.Handler) http.Handler {
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(withUserInfo(r.Context(), userInfoFromCertificate(cert))))
 	})
 }

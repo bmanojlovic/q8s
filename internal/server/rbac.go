@@ -432,13 +432,13 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
-			respondList(w, r, s, s.config.Store.AllClusterRoles, clusterRolesToTable,
+			respondList(w, r, s, s.allClusterRoles, clusterRolesToTable,
 				func(items []rbacv1.ClusterRole) *rbacv1.ClusterRoleList {
 					return &rbacv1.ClusterRoleList{TypeMeta: metav1.TypeMeta{APIVersion: rbacAPIVersion, Kind: "ClusterRoleList"}, Items: items}
 				})
 			return
 		}
-		cr, err := s.config.Store.GetClusterRole(name)
+		cr, err := s.getClusterRole(name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
@@ -459,6 +459,10 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if isBuiltinClusterRole(cr.Name) {
+			s.respondStatus(w, http.StatusConflict, "AlreadyExists", "clusterroles.rbac.authorization.k8s.io %q already exists", cr.Name)
+			return
+		}
 		if err := validateClusterRole(&cr); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
@@ -470,6 +474,10 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 		}
 		encode(w, created, http.StatusCreated)
 	case http.MethodPut:
+		if isBuiltinClusterRole(name) {
+			s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "clusterroles.rbac.authorization.k8s.io %q is read-only", name)
+			return
+		}
 		if _, err := s.config.Store.GetClusterRole(name); err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 			return
@@ -498,6 +506,10 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 		}
 		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
+		if isBuiltinClusterRole(name) {
+			s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "clusterroles.rbac.authorization.k8s.io %q is read-only", name)
+			return
+		}
 		existing, err := s.config.Store.GetClusterRole(name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -530,6 +542,10 @@ func (s *Server) handleClusterRoles(w http.ResponseWriter, r *http.Request) {
 					return names
 				},
 				func(n string) error { return s.config.Store.DeleteClusterRole(n) })
+			return
+		}
+		if isBuiltinClusterRole(name) {
+			s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "clusterroles.rbac.authorization.k8s.io %q is read-only", name)
 			return
 		}
 		if err := s.config.Store.DeleteClusterRole(name); err != nil {

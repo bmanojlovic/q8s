@@ -104,7 +104,23 @@ func TestRBACCRUD(t *testing.T) {
 			assertStatus(t, resp, http.StatusOK)
 			list := decodeBody(t, resp)
 			assertKind(t, list, tc.listKind)
-			if items, _ := list["items"].([]interface{}); len(items) != 1 {
+			items, _ := list["items"].([]interface{})
+			if tc.kind == "ClusterRole" {
+				// The synthetic ClusterRoles are merged into the list; this test
+				// only cares about the stored one it created.
+				builtin := map[string]bool{"cluster-admin": true, "admin": true, "edit": true, "view": true}
+				stored := items[:0]
+				for _, item := range items {
+					obj, _ := item.(map[string]interface{})
+					meta, _ := obj["metadata"].(map[string]interface{})
+					name, _ := meta["name"].(string)
+					if !builtin[name] {
+						stored = append(stored, item)
+					}
+				}
+				items = stored
+			}
+			if len(items) != 1 {
 				t.Fatalf("expected one item, got %v", list["items"])
 			}
 
