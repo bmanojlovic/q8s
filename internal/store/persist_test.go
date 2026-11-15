@@ -250,3 +250,26 @@ func TestLoadRecoversWhenStoreFileMissing(t *testing.T) {
 		t.Fatalf("store.json was not recreated as valid JSON: %q", raw)
 	}
 }
+
+// TestDeleteAdvancesResourceVersion: a delete is a write of its own, so it
+// gets a new resourceVersion and a snapshot of its own, and the snapshot of
+// the state before the delete is kept.
+func TestDeleteAdvancesResourceVersion(t *testing.T) {
+	st, file := newFileStore(t)
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"}}
+	if _, err := st.CreateConfigMap(cm); err != nil {
+		t.Fatalf("CreateConfigMap: %v", err)
+	}
+	before := st.ResourceVersion()
+	if err := st.DeleteConfigMap("default", "demo"); err != nil {
+		t.Fatalf("DeleteConfigMap: %v", err)
+	}
+	after := st.ResourceVersion()
+	if after == before {
+		t.Fatalf("delete kept resourceVersion %d", before)
+	}
+	rvs := snapshotRVs(t, file)
+	if len(rvs) < 2 || rvs[0] == rvs[1] {
+		t.Fatalf("expected distinct snapshots for create and delete, got %v", rvs)
+	}
+}

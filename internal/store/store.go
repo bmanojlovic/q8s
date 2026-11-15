@@ -905,6 +905,8 @@ func (s *Store) DeleteNamespace(name string) error {
 		return fmt.Errorf("namespace %q not found", name)
 	}
 	delete(s.namespaces, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -1075,6 +1077,8 @@ func (s *Store) DeletePod(ns, name string) error {
 		return fmt.Errorf("pod %q not found in namespace %q", name, ns)
 	}
 	delete(s.pods, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.forgetRunStarts(key)
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
@@ -1819,6 +1823,8 @@ func (s *Store) DeleteService(ns, name string) error {
 		return fmt.Errorf("service %q not found in namespace %q", name, ns)
 	}
 	delete(s.services, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -1943,6 +1949,8 @@ func (s *Store) DeletePVC(ns, name string) error {
 		return fmt.Errorf("PVC %q not found in namespace %q", name, ns)
 	}
 	delete(s.pvcs, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2065,6 +2073,8 @@ func (s *Store) DeleteConfigMap(ns, name string) error {
 		return fmt.Errorf("configmap %q not found in namespace %q", name, ns)
 	}
 	delete(s.configmaps, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2143,6 +2153,8 @@ func (s *Store) DeleteSecret(ns, name string) error {
 		return fmt.Errorf("secret %q not found in namespace %q", name, ns)
 	}
 	delete(s.secrets, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2242,6 +2254,8 @@ func (s *Store) DeleteServiceAccount(ns, name string) error {
 		return fmt.Errorf("serviceaccount %q not found in namespace %q", name, ns)
 	}
 	delete(s.serviceAccounts, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2346,6 +2360,8 @@ func (s *Store) DeleteJob(ns, name string) error {
 		return fmt.Errorf("job %q not found in namespace %q", name, ns)
 	}
 	delete(s.jobs, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2479,6 +2495,8 @@ func (s *Store) DeleteCronJob(ns, name string) error {
 		return fmt.Errorf("cronjob %q not found in namespace %q", name, ns)
 	}
 	delete(s.cronjobs, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2576,6 +2594,8 @@ func (s *Store) DeleteIngress(ns, name string) error {
 		return fmt.Errorf("ingress %q not found in namespace %q", name, ns)
 	}
 	delete(s.ingresses, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2672,6 +2692,8 @@ func (s *Store) DeleteMiddleware(ns, name string) error {
 		return fmt.Errorf("middleware %q not found in namespace %q", name, ns)
 	}
 	delete(s.middlewares, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2771,6 +2793,8 @@ func (s *Store) DeleteIngressRouteTCP(ns, name string) error {
 		return fmt.Errorf("ingressroutetcp %q not found in namespace %q", name, ns)
 	}
 	delete(s.ingressRouteTCPs, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -2911,6 +2935,8 @@ func (s *Store) DeleteDeployment(ns, name string) error {
 		return fmt.Errorf("deployment %q not found in namespace %q", name, ns)
 	}
 	delete(s.deployments, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -3025,6 +3051,8 @@ func (s *Store) DeleteRole(ns, name string) error {
 		return fmt.Errorf("role %q not found in namespace %q", name, ns)
 	}
 	delete(s.roles, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -3124,6 +3152,8 @@ func (s *Store) DeleteRoleBinding(ns, name string) error {
 		return fmt.Errorf("rolebinding %q not found in namespace %q", name, ns)
 	}
 	delete(s.roleBindings, key)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -3208,6 +3238,8 @@ func (s *Store) DeleteClusterRole(name string) error {
 		return fmt.Errorf("clusterrole %q not found", name)
 	}
 	delete(s.clusterRoles, name)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err
@@ -3291,6 +3323,8 @@ func (s *Store) DeleteClusterRoleBinding(name string) error {
 		return fmt.Errorf("clusterrolebinding %q not found", name)
 	}
 	delete(s.clusterRoleBindings, name)
+	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+	s.incRV()
 	s.mu.Unlock()
 	if err := s.persist(); err != nil {
 		return err

@@ -505,6 +505,9 @@ func serveWatch[Item any, PI watchItem[Item]](w http.ResponseWriter, r *http.Req
 		}
 		for k, e := range seen {
 			if !currentKeys[k] {
+				// As in Kubernetes, the DELETED event carries the
+				// resourceVersion of the delete, not the object's last one.
+				e.obj.SetResourceVersion(s.rv())
 				if !write("DELETED", e.obj) {
 					return
 				}

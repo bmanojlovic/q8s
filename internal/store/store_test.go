@@ -6,12 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"q8s/internal/quadlet"
+	"q8s/internal/store"
+
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"q8s/internal/quadlet"
-	"q8s/internal/store"
 )
 
 // --- helpers ---
@@ -1342,31 +1343,12 @@ func reloadUntil(t *testing.T, file string, ready func(*store.Store) bool) *stor
 	}
 }
 
-// settledTempDir is t.TempDir for tests that write through a file-backed
-// store. Saves run on background goroutines and can still be writing
-// store.json.tmp when the test returns, which makes t.TempDir's cleanup fail
-// with "directory not empty"; this cleanup retries until they are done.
+// settledTempDir is t.TempDir. Saves used to run on background goroutines
+// that could still be writing when a test returned; they are synchronous now,
+// so plain t.TempDir cleans up reliably.
 func settledTempDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "q8s-store-test-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			err := os.RemoveAll(dir)
-			if err == nil {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Errorf("remove %s: %v", dir, err)
-				return
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-	})
-	return dir
+	return t.TempDir()
 }
 
 // kubectl run --attach waits for the Ready condition, so the conditions must
