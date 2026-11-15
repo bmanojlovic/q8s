@@ -55,6 +55,12 @@ func encoder() *jsonser.Serializer {
 	return jsonser.NewSerializer(jsonser.SimpleMetaFactory{}, scheme, scheme, false)
 }
 
+// podmanCommand runs one podman invocation. Tests replace it to record the
+// calls without reaching a real podman.
+var podmanCommand = func(ctx context.Context, args ...string) error {
+	return exec.CommandContext(ctx, "podman", args...).Run()
+}
+
 // readBody reads the request body, mapping MaxBytesReader overflow to a
 // 413 Status the way real kube-apiserver does. Returns ok=false (and has
 // already written the response) when reading failed.
@@ -675,7 +681,12 @@ func (s *Server) removeStaleOwnedUnits(dir, ns, podName string, keep map[string]
 	if err != nil {
 		return false
 	}
-	removed := false
+	type staleFile struct {
+		name string
+		path string
+	}
+	var stale []staleFile
+	hasPod := false
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -694,10 +705,31 @@ func (s *Server) removeStaleOwnedUnits(dir, ns, podName string, keep map[string]
 		if !ownedByExactLabels(content, ns, podName) {
 			continue
 		}
-		if mgr := s.config.Manager; mgr != nil {
-			mgr.StopUnit(strings.TrimSuffix(name, filepath.Ext(name)) + ".service")
+		stale = append(stale, staleFile{name: name, path: path})
+		if strings.HasSuffix(name, ".pod") {
+			hasPod = true
 		}
-		if err := os.Remove(path); err != nil {
+	}
+	if len(stale) == 0 {
+		return false
+	}
+	// Stop every stale member unit first. A stale .pod means the workload
+	// changed from a Podman pod to a single container; stop the pod service
+	// and force-remove the pod while both still exist, because the quadlet
+	// file is about to disappear and the daemon reload would drop the
+	// quadlet-generated ExecStopPost that normally removes it.
+	for _, f := range stale {
+		if strings.HasSuffix(f.name, ".pod") {
+			continue
+		}
+		s.stopUnit(strings.TrimSuffix(f.name, filepath.Ext(f.name)) + ".service")
+	}
+	if hasPod {
+		s.stopAndRemovePod(ns, podName)
+	}
+	removed := false
+	for _, f := range stale {
+		if err := os.Remove(f.path); err != nil {
 			continue
 		}
 		removed = true
@@ -3983,20 +4015,14 @@ func (s *Server) stopPodUnit(pod *corev1.Pod) {
 // containers. A Podman pod is torn down as a unit (podman pod rm -f), while
 // a single-container pod keeps the historical rm of its one container.
 func (s *Server) stopPodByName(ns, name string, containers []corev1.Container) {
-	unit := fmt.Sprintf("%s-%s.service", ns, name)
 	if len(containers) <= 1 {
-		s.stopAndRemoveUnit(unit, fmt.Sprintf("%s-%s", ns, name))
+		s.stopAndRemoveUnit(fmt.Sprintf("%s-%s.service", ns, name), fmt.Sprintf("%s-%s", ns, name))
 		return
 	}
-	if mgr := s.config.Manager; mgr != nil {
-		for _, c := range containers {
-			mgr.StopUnit(fmt.Sprintf("%s-%s-%s.service", ns, name, c.Name))
-		}
-		mgr.StopUnit(unit)
+	for _, c := range containers {
+		s.stopUnit(fmt.Sprintf("%s-%s-%s.service", ns, name, c.Name))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	exec.CommandContext(ctx, "podman", "pod", "rm", "-f", fmt.Sprintf("%s-%s", ns, name)).Run()
+	s.stopAndRemovePod(ns, name)
 }
 
 // stopAndRemoveUnit stops a unit and force-removes its container.
@@ -4009,14 +4035,37 @@ func (s *Server) stopPodByName(ns, name string, containers []corev1.Container) {
 // reconcile resurrects the deleted Deployment from a stub spec, and scaled-
 // down instances linger as stopped containers forever.
 func (s *Server) stopAndRemoveUnit(unit, containerName string) {
-	if mgr := s.config.Manager; mgr != nil {
-		mgr.StopUnit(unit)
-	}
+	s.stopUnit(unit)
 	// Bounded: this runs inside HTTP DELETE handlers, and podman rm -f on a
 	// wedged container must not hold the request (and the goroutine) forever.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	exec.CommandContext(ctx, "podman", "rm", "-f", containerName).Run()
+	podmanCommand(ctx, "rm", "-f", containerName)
+}
+
+// stopAndRemovePod stops the .pod service and force-removes the Podman pod.
+// Quadlet's ExecStopPost `podman pod rm` only runs while the unit is still
+// loaded; the delete paths remove the .pod file and reload the daemon right
+// afterwards, so the pod has to be removed synchronously here. --ignore keeps
+// the call idempotent for paths that stop the same pod twice.
+func (s *Server) stopAndRemovePod(ns, name string) {
+	s.stopUnit(fmt.Sprintf("%s-%s-pod.service", ns, name))
+	// Same bounded context as stopAndRemoveUnit: this runs in delete and
+	// scale-down handlers and must not hang on a wedged pod.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	podmanCommand(ctx, "pod", "rm", "-f", "--ignore", fmt.Sprintf("%s-%s", ns, name))
+}
+
+// stopUnit stops one systemd unit through the test hook or config.Manager.
+func (s *Server) stopUnit(name string) {
+	if s.stopUnitHook != nil {
+		s.stopUnitHook(name)
+		return
+	}
+	if mgr := s.config.Manager; mgr != nil {
+		mgr.StopUnit(name)
+	}
 }
 
 func (s *Server) removePodQuadlet(pod *corev1.Pod) {

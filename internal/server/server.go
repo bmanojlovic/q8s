@@ -75,6 +75,10 @@ type Server struct {
 	// ops stay nil in tests (Manager nil), so nothing can reach real podman
 	// unless cmd/q8s installed the CLI-backed implementation through New.
 	network *networkState
+	// stopUnitHook, when set, replaces systemd stops. Tests use it to observe
+	// the order of unit stops relative to quadlet file removal; nil uses
+	// config.Manager.
+	stopUnitHook func(name string)
 	// disk caches the short-lived disk pressure check for write requests.
 	disk diskPressureCache
 }
