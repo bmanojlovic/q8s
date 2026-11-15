@@ -520,13 +520,16 @@ func (s *Server) handleCronRunPodLogs(w http.ResponseWriter, r *http.Request, po
 	cronJob := pod.Labels[cronRunCronJobLabel]
 	s.handleJournalPodLogs(w, r, pod,
 		cronruns.UnitName(pod.Namespace, cronJob),
-		cronruns.ContainerName(pod.Namespace, cronJob))
+		cronruns.ContainerName(pod.Namespace, cronJob),
+		time.Time{})
 }
 
 // handleJournalPodLogs serves a synthetic pod's log subresource from one
 // systemd unit. The invocation id annotation selects the newest run; without
-// it every run of the unit is returned.
-func (s *Server) handleJournalPodLogs(w http.ResponseWriter, r *http.Request, pod *corev1.Pod, unit, container string) {
+// it every run of the unit is returned. notBefore, when set, floors the
+// journal selection so a recreated pod does not show its predecessor's runs;
+// a later sinceSeconds or sinceTime still wins.
+func (s *Server) handleJournalPodLogs(w http.ResponseWriter, r *http.Request, pod *corev1.Pod, unit, container string, notBefore time.Time) {
 	src := s.config.CronRuns
 	if src == nil {
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "pod %q not found", pod.Name)
@@ -554,6 +557,9 @@ func (s *Server) handleJournalPodLogs(w http.ResponseWriter, r *http.Request, po
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
 			opt.Since = t
 		}
+	}
+	if !notBefore.IsZero() && (opt.Since.IsZero() || opt.Since.Before(notBefore)) {
+		opt.Since = notBefore
 	}
 	args := src.LogArgsForUnit(unit, container, invocationID, opt)
 	timestamps := q.Get("timestamps") == "true"

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -148,7 +149,8 @@ func (s *Server) handleJobPodLogs(w http.ResponseWriter, r *http.Request, pod *c
 	jobName := pod.Labels[jobNameLabel]
 	s.handleJournalPodLogs(w, r, pod,
 		cronruns.JobUnitName(pod.Namespace, jobName),
-		cronruns.JobContainerName(pod.Namespace, jobName))
+		cronruns.JobContainerName(pod.Namespace, jobName),
+		time.Time{})
 }
 
 func jobPodObjectFor(job *batchv1.Job, run *cronruns.Run) *corev1.Pod {

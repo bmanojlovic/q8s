@@ -1065,8 +1065,35 @@ func (s *Server) podContainerName(ns, podName, requested string) string {
 	return fmt.Sprintf("%s-%s-%s", ns, podName, requested)
 }
 
+// podLogUnit returns the systemd unit and Podman container name whose
+// journal output belongs to one container of a stored pod. It mirrors
+// podUnitNames and podContainerName: a single-container pod keeps the
+// pod-only names, a multi-container pod names the requested member.
+func podLogUnit(pod *corev1.Pod, requested string) (unit, container string) {
+	container = fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
+	unit = container + ".service"
+	if len(pod.Spec.Containers) <= 1 {
+		return unit, container
+	}
+	if requested == "" {
+		requested = pod.Spec.Containers[0].Name
+	}
+	container = fmt.Sprintf("%s-%s-%s", pod.Namespace, pod.Name, requested)
+	return container + ".service", container
+}
+
+// podmanContainerExists reports whether podman still has the named
+// container. A podman that cannot answer counts as gone, because the journal
+// still holds the output of a container that ran.
+func podmanContainerExists(ctx context.Context, name string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "podman", "container", "exists", name).Run() == nil
+}
+
 func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request, ns, name string) {
-	if _, err := s.config.Store.GetPod(ns, name); err != nil {
+	pod, err := s.config.Store.GetPod(ns, name)
+	if err != nil {
 		if pod, ok := s.jobPodFindPod(r.Context(), ns, name); ok {
 			s.handleJobPodLogs(w, r, pod)
 			return
@@ -1078,6 +1105,18 @@ func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request, ns, name 
 	}
 	q := r.URL.Query()
 	containerName := s.podContainerName(ns, name, q.Get("container"))
+
+	// q8s runs containers with --rm, so a finished pod's container is gone
+	// while Kubernetes keeps serving its logs. The journald log driver tags
+	// every line with CONTAINER_NAME, so read those lines instead. A Pending
+	// pod has not run anything yet and keeps the podman error.
+	if pod != nil && s.config.CronRuns != nil && pod.Status.Phase != corev1.PodPending &&
+		!podmanContainerExists(r.Context(), containerName) {
+		unit, container := podLogUnit(pod, q.Get("container"))
+		s.handleJournalPodLogs(w, r, pod, unit, container,
+			pod.CreationTimestamp.Time.Truncate(time.Second))
+		return
+	}
 
 	args := []string{"logs"}
 	follow := q.Get("follow") == "true"
