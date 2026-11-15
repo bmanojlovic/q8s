@@ -21,6 +21,9 @@ type UnitState struct {
 	Result    string // "success", "exit-code", "signal", "" (empty when active)
 	NRestarts int    // times systemd has auto-restarted the unit (Restart=on-failure)
 	ExitCode  int    // exit code of the main process' last run (ExecMainStatus)
+	// MainStart is when the main process last started (ExecMainStartTimestamp);
+	// zero when the unit never ran since it was loaded.
+	MainStart time.Time
 }
 
 // UnitState queries the unit's ActiveState, SubState, Result, restart count,
@@ -28,7 +31,7 @@ type UnitState struct {
 // (never loaded).
 func (m *Manager) UnitState(name string) (*UnitState, error) {
 	// systemctl show is the most reliable path across loaded/unloaded units.
-	args := []string{"show", name, "--property=ActiveState,SubState,Result,NRestarts,ExecMainStatus", "--no-pager"}
+	args := []string{"show", name, "--timestamp=unix", "--property=ActiveState,SubState,Result,NRestarts,ExecMainStatus,ExecMainStartTimestamp", "--no-pager"}
 	out, err := m.RunSystemctl(args...)
 	if err != nil {
 		return nil, err
@@ -50,6 +53,11 @@ func (m *Manager) UnitState(name string) (*UnitState, error) {
 			s.NRestarts, _ = strconv.Atoi(kv[1])
 		case "ExecMainStatus":
 			s.ExitCode, _ = strconv.Atoi(kv[1])
+		case "ExecMainStartTimestamp":
+			// --timestamp=unix prints "@<seconds>"; empty when it never ran.
+			if sec, err := strconv.ParseInt(strings.TrimPrefix(kv[1], "@"), 10, 64); err == nil && sec > 0 {
+				s.MainStart = time.Unix(sec, 0)
+			}
 		}
 	}
 	if s.Active == "" {

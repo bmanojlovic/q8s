@@ -447,3 +447,23 @@ func TestUnitPhaseNotStartedYetStaysPending(t *testing.T) {
 		t.Fatalf("pending pod with an exited container: %s, want Succeeded", got)
 	}
 }
+
+// A restartPolicy: Never pod that runs and exits (its --rm container already
+// removed) between two syncs looks like a unit that never started, except
+// for its start timestamp. Started after the pod was created: Succeeded.
+// Started before (an earlier run of a recreated pod): still Pending.
+func TestUnitPhaseFastExitAfterCreationSucceeds(t *testing.T) {
+	created := time.Date(2026, 11, 15, 16, 0, 0, 500_000_000, time.UTC)
+	pending := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(created)},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	ran := &systemd.UnitState{Active: "inactive", Sub: "dead", Result: "success", MainStart: created.Truncate(time.Second)}
+	if got := unitPhase(pending, ran, nil); got != corev1.PodSucceeded {
+		t.Fatalf("unit started after the pod was created: %s, want Succeeded", got)
+	}
+	earlier := &systemd.UnitState{Active: "inactive", Sub: "dead", Result: "success", MainStart: created.Add(-time.Minute)}
+	if got := unitPhase(pending, earlier, nil); got != corev1.PodPending {
+		t.Fatalf("unit started before the pod existed: %s, want Pending", got)
+	}
+}

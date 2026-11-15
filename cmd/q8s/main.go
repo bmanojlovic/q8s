@@ -1266,10 +1266,24 @@ const containerDown = "down"
 // up before the container existed.
 func unitPhase(pod *corev1.Pod, s *systemd.UnitState, infos []podman.ContainerInfo) corev1.PodPhase {
 	phase := unitStateToPhase(s)
-	if phase == corev1.PodSucceeded && pod.Status.Phase == corev1.PodPending && len(infos) == 0 {
+	if phase == corev1.PodSucceeded && pod.Status.Phase == corev1.PodPending && len(infos) == 0 && !unitRanForPod(pod, s) {
+		// inactive/success with no container can also mean the unit has not
+		// started yet; stay Pending unless systemd says it ran for this pod.
 		return corev1.PodPending
 	}
 	return phase
+}
+
+// unitRanForPod reports whether the unit's main process started after the pod
+// was created (both at second precision). A fast restartPolicy: Never pod can
+// run and exit, with its --rm container already gone, between two syncs; its
+// unit is then inactive/success with no container exactly like a unit that has
+// not started yet, and only the start timestamp tells them apart.
+func unitRanForPod(pod *corev1.Pod, s *systemd.UnitState) bool {
+	if s == nil || s.MainStart.IsZero() {
+		return false
+	}
+	return !s.MainStart.Before(pod.CreationTimestamp.Time.Truncate(time.Second))
 }
 
 func unitStateToPhase(s *systemd.UnitState) corev1.PodPhase {
