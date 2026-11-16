@@ -277,9 +277,11 @@ func resourceRuleMatches(rule rbacv1.PolicyRule, a requestAttributes) bool {
 		return false
 	}
 	if len(rule.ResourceNames) > 0 {
-		// A rule restricted to names never grants a request without a name,
-		// such as list, watch or deletecollection.
-		if a.Name == "" {
+		// resourceNames never applies to create in Kubernetes: the object
+		// does not exist when authorization runs, so a name list could not
+		// reliably identify it. A rule restricted to names also never grants
+		// a request without a name, such as list, watch or deletecollection.
+		if a.Verb == "create" || a.Name == "" {
 			return false
 		}
 		for _, candidate := range rule.ResourceNames {

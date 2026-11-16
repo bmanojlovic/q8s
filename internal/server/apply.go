@@ -48,6 +48,15 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 	// fieldManager and force are accepted and ignored: q8s keeps no
 	// managedFields, so there is no per-manager ownership to conflict. Apply
 	// here means the applier owns the user sections, as described above.
+	if attrs := parseRequestAttributes(r); attrs.IsResourceRequest && attrs.Subresource != "" {
+		// The create fallback below would otherwise POST to a subresource URL
+		// that authorizeMiddleware authorized for the original PATCH verb.
+		// q8s deliberately supports no apply on a subresource, so refuse them
+		// all rather than fall through to the named object handler.
+		s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
+			"server-side apply is not supported on subresource %q", attrs.Subresource)
+		return
+	}
 	if _, ok := r.URL.Query()["dryRun"]; ok {
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "dryRun is not supported")
 		return
@@ -97,6 +106,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 	if !s.objectIdentityMatchesURL(w, &meta, namespaceFromURLPath(urlPath), urlName) {
 		return
 	}
+	if s.rejectAppliedHostAccess(w, r, js) {
+		return
+	}
 
 	// Look the object up through the normal GET handler. This also lets
 	// resources q8s synthesizes (Node, StorageClass) participate without
@@ -116,6 +128,20 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 		createRequest := r.Clone(r.Context())
 		createRequest.Method = http.MethodPost
 		createRequest.URL.Path = collectionPath
+
+		// authorizeMiddleware only checked the original PATCH. The create
+		// fallback is a new request, so authorize create on the collection
+		// here, the same way that middleware would. Parsing the collection
+		// path rather than reusing the object attributes gets the namespace
+		// right for cluster-scoped objects such as Namespace.
+		if u, ok := callerInfo(r); ok && !isAdmin(u) {
+			createAttrs := parseRequestAttributes(createRequest)
+			if allowed, _ := s.authorize(u, createAttrs); !allowed {
+				s.respondStatus(w, http.StatusForbidden, "Forbidden", "%s", forbiddenMessage(u, createAttrs))
+				return
+			}
+		}
+
 		createRequest.Body = io.NopCloser(bytes.NewReader(js))
 		createRequest.ContentLength = int64(len(js))
 		createRequest.Header = r.Header.Clone()

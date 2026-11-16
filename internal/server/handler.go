@@ -954,6 +954,9 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if s.rejectHostAccess(w, r, "Pod", pod.Name, hostAccessReasons(pod.Spec)) {
+			return
+		}
 		// Fail fast with a proper 400 instead of storing the pod and only
 		// discovering at quadlet-generation time (after the fact, logged
 		// server-side only) that its spec can't be safely turned into a
@@ -1052,6 +1055,9 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validatePodAnnotations("pod", &patched.Spec, patched.Annotations, 0); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "Pod", patched.Name, hostAccessReasons(patched.Spec)) {
 			return
 		}
 		// Same fail-fast dry-run as create: a patch whose merged spec can't
@@ -1493,6 +1499,9 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if s.rejectHostAccess(w, r, "PersistentVolumeClaim", pvc.Name, pvcHostAccessReasons(&pvc)) {
+			return
+		}
 		created, err := s.config.Store.CreatePVC(&pvc)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -1546,6 +1555,9 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "PersistentVolumeClaim", patched.Name, pvcHostAccessReasons(&patched)) {
 			return
 		}
 		updated, err := s.config.Store.UpdatePVC(&patched)
@@ -2218,6 +2230,9 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if s.rejectHostAccess(w, r, "Deployment", dep.Name, hostAccessReasons(dep.Spec.Template.Spec)) {
+			return
+		}
 		created, err := s.config.Store.CreateDeployment(&dep)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -2255,6 +2270,9 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "Deployment", dep.Name, hostAccessReasons(dep.Spec.Template.Spec)) {
 			return
 		}
 		existing, err := s.config.Store.GetDeployment(ns, name)
@@ -2340,6 +2358,9 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if s.rejectHostAccess(w, r, "Deployment", patched.Name, hostAccessReasons(patched.Spec.Template.Spec)) {
+			return
+		}
 		updated, err := s.config.Store.UpdateDeployment(&patched)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
@@ -2383,6 +2404,11 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 	if err != nil {
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 		return
+	}
+	if r.Method == http.MethodPatch || r.Method == http.MethodPut {
+		if s.rejectHostAccess(w, r, "Deployment", dep.Name, hostAccessReasons(dep.Spec.Template.Spec)) {
+			return
+		}
 	}
 	scaleResp := func(dep *appsv1.Deployment) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2791,6 +2817,9 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if s.rejectHostAccess(w, r, "Job", job.Name, hostAccessReasons(job.Spec.Template.Spec)) {
+			return
+		}
 		ensureJobPodIdentity(&job)
 		created, err := s.config.Store.CreateJob(&job)
 		if err != nil {
@@ -2828,6 +2857,9 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateUserNSSizeAnnotation("job spec.template", job.Spec.Template.Annotations); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "Job", job.Name, hostAccessReasons(job.Spec.Template.Spec)) {
 			return
 		}
 		existing, err := s.config.Store.GetJob(ns, name)
@@ -2916,6 +2948,9 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateUserNSSizeAnnotation("job spec.template", patched.Spec.Template.Annotations); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "Job", patched.Name, hostAccessReasons(patched.Spec.Template.Spec)) {
 			return
 		}
 		ensureJobPodIdentity(&patched)
@@ -3014,6 +3049,9 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if s.rejectHostAccess(w, r, "CronJob", cj.Name, hostAccessReasons(cj.Spec.JobTemplate.Spec.Template.Spec)) {
+			return
+		}
 		created, err := s.config.Store.CreateCronJob(&cj)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -3054,6 +3092,9 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		if err := validateCronJobTimeZone(cj.Spec.TimeZone); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "CronJob", cj.Name, hostAccessReasons(cj.Spec.JobTemplate.Spec.Template.Spec)) {
 			return
 		}
 		existing, err := s.config.Store.GetCronJob(ns, name)
@@ -3135,6 +3176,9 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		if err := validateCronJobTimeZone(patched.Spec.TimeZone); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "CronJob", patched.Name, hostAccessReasons(patched.Spec.JobTemplate.Spec.Template.Spec)) {
 			return
 		}
 		updated, err := s.config.Store.UpdateCronJob(&patched)

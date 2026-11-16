@@ -38,9 +38,13 @@ same way the Kubernetes authorizer builds them:
 | pods `log` | `get` |
 
 Rule matching follows Kubernetes: `*` matches every verb, API group and
-resource; `resourceNames` is an exact list of names and a rule with
-resourceNames never grants a collection request; `pods/*` grants every pod
-subresource, and a rule naming `pods` does not grant `pods/log`. A RoleBinding
+resource; `resourceNames` is an exact list of names, a rule with resourceNames
+never grants a collection request, and it never grants `create`; `pods/*`
+grants every pod subresource, and a rule naming `pods` does not grant
+`pods/log`. A `POST` to a named object URL is answered with 405
+MethodNotAllowed; only the collection URL creates an object, and the named
+subresources that take POST (`pods/exec`, `pods/attach`, `pods/portforward`,
+`pods/eviction`, bindings) are the exception. A RoleBinding
 may point at a Role in its namespace or at a ClusterRole, and the ClusterRole
 rules then apply only in that namespace. ClusterRoleBindings apply in every
 namespace. Aggregation through `aggregationRule` is evaluated at request time.
@@ -61,6 +65,36 @@ Writes to `rbac.authorization.k8s.io` objects are administrator-only.
 Escalation checks are not implemented, so a bound rule that appears to grant
 them is not enough. `SubjectAccessReview` creation is administrator-only as
 well, because it reviews another user's access.
+
+## Host access
+
+Host access is administrator-only, independent of the RBAC verbs a user
+holds. A non-administrator who creates, updates or patches a Pod, Deployment,
+Job, CronJob or PersistentVolumeClaim that uses any of these fields gets 403
+Forbidden, even when the change itself leaves the host-access field untouched.
+A non-administrator also cannot scale a Deployment whose pod template has
+host access, and deletes remain governed by RBAC.
+
+- any container or initContainer with
+  `securityContext.privileged: true`
+- `spec.hostPID: true`
+- `spec.hostIPC: true`
+- `spec.hostNetwork: true`
+- `spec.hostUsers: true`
+- a PersistentVolumeClaim with `storageClassName: hostpath` or the
+  `q8s.io/host-path` annotation
+
+These fields either disable the rootful user namespace or join a host
+namespace, so they are equivalent to root on the host: a q8s administrator
+is trusted like root on the machine (or the owner of the account, rootless).
+A pod of an ordinary user may still mount a hostpath PersistentVolumeClaim
+that an administrator created in its namespace; creating the claim is the
+administrator's decision to hand that directory to the namespace. The GPU device
+(`nvidia.com/gpu`) and the read-only ServiceAccount workload mounts are not
+host access and stay available to ordinary users. The same check applies to
+server-side apply and to dry-run requests; it runs on the resulting object, so
+a patch that only changes an image still fails while the pod template keeps
+host access. Existing objects are not changed at startup or during reconcile.
 
 An API path with an empty, `.` or `..` segment, or an encoded `/` or `.`, is
 refused with 400 before authorization. A write whose object names a different

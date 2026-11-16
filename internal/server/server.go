@@ -188,6 +188,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "invalid API path %q", r.URL.Path)
 		return
 	}
+	if isPOSTToNamedObject(r) {
+		// A named object URL addresses an existing object, so POST there can
+		// never mean create. Answering 405 here keeps the URL name from
+		// reaching a collection-style create handler (and from matching a
+		// resourceNames rule on the way).
+		s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
+			"the server does not allow this method on the requested resource")
+		return
+	}
 	if _, dry := r.URL.Query()["dryRun"]; dry && r.Method != http.MethodGet && !isPodWritePath(r.URL.Path) {
 		// Only pods honor dryRun. Refusing it elsewhere is safer than the
 		// alternative of running the write for real.
@@ -195,6 +204,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handler.ServeHTTP(w, r)
+}
+
+// isPOSTToNamedObject reports whether r is a POST to a named object URL that
+// is not one of the subresources that accept POST. Kubernetes answers 405 for
+// these requests; only the object's collection URL can create it.
+func isPOSTToNamedObject(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	attrs := parseRequestAttributes(r)
+	if !attrs.IsResourceRequest || attrs.Name == "" {
+		return false
+	}
+	if attrs.Subresource == "" {
+		return true
+	}
+	return !postNamedSubresourceAllowed(attrs.Resource, attrs.Subresource)
+}
+
+// postNamedSubresourceAllowed reports whether a named object subresource takes
+// POST. The review resources are not listed because they are collection URLs
+// and therefore have no name to begin with.
+func postNamedSubresourceAllowed(resource, subresource string) bool {
+	switch subresource {
+	case "exec", "attach", "portforward", "eviction":
+		return resource == "pods"
+	case "binding", "bindings":
+		return resource == "pods" || resource == "bindings"
+	default:
+		return false
+	}
 }
 
 // isUncleanAPIPath reports whether path is under /api/ or /apis/ and has an

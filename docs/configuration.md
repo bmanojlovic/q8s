@@ -173,6 +173,17 @@ PVCs can specify a `storageClassName` to control how volumes are mounted:
 
 The `hostpath` class reads the host directory from the `q8s.io/host-path` annotation on the PVC. No `.volume` file is generated for hostpath PVCs. An optional `q8s.io/selinux-label` annotation selects the relabel mode for the host directory: `private` (default) emits `:Z`, `shared` emits `:z`, and any other value is rejected.
 
+Host path storage is available to administrators only: a non-administrator creating or patching a PVC with `storageClassName: hostpath` or the `q8s.io/host-path` annotation gets 403 Forbidden. See [Host access](rbac.md#host-access).
+
+### Host access
+
+The pod fields `securityContext.privileged: true`, `hostPID`, `hostIPC`,
+`hostNetwork` and `hostUsers: true` reach host namespaces or switch off the
+rootful user namespace. They are rendered as podman flags and are available to
+administrators only: a non-administrator creating or patching such a Pod,
+Deployment, Job or CronJob gets 403 Forbidden, even when the change itself
+does not touch the field. See [Host access](rbac.md#host-access).
+
 ## Port semantics
 
 | Mechanism | Effect | Quadlet output |
