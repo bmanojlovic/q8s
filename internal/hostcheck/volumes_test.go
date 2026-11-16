@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/store"
@@ -113,6 +114,63 @@ func TestOrphanedVolumesFindsEachKindAndSkipsInUseOnes(t *testing.T) {
 	} {
 		if !strings.Contains(c.Fix, want) {
 			t.Errorf("fix %q does not contain %q", c.Fix, want)
+		}
+	}
+}
+
+func TestOrphanedVolumesUsesPerReplicaDeploymentNames(t *testing.T) {
+	storeFile := filepath.Join(t.TempDir(), "store.json")
+	st, err := store.Load(storeFile)
+	if err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+	replicas := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "app",
+					Image: "nginx",
+					VolumeMounts: []corev1.VolumeMount{{
+						Name:      "cache",
+						MountPath: "/cache",
+					}},
+				}},
+				Volumes: []corev1.Volume{{
+					Name:         "cache",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+			}},
+		},
+	}
+	if _, err := st.CreateDeployment(dep); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	storeData, err := os.ReadFile(storeFile)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+
+	volumes := []podmanVolume{
+		{Name: "q8s_default_web_0_cache"},
+		{Name: "q8s_default_web_1_cache"},
+		{Name: "q8s_default_web_cache"},
+	}
+	c := checkOrphanedVolumes(volumeEnv(t, storeData, volumeListJSON(t, volumes)))
+	if c.Status != StatusWarn {
+		t.Fatalf("status = %q, want warn (detail %q)", c.Status, c.Detail)
+	}
+	if !strings.Contains(c.Detail, "q8s_default_web_cache (no stored workload uses it)") {
+		t.Errorf("detail %q does not report the old shared Deployment volume", c.Detail)
+	}
+	for _, inUse := range []string{"q8s_default_web_0_cache", "q8s_default_web_1_cache"} {
+		if strings.Contains(c.Detail, inUse) {
+			t.Errorf("detail %q reports in-use replica volume %q", c.Detail, inUse)
+		}
+		if strings.Contains(c.Fix, inUse) {
+			t.Errorf("fix %q removes in-use replica volume %q", c.Fix, inUse)
 		}
 	}
 }

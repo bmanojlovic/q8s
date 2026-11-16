@@ -225,7 +225,11 @@ administrator can run after checking the data is no longer needed.
 It reads `<data dir>/store.json` read-only and computes the expected volume
 names from the stored Pods, Deployments, Jobs, CronJobs and PVCs. A
 `q8s_<namespace>_<owner>_<volume>` volume that no stored emptyDir produces is
-an orphan of a deleted workload. A volume carrying the label
+an orphan of a deleted workload. A Deployment replica's emptyDir uses
+`q8s_<namespace>_<deployment>_<replica-index>_<volume>`; an older
+`q8s_<namespace>_<deployment>_<volume>` volume is therefore reported as an
+orphan of the shared-volume scheme before replicas got their own emptyDir. A
+volume carrying the label
 `app.kubernetes.io/managed-by=q8s` that is not the volume of a stored PVC is
 the data of a deleted PVC (PVC data is never deleted automatically). A volume
 whose name equals the plain volume name of an emptyDir in a stored workload

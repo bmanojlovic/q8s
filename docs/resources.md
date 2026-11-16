@@ -182,24 +182,31 @@ A Pod or pod template accepts these volume sources: `persistentVolumeClaim`,
 `hostpath` PersistentVolumeClaim for a host directory; a pod never mounts one
 directly.
 
-An `emptyDir` is a Podman named volume called
-`q8s_{namespace}_{owner}_{volume}`. `owner` is the pod name for a bare Pod and
-the Deployment, Job or CronJob name for a pod template, so all replicas and
-runs of one workload share the volume and it survives restarts. Kubernetes
-instead gives every pod its own `emptyDir`; the per-workload sharing is a
-deliberate q8s difference. The underscore separator cannot appear in a
-Kubernetes name, so an emptyDir can never collide with another namespace's
-emptyDir or with a PVC volume, which is named `{namespace}-{claim}`. An
-`emptyDir` with `medium: Memory` mounted at `/dev/shm` is rendered as
-`ShmSize=` instead, as described above under Pods.
+An `emptyDir` is a Podman named volume. A bare Pod uses
+`q8s_{namespace}_{pod}_{volume}`. Each replica of a Deployment uses its own
+volume, `q8s_{namespace}_{deployment}_{replica-index}_{volume}`, so a file
+written by one replica is not visible in another, as in Kubernetes. Job and
+CronJob runs keep the per-workload name
+`q8s_{namespace}_{job-or-cronjob}_{volume}`. The underscore separator cannot
+appear in a Kubernetes name, so a bare-pod name and a replica name can never
+collide (they have four and five underscore-separated parts), and an
+emptyDir can never collide with another namespace's emptyDir or with a PVC
+volume, which is named `{namespace}-{claim}`. An `emptyDir` with
+`medium: Memory` mounted at `/dev/shm` is rendered as `ShmSize=` instead, as
+described above under Pods.
 
-An emptyDir lives as long as its Pod, Deployment, Job or CronJob: deleting
-that object through the API removes its emptyDir volumes in the same request,
-after the units are stopped and the containers are removed. Deleting a single
-Deployment replica pod, scaling the Deployment, or rolling out a new template
-keeps the shared volume, because the other replicas still use it. A volume
-that stays behind is reported by `q8s doctor`, which prints the
-`podman volume rm` command to clean it up.
+A bare Pod's emptyDir lives as long as the Pod. A Deployment replica's
+emptyDir belongs to that replica incarnation: it is removed, after the
+container is stopped and removed, when the replica pod is deleted through the
+API, when a scale-down drops that replica, and when the Deployment or its
+namespace is deleted. A container restart, including a Podman restart, keeps
+the volume, as in Kubernetes. A rollout or template change keeps the volume
+because the existing redeploy path restarts the unit in place rather than
+stopping it and starting a new pod. Deleting a single Deployment replica pod
+through the API also recreates that replica in the same request when the
+Deployment still exists and its index is below `spec.replicas`; there is no
+controller that would do it later. A volume that stays behind is reported by
+`q8s doctor`, which prints the `podman volume rm` command to clean it up.
 
 Only `metadata.labels` values that satisfy the Kubernetes label rule are
 stored, because pod labels are copied onto the generated container as a

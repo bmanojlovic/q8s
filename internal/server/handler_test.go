@@ -3939,7 +3939,9 @@ func TestDeleteCollectionPodsAndDeployments(t *testing.T) {
 		postDeployment(t, ts.URL, "default", fmt.Sprintf("d%d", i), 1, map[string]string{"app": "d"})
 	}
 
-	// Collection-delete pods.
+	// Collection-delete pods. The two bare pods are gone, but the Deployment
+	// replicas are recreated by the same request, because q8s has no
+	// ReplicaSet controller.
 	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/namespaces/default/pods", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3952,8 +3954,12 @@ func TestDeleteCollectionPodsAndDeployments(t *testing.T) {
 	var list corev1.PodList
 	json.NewDecoder(resp.Body).Decode(&list)
 	resp.Body.Close()
-	if len(list.Items) != 0 {
-		t.Errorf("expected 0 pods after collection delete, got %d", len(list.Items))
+	gotPods := make(map[string]bool, len(list.Items))
+	for _, pod := range list.Items {
+		gotPods[pod.Name] = true
+	}
+	if len(gotPods) != 2 || !gotPods["d0-0"] || !gotPods["d1-0"] {
+		t.Errorf("expected only the recreated Deployment replicas d0-0 and d1-0 after collection delete, got %v", gotPods)
 	}
 
 	// Collection-delete deployments.

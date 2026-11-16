@@ -925,7 +925,25 @@ func expectedVolumes(st *store.Store) (emptyDir, legacy, pvc map[string]bool) {
 		}
 	}
 	for _, dep := range st.AllDeployments() {
-		addSpec(dep.Namespace, dep.Name, &dep.Spec.Template.Spec)
+		// A Deployment replica has its own emptyDir volume now, so the live
+		// names are per replica index. The plain workload name is kept only
+		// as a legacy name; a leftover q8s_<ns>_<dep>_<vol> volume is an
+		// orphan of the old shared-volume scheme.
+		for _, name := range quadlet.EmptyDirVolumeBases(&dep.Spec.Template.Spec) {
+			legacy[name] = true
+		}
+		replicas := int32(1)
+		if dep.Spec.Replicas != nil {
+			replicas = *dep.Spec.Replicas
+		}
+		if replicas < 0 {
+			replicas = 0
+		}
+		for i := int32(0); i < replicas; i++ {
+			for _, name := range quadlet.EmptyDirVolumeNamesForDeploymentReplica(dep.Namespace, dep.Name, i, &dep.Spec.Template.Spec) {
+				emptyDir[name] = true
+			}
+		}
 	}
 	for _, job := range st.AllJobs() {
 		addSpec(job.Namespace, job.Name, &job.Spec.Template.Spec)

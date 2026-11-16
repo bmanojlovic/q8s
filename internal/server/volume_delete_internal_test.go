@@ -87,7 +87,7 @@ func TestDeleteBarePodRemovesItsEmptyDirVolumes(t *testing.T) {
 	}
 }
 
-func TestDeleteDeploymentRemovesTemplateEmptyDirVolumesOnce(t *testing.T) {
+func TestDeleteDeploymentRemovesEveryReplicaEmptyDirVolume(t *testing.T) {
 	st := store.New()
 	srv := &Server{config: Config{Store: st}}
 	replicas := int32(2)
@@ -107,9 +107,12 @@ func TestDeleteDeploymentRemovesTemplateEmptyDirVolumesOnce(t *testing.T) {
 		t.Fatalf("deleteDeploymentByName: %v", err)
 	}
 
-	want := []string{"volume rm --force q8s_default_web_cache"}
+	want := []string{
+		"volume rm --force q8s_default_web_0_cache",
+		"volume rm --force q8s_default_web_1_cache",
+	}
 	if got := volumeRmCalls(*calls); !equalStrings(got, want) {
-		t.Errorf("volume rm calls = %v, want %v (one shared template volume)", got, want)
+		t.Errorf("volume rm calls = %v, want %v (one volume per replica)", got, want)
 	}
 }
 
@@ -160,7 +163,7 @@ func TestDeleteCronJobRemovesTemplateEmptyDirVolumes(t *testing.T) {
 	}
 }
 
-func TestDeleteDeploymentReplicaPodKeepsSharedEmptyDirVolume(t *testing.T) {
+func TestDeleteDeploymentReplicaPodRemovesItsOwnEmptyDirVolume(t *testing.T) {
 	st := store.New()
 	srv := &Server{config: Config{Store: st}}
 	pod := &corev1.Pod{
@@ -179,12 +182,18 @@ func TestDeleteDeploymentReplicaPodKeepsSharedEmptyDirVolume(t *testing.T) {
 	}
 	calls := recordPodmanCommand(t)
 
+	// deletePodByName is the internal delete; only the API wrapper recreates
+	// the replica after removing its volume.
 	if err := srv.deletePodByName("default", "web-0"); err != nil {
 		t.Fatalf("deletePodByName: %v", err)
 	}
 
-	if got := volumeRmCalls(*calls); len(got) != 0 {
-		t.Errorf("deleting one replica removed shared volumes: %v", got)
+	want := []string{"volume rm --force q8s_default_web_0_cache"}
+	if got := volumeRmCalls(*calls); !equalStrings(got, want) {
+		t.Errorf("volume rm calls = %v, want %v", got, want)
+	}
+	if _, err := st.GetPod("default", "web-0"); err == nil {
+		t.Fatal("internal delete recreated the replica")
 	}
 }
 

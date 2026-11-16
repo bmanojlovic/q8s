@@ -895,10 +895,62 @@ func PVCVolumeName(ns, name string) string {
 // underscore separator cannot appear in a Kubernetes namespace, owner or
 // volume name, so this name can never equal another namespace's emptyDir or
 // a PVC volume (PVCVolumeName joins with '-'). owner is the pod name for a
-// bare pod and the Deployment, Job or CronJob name for a pod template, so
-// every replica or run of one workload keeps sharing the same volume.
+// bare pod, the Deployment, Job or CronJob name for a pod template, and
+// DeploymentReplicaVolumeOwner(deployment, index) for one Deployment replica.
 func EmptyDirVolumeName(ns, owner, name string) string {
 	return fmt.Sprintf("q8s_%s_%s_%s", ns, owner, name)
+}
+
+// DeploymentReplicaVolumeOwner is the owner component of a Deployment
+// replica's emptyDir volume name. Replicas must not share an emptyDir, so
+// replica i uses "<deployment>_<i>" and every replica gets its own volume.
+// The underscore cannot appear in a Kubernetes name, so this can never
+// collide with a bare pod or workload owner component.
+func DeploymentReplicaVolumeOwner(deployment string, index int32) string {
+	return fmt.Sprintf("%s_%d", deployment, index)
+}
+
+// DeploymentReplica returns the Deployment name and replica index of a stored
+// Deployment instance pod. materializeDeploymentInstance names instance i
+// "<deployment>-<i>" and sets the Deployment OwnerReference, so the index is
+// the validated decimal suffix after that prefix. A pod whose name does not
+// have this shape reports false rather than guessing an index.
+func DeploymentReplica(pod *corev1.Pod) (string, int32, bool) {
+	for _, or := range pod.OwnerReferences {
+		if or.Kind != "Deployment" || or.Name == "" {
+			continue
+		}
+		if index, ok := deploymentReplicaIndex(pod.Name, or.Name); ok {
+			return or.Name, index, true
+		}
+	}
+	return "", 0, false
+}
+
+// deploymentReplicaIndex parses the instance index from a pod name of the
+// form "<deployment>-<index>". Only a canonical non-negative decimal suffix
+// is accepted, so an unrelated pod named "<deployment>-canary" or a moved
+// index like "<deployment>-00" keeps the old per-workload owner instead of
+// silently landing in another replica's volume name space.
+func deploymentReplicaIndex(podName, deployment string) (int32, bool) {
+	prefix := deployment + "-"
+	if !strings.HasPrefix(podName, prefix) {
+		return 0, false
+	}
+	suffix := podName[len(prefix):]
+	if suffix == "" || (len(suffix) > 1 && suffix[0] == '0') {
+		return 0, false
+	}
+	for i := 0; i < len(suffix); i++ {
+		if suffix[i] < '0' || suffix[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(suffix, 10, 32)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return int32(n), true
 }
 
 // EmptyDirVolumeNames returns the Podman volume names of a pod's emptyDir
@@ -919,6 +971,12 @@ func EmptyDirVolumeNamesForSpec(ns, owner string, spec *corev1.PodSpec) []string
 		names = append(names, EmptyDirVolumeName(ns, owner, base))
 	}
 	return names
+}
+
+// EmptyDirVolumeNamesForDeploymentReplica is EmptyDirVolumeNamesForSpec for
+// one replica index of a Deployment template.
+func EmptyDirVolumeNamesForDeploymentReplica(ns, deployment string, index int32, spec *corev1.PodSpec) []string {
+	return EmptyDirVolumeNamesForSpec(ns, DeploymentReplicaVolumeOwner(deployment, index), spec)
 }
 
 // EmptyDirVolumeBases returns the plain volume names (metadata.name, not the
@@ -942,13 +1000,22 @@ func EmptyDirVolumeBases(spec *corev1.PodSpec) []string {
 	return names
 }
 
-// emptyDirVolumeOwner returns the workload that owns the emptyDir volume: a
-// Deployment, Job or CronJob name for template-derived pods, otherwise the
-// pod's own name.
+// emptyDirVolumeOwner returns the owner component of the emptyDir volume
+// name: a Deployment replica gets "<deployment>_<index>", a Job or CronJob
+// keeps its workload name (runs share their volume), and a bare pod uses its
+// own name.
 func emptyDirVolumeOwner(pod *corev1.Pod) string {
 	for _, or := range pod.OwnerReferences {
 		switch or.Kind {
-		case "Deployment", "Job", "CronJob":
+		case "Deployment":
+			if or.Name == "" {
+				continue
+			}
+			if index, ok := deploymentReplicaIndex(pod.Name, or.Name); ok {
+				return DeploymentReplicaVolumeOwner(or.Name, index)
+			}
+			return or.Name
+		case "Job", "CronJob":
 			if or.Name != "" {
 				return or.Name
 			}

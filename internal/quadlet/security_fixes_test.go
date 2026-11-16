@@ -37,25 +37,76 @@ func TestEmptyDirVolumeNamesAreNamespacedAndWorkloadScoped(t *testing.T) {
 	}
 }
 
-// TestEmptyDirVolumeIsSharedByWorkloadReplicas: every pod of one Deployment
-// resolves its owner to the Deployment name, not the instance pod name, so
-// all replicas keep sharing one volume as before.
-func TestEmptyDirVolumeIsSharedByWorkloadReplicas(t *testing.T) {
-	pod := simplePod("default", "web-0", "img")
-	pod.OwnerReferences = []metav1.OwnerReference{{Kind: "Deployment", Name: "web"}}
-	pod.Spec.Volumes = []corev1.Volume{{
-		Name:         "cache",
-		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-	}}
-	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "cache", MountPath: "/cache"}}
-	first := string(mustContainer(t, pod, ""))
+// TestEmptyDirVolumeIsPerDeploymentReplica: replica i of Deployment web gets
+// its own volume q8s_<namespace>_web_<i>_<volume>, as Kubernetes gives each pod
+// its own emptyDir. A bare pod keeps the bare-pod form, so the two forms can
+// never collide.
+func TestEmptyDirVolumeIsPerDeploymentReplica(t *testing.T) {
+	replica := func(name string) *corev1.Pod {
+		pod := simplePod("default", name, "img")
+		pod.Spec.Volumes = []corev1.Volume{{
+			Name:         "cache",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		}}
+		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "cache", MountPath: "/cache"}}
+		return pod
+	}
+	first := replica("web-0")
+	first.OwnerReferences = []metav1.OwnerReference{{Kind: "Deployment", Name: "web"}}
+	second := replica("web-1")
+	second.OwnerReferences = []metav1.OwnerReference{{Kind: "Deployment", Name: "web"}}
 
-	second := pod.DeepCopy()
-	second.Name = "web-1"
+	firstOut := string(mustContainer(t, first, ""))
 	secondOut := string(mustContainer(t, second, ""))
+	assertContains(t, firstOut, "Volume=q8s_default_web_0_cache:/cache")
+	assertContains(t, secondOut, "Volume=q8s_default_web_1_cache:/cache")
 
-	assertContains(t, first, "Volume=q8s_default_web_cache:/cache")
-	assertContains(t, secondOut, "Volume=q8s_default_web_cache:/cache")
+	bare := replica("web-0")
+	bareOut := string(mustContainer(t, bare, ""))
+	assertContains(t, bareOut, "Volume=q8s_default_web-0_cache:/cache")
+	if strings.Contains(bareOut, "q8s_default_web_0_cache") {
+		t.Fatalf("bare pod volume name collides with a Deployment replica name:\n%s", bareOut)
+	}
+}
+
+// TestDeploymentReplicaWithoutEmptyDirRendersUnchanged is the golden guard for
+// the per-replica emptyDir change: a Deployment replica without an emptyDir
+// must render exactly as it did before, because an upgrade restarts every unit
+// whose rendered file changes.
+func TestDeploymentReplicaWithoutEmptyDirRendersUnchanged(t *testing.T) {
+	pod := simplePod("default", "web-0", "nginx:1.0")
+	pod.OwnerReferences = []metav1.OwnerReference{{
+		Kind: "Deployment", Name: "web", APIVersion: "apps/v1", Controller: boolPtr(true),
+	}}
+	want := `[Container]
+Image=nginx:1.0
+Pull=missing
+ContainerName=default-web-0
+Network=q8s-default.network
+NetworkAlias=web-0.default
+Label=io.kubernetes.pod.name=web-0
+Label=io.kubernetes.pod.namespace=default
+Label=io.kubernetes.pod.deployment=web
+Label=app.kubernetes.io/managed-by=q8s
+Label=q8s.io/template-hash=ee46d0e4b71f
+
+[Unit]
+Description=Pod web-0
+Wants=q8s-api.service
+After=q8s-api.service
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`
+	if got := mustContainer(t, pod, ""); got != want {
+		t.Fatalf("Deployment replica without emptyDir changed:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
 }
 
 // TestUnsupportedStoredVolumeRendersNamespacedEmptyDirName: an object already
@@ -108,7 +159,7 @@ func TestEmptyDirVolumeNameSetsMatchTheStoredVolumes(t *testing.T) {
 	}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "cache", MountPath: "/cache"}}
 
-	want := []string{"q8s_default_web_cache", "q8s_default_web_scratch", "q8s_default_web_shm"}
+	want := []string{"q8s_default_web_0_cache", "q8s_default_web_0_scratch", "q8s_default_web_0_shm"}
 	names := quadlet.EmptyDirVolumeNames(pod)
 	if len(names) != len(want) {
 		t.Fatalf("EmptyDirVolumeNames = %v, want %v", names, want)
@@ -122,13 +173,13 @@ func TestEmptyDirVolumeNameSetsMatchTheStoredVolumes(t *testing.T) {
 	if len(bases) != 3 || bases[0] != "cache" || bases[1] != "scratch" || bases[2] != "shm" {
 		t.Fatalf("EmptyDirVolumeBases = %v, want [cache scratch shm]", bases)
 	}
-	fromSpec := quadlet.EmptyDirVolumeNamesForSpec("default", "web", &pod.Spec)
+	fromSpec := quadlet.EmptyDirVolumeNamesForDeploymentReplica("default", "web", 0, &pod.Spec)
 	if len(fromSpec) != len(names) {
-		t.Fatalf("EmptyDirVolumeNamesForSpec = %v, want %v", fromSpec, names)
+		t.Fatalf("EmptyDirVolumeNamesForDeploymentReplica = %v, want %v", fromSpec, names)
 	}
 	for i := range names {
 		if fromSpec[i] != names[i] {
-			t.Fatalf("EmptyDirVolumeNamesForSpec = %v, want %v", fromSpec, names)
+			t.Fatalf("EmptyDirVolumeNamesForDeploymentReplica = %v, want %v", fromSpec, names)
 		}
 	}
 }

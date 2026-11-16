@@ -1095,7 +1095,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 					}
 					return names
 				},
-				func(n string) error { return s.deletePodByName(ns, n) })
+				func(n string) error { return s.deletePodByNameForAPI(ns, n) })
 			return
 		}
 		if dry {
@@ -1112,7 +1112,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			}, http.StatusOK)
 			return
 		}
-		if err := s.deletePodByName(ns, name); err != nil {
+		if err := s.deletePodByNameForAPI(ns, name); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
@@ -4407,14 +4407,14 @@ func (s *Server) removeNamespaceEmptyDirVolumes(ns string) {
 	s.removeEmptyDirVolumes(names)
 }
 
-// podOwnedByWorkload reports whether a pod is a replica or run of a
-// Deployment, Job or CronJob. Such a pod shares its template's emptyDir
-// volumes with the other replicas, so deleting the pod alone must keep them;
-// the owner's own delete removes them.
-func podOwnedByWorkload(pod *corev1.Pod) bool {
+// podSharesWorkloadEmptyDir reports whether a pod is a Job or CronJob run
+// whose emptyDir volumes are shared with the other runs of that workload, so
+// deleting one run must keep them. A Deployment replica has its own volume
+// (see EmptyDirVolumeNamesForDeploymentReplica), so its delete removes it.
+func podSharesWorkloadEmptyDir(pod *corev1.Pod) bool {
 	for _, or := range pod.OwnerReferences {
 		switch or.Kind {
-		case "Deployment", "Job", "CronJob":
+		case "Job", "CronJob":
 			return true
 		}
 	}
@@ -4937,6 +4937,19 @@ func isDeploymentOwned(pod *corev1.Pod) bool {
 	return false
 }
 
+// podOwnedByDeployment reports whether pod is an instance of the named
+// Deployment. Unlike quadlet.DeploymentReplica it does not require the pod
+// name to carry a replica index, so delete can also clean up an instance
+// stored in an older or unexpected shape.
+func podOwnedByDeployment(pod *corev1.Pod, deployment string) bool {
+	for _, or := range pod.OwnerReferences {
+		if or.Kind == "Deployment" && or.Name == deployment {
+			return true
+		}
+	}
+	return false
+}
+
 // materializeDeploymentInstance builds the Pod object for deployment
 // instance i from the template. Template container ports are copied as
 // declared: an explicit hostPort/hostIP is kept, but nothing is invented.
@@ -5078,6 +5091,61 @@ func (s *Server) deleteDeploymentPods(dep *appsv1.Deployment) []string {
 	return podNames
 }
 
+// deploymentEmptyDirVolumes returns every emptyDir volume name the
+// Deployment's replicas can own: the names for indexes 0..spec.replicas-1
+// plus the names of every stored replica pod, so an instance left at an index
+// outside that range (a partially applied scale-down, for example) is not
+// missed. Names are sorted and unique.
+func (s *Server) deploymentEmptyDirVolumes(dep *appsv1.Deployment) []string {
+	seen := make(map[string]bool)
+	var names []string
+	add := func(candidates []string) {
+		for _, name := range candidates {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	for i := int32(0); i < deploymentReplicas(dep); i++ {
+		add(quadlet.EmptyDirVolumeNamesForDeploymentReplica(dep.Namespace, dep.Name, i, &dep.Spec.Template.Spec))
+	}
+	for _, pod := range s.config.Store.Pods(dep.Namespace) {
+		if !podOwnedByDeployment(pod, dep.Name) {
+			continue
+		}
+		add(quadlet.EmptyDirVolumeNames(pod))
+	}
+	sort.Strings(names)
+	return names
+}
+
+// replicaEmptyDirVolumes returns the emptyDir volume names of one replica
+// incarnation. It combines the current template with the stored instance
+// pod's own spec: if the template changed in the same write that scaled the
+// Deployment down, the stored pod may still own the previous template's
+// volume names. Names are sorted and unique.
+func (s *Server) replicaEmptyDirVolumes(dep *appsv1.Deployment, index int32) []string {
+	seen := make(map[string]bool)
+	var names []string
+	add := func(candidates []string) {
+		for _, name := range candidates {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	add(quadlet.EmptyDirVolumeNamesForDeploymentReplica(dep.Namespace, dep.Name, index, &dep.Spec.Template.Spec))
+	if pod, err := s.config.Store.GetPod(dep.Namespace, fmt.Sprintf("%s-%d", dep.Name, index)); err == nil {
+		add(quadlet.EmptyDirVolumeNames(pod))
+	}
+	sort.Strings(names)
+	return names
+}
+
 func (s *Server) removeDeploymentQuadlets(dep *appsv1.Deployment) {
 	var paths []string
 	for i := int32(0); i < deploymentReplicas(dep); i++ {
@@ -5103,6 +5171,7 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 	}
 	for i := newR; i < oldR; i++ {
 		instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+		volumes := s.replicaEmptyDirVolumes(dep, i)
 		s.stopPodByName(dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)
 		s.removePodSockets(dep.Namespace, instanceName)
 		s.reloadAfterRemove(podQuadletPaths(s.config.QuadletDir, dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)...)
@@ -5111,6 +5180,9 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 		// ingress backends (selector-driven) would keep routing to a
 		// scaled-down replica that no longer exists.
 		s.config.Store.DeletePod(dep.Namespace, instanceName)
+		// The volume belongs to that replica's incarnation. The container is
+		// stopped and removed above, so Podman can remove it now.
+		s.removeEmptyDirVolumes(volumes)
 	}
 }
 
@@ -5843,11 +5915,49 @@ func (s *Server) deletePodByName(ns, name string) error {
 	if err := s.config.Store.DeletePod(ns, name); err != nil {
 		return deleteStoreError("pod", name, err)
 	}
-	if !podOwnedByWorkload(pod) {
+	if !podSharesWorkloadEmptyDir(pod) {
 		s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNames(pod))
 	}
 	s.regenerateIngressConfigs(ns)
 	return nil
+}
+
+// deletePodByNameForAPI is the Pod DELETE handler's delete. Unlike
+// deletePodByName it replaces a deleted Deployment replica in the same
+// request: q8s has no ReplicaSet controller that would bring it back. Internal
+// deletes (Deployment delete, scale-down, namespace delete, rollout) keep
+// using deletePodByName and never recreate anything.
+func (s *Server) deletePodByNameForAPI(ns, name string) error {
+	pod, err := s.config.Store.GetPod(ns, name)
+	if err != nil {
+		return err
+	}
+	if err := s.deletePodByName(ns, name); err != nil {
+		return err
+	}
+	s.recreateDeploymentReplica(pod)
+	return nil
+}
+
+// recreateDeploymentReplica replaces a Deployment replica pod deleted through
+// the API. It does nothing for a bare pod, a Job or CronJob run, a pod whose
+// Deployment no longer exists, or an index the Deployment no longer wants.
+// The delete already succeeded, so a failed recreate is only logged by the
+// deploy path; the replica stays missing until the next Deployment write.
+func (s *Server) recreateDeploymentReplica(pod *corev1.Pod) {
+	deploymentName, index, ok := quadlet.DeploymentReplica(pod)
+	if !ok {
+		return
+	}
+	dep, err := s.config.Store.GetDeployment(pod.Namespace, deploymentName)
+	if err != nil {
+		return
+	}
+	if index >= deploymentReplicas(dep) {
+		return
+	}
+	s.deployDeploymentInstance(dep, index, false)
+	s.regenerateIngressConfigs(dep.Namespace)
 }
 
 func (s *Server) deleteServiceByName(ns, name string) error {
@@ -5900,13 +6010,17 @@ func (s *Server) deleteDeploymentByName(ns, name string) error {
 	if err != nil {
 		return err
 	}
+	// Compute the per-replica volume names before the pods leave the store:
+	// an instance at an index outside spec.replicas must not leave its
+	// volume behind either.
+	replicaVolumes := s.deploymentEmptyDirVolumes(dep)
 	s.stopDeploymentUnits(dep)
 	s.removeDeploymentQuadlets(dep)
 	podNames := s.deleteDeploymentPods(dep)
 	if err := s.config.Store.DeleteDeploymentWithPods(ns, name, podNames); err != nil {
 		return deleteStoreError("deployment", name, err)
 	}
-	s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNamesForSpec(dep.Namespace, dep.Name, &dep.Spec.Template.Spec))
+	s.removeEmptyDirVolumes(replicaVolumes)
 	s.regenerateIngressConfigs(dep.Namespace)
 	return nil
 }
