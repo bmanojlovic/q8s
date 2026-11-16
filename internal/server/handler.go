@@ -3365,6 +3365,19 @@ func serviceServersTransport(annotations map[string]string) string {
 	return v
 }
 
+// servicePassHostHeader returns the passHostHeader value the backend Service
+// asks for and whether the annotation is set. An invalid value found in the
+// store is ignored, so it can never reach the generated YAML. The second
+// result is false when the annotation is absent, and then the generated file
+// is unchanged from before the field was supported.
+func servicePassHostHeader(annotations map[string]string) (value, ok bool) {
+	v, exists := annotations[annServicePassHostHeader]
+	if !exists || validateServicePassHostHeader(v) != nil {
+		return false, false
+	}
+	return v == "true", true
+}
+
 // yamlFlowList renders items as a quoted YAML flow sequence, the same quoting
 // the url lines use, so no item can break out of its scalar.
 func yamlFlowList(items []string) string {
@@ -3485,8 +3498,12 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 			for _, url := range servers {
 				services.WriteString(fmt.Sprintf("          - url: %q\n", url))
 			}
-			if transport := serviceServersTransport(s.backendServiceAnnotations(ing.Namespace, svcName)); transport != "" {
+			backendAnnotations := s.backendServiceAnnotations(ing.Namespace, svcName)
+			if transport := serviceServersTransport(backendAnnotations); transport != "" {
 				services.WriteString(fmt.Sprintf("        serversTransport: %q\n", transport))
+			}
+			if passHostHeader, ok := servicePassHostHeader(backendAnnotations); ok {
+				services.WriteString(fmt.Sprintf("        passHostHeader: %t\n", passHostHeader))
 			}
 		}
 	}

@@ -283,13 +283,19 @@ backend is never replaced by the `localhost` fallback. IPv6 literals are
 bracketed (`http://[2001:db8::10]:8443`), and an IPv4 literal is accepted as
 `externalName` just as Kubernetes accepts it (`externalName: 192.0.2.10`).
 
-Both annotations are read from the backend Service and apply to selector-based
-Services too:
+All three annotations are read from the backend Service and apply to
+selector-based Services too:
 
 | annotation | value | effect |
 |---|---|---|
 | `traefik.ingress.kubernetes.io/service.serversscheme` | `http`, `https` or `h2c` (default `http`) | scheme of every generated backend URL |
 | `traefik.ingress.kubernetes.io/service.serverstransport` | `<name>@<provider>` | `serversTransport:` in the generated service |
+| `traefik.ingress.kubernetes.io/service.passhostheader` | `true` or `false` | `passHostHeader:` in the generated load balancer |
+
+`passhostheader: false` is what an ExternalName backend in front of a CDN
+usually needs: Traefik then sends the upstream's own Host header instead of
+the Ingress host. When the annotation is absent the key is omitted from the
+generated file, so Traefik's default (send the request Host) applies.
 
 `serversscheme` and `serverstransport` must already exist in Traefik's
 dynamic configuration; q8s only references a transport, it never generates

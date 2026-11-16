@@ -77,7 +77,7 @@ func isBasicUserRequest(a requestAttributes) bool {
 	}
 	switch a.APIGroup {
 	case "authorization.k8s.io":
-		return a.Resource == "selfsubjectaccessreviews"
+		return a.Resource == "selfsubjectaccessreviews" || a.Resource == "selfsubjectrulesreviews"
 	case "authentication.k8s.io":
 		return a.Resource == "selfsubjectreviews"
 	default:
@@ -104,17 +104,34 @@ func isDiscoveryRequest(a requestAttributes) bool {
 	return false
 }
 
-// nonResourceAllowed checks the nonResourceURLs rules of every ClusterRole
-// bound to u.
-func (s *Server) nonResourceAllowed(u userInfo, a requestAttributes) bool {
-	for _, binding := range s.config.Store.AllClusterRoleBindings() {
-		if !bindingMatches(binding.Subjects, u) {
-			continue
-		}
-		for _, rule := range s.effectiveClusterRoleRules(binding.RoleRef.Name, make(map[string]bool)) {
-			if nonResourceRuleMatches(rule, a) {
-				return true
+// boundPolicyRules returns the PolicyRules granted to u by RoleBindings in
+// namespace and by every ClusterRoleBinding, resolved through the same
+// roleRef lookup the authorizer uses. RoleBinding rules only apply in
+// namespace; ClusterRoleBinding rules apply in every namespace.
+func (s *Server) boundPolicyRules(u userInfo, namespace string) (namespaced, cluster []rbacv1.PolicyRule) {
+	if namespace != "" {
+		for _, binding := range s.config.Store.RoleBindings(namespace) {
+			if bindingMatches(binding.Subjects, u) {
+				namespaced = append(namespaced, s.roleBindingRules(binding, namespace)...)
 			}
+		}
+	}
+	for _, binding := range s.config.Store.AllClusterRoleBindings() {
+		if bindingMatches(binding.Subjects, u) {
+			cluster = append(cluster, s.effectiveClusterRoleRules(binding.RoleRef.Name, make(map[string]bool))...)
+		}
+	}
+	return namespaced, cluster
+}
+
+// nonResourceAllowed checks the nonResourceURLs rules of every ClusterRole
+// bound to u. A RoleBinding to a ClusterRole cannot grant non-resource URLs,
+// so only ClusterRoleBindings contribute here.
+func (s *Server) nonResourceAllowed(u userInfo, a requestAttributes) bool {
+	_, cluster := s.boundPolicyRules(u, "")
+	for _, rule := range cluster {
+		if nonResourceRuleMatches(rule, a) {
+			return true
 		}
 	}
 	return false
@@ -124,26 +141,15 @@ func (s *Server) nonResourceAllowed(u userInfo, a requestAttributes) bool {
 // request namespace and by ClusterRoleBindings, and reports whether one of
 // them matches the request.
 func (s *Server) resourceAllowed(u userInfo, a requestAttributes) bool {
-	if a.Namespace != "" {
-		for _, binding := range s.config.Store.RoleBindings(a.Namespace) {
-			if !bindingMatches(binding.Subjects, u) {
-				continue
-			}
-			for _, rule := range s.roleBindingRules(binding, a.Namespace) {
-				if resourceRuleMatches(rule, a) {
-					return true
-				}
-			}
+	namespaced, cluster := s.boundPolicyRules(u, a.Namespace)
+	for _, rule := range namespaced {
+		if resourceRuleMatches(rule, a) {
+			return true
 		}
 	}
-	for _, binding := range s.config.Store.AllClusterRoleBindings() {
-		if !bindingMatches(binding.Subjects, u) {
-			continue
-		}
-		for _, rule := range s.effectiveClusterRoleRules(binding.RoleRef.Name, make(map[string]bool)) {
-			if resourceRuleMatches(rule, a) {
-				return true
-			}
+	for _, rule := range cluster {
+		if resourceRuleMatches(rule, a) {
+			return true
 		}
 	}
 	return false

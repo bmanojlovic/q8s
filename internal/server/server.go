@@ -249,6 +249,7 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/apis/authorization.k8s.io", s.handleAuthorizationRoot)
 	s.mux.HandleFunc("/apis/authorization.k8s.io/v1", s.handleAuthorizationV1)
 	s.mux.HandleFunc("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", s.handleSelfSubjectAccessReview)
+	s.mux.HandleFunc("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", s.handleSelfSubjectRulesReview)
 	s.mux.HandleFunc("/apis/authorization.k8s.io/v1/subjectaccessreviews", s.handleSubjectAccessReview)
 	s.mux.HandleFunc("/apis/authentication.k8s.io", s.handleAuthenticationRoot)
 	s.mux.HandleFunc("/apis/authentication.k8s.io/v1", s.handleAuthenticationV1)

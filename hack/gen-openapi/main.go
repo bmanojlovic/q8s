@@ -80,6 +80,7 @@ var servedGVKs = []gvk{
 	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"},
 	{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"},
 	{Group: "authorization.k8s.io", Version: "v1", Kind: "SelfSubjectAccessReview"},
+	{Group: "authorization.k8s.io", Version: "v1", Kind: "SelfSubjectRulesReview"},
 	{Group: "authorization.k8s.io", Version: "v1", Kind: "SubjectAccessReview"},
 	{Group: "authentication.k8s.io", Version: "v1", Kind: "SelfSubjectReview"},
 	{Group: "storage.k8s.io", Version: "v1", Kind: "StorageClass"},

@@ -184,6 +184,7 @@ const (
 const (
 	annServiceServersScheme    = "traefik.ingress.kubernetes.io/service.serversscheme"
 	annServiceServersTransport = "traefik.ingress.kubernetes.io/service.serverstransport"
+	annServicePassHostHeader   = "traefik.ingress.kubernetes.io/service.passhostheader"
 )
 
 // traefikNameRE matches an entrypoint, certresolver or middleware name;
@@ -241,6 +242,18 @@ func validateServiceServersScheme(value string) error {
 	}
 }
 
+// validateServicePassHostHeader accepts only the exact strings Traefik's
+// boolean file-provider field understands. Anything else is rejected rather
+// than coerced, so the generated YAML is always either true or false.
+func validateServicePassHostHeader(value string) error {
+	switch value {
+	case "true", "false":
+		return nil
+	default:
+		return fmt.Errorf("annotation %s: value %q is invalid: must be true or false", annServicePassHostHeader, value)
+	}
+}
+
 // validateTraefikTransportRef validates a serversTransport reference. Both
 // name and provider are spliced into the generated YAML, so the same rules as
 // middleware references apply: name matches traefikNameRE, provider matches
@@ -271,6 +284,11 @@ func validateServiceAnnotations(annotations map[string]string) error {
 	}
 	if v, ok := annotations[annServiceServersTransport]; ok {
 		if err := validateTraefikTransportRef(annServiceServersTransport, v); err != nil {
+			return err
+		}
+	}
+	if v, ok := annotations[annServicePassHostHeader]; ok {
+		if err := validateServicePassHostHeader(v); err != nil {
 			return err
 		}
 	}
