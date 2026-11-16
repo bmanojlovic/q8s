@@ -373,7 +373,7 @@ func TestCronRunStoredPodWins(t *testing.T) {
 	fake := newFakeJournal()
 	f := newCronFixture()
 	f.install(fake)
-	ts, _ := newCronRunServer(t, fake)
+	ts, st := newCronRunServer(t, fake)
 	createCronJob(t, ts, cronJobWithLabels("default", "cron"))
 
 	runPod := f.jobC + "-run"
@@ -381,11 +381,19 @@ func TestCronRunStoredPodWins(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
+	stored, err := st.GetPod("default", runPod)
+	if err != nil {
+		t.Fatalf("get stored pod: %v", err)
+	}
+	if stored.UID == "" {
+		t.Fatal("stored pod has no UID")
+	}
+
 	resp = get(t, ts.URL+"/api/v1/namespaces/default/pods/"+runPod)
 	assertStatus(t, resp, 200)
 	pod := decodeBody(t, resp)
-	if uid := nested(pod, "metadata")["uid"]; !strings.HasPrefix(fmt.Sprint(uid), "q8s-pod-") {
-		t.Fatalf("GET returned the synthetic pod, uid = %v", uid)
+	if uid := fmt.Sprint(nested(pod, "metadata")["uid"]); uid != string(stored.UID) {
+		t.Fatalf("GET returned the synthetic pod, uid = %v want %v", uid, stored.UID)
 	}
 
 	resp = get(t, ts.URL+"/api/v1/namespaces/default/pods")
@@ -395,8 +403,8 @@ func TestCronRunStoredPodWins(t *testing.T) {
 	for _, it := range items {
 		if nested(it, "metadata")["name"] == runPod {
 			count++
-			if uid := nested(it, "metadata")["uid"]; !strings.HasPrefix(fmt.Sprint(uid), "q8s-pod-") {
-				t.Fatalf("list contains both pods: uid = %v", uid)
+			if uid := fmt.Sprint(nested(it, "metadata")["uid"]); uid != string(stored.UID) {
+				t.Fatalf("list contains both pods: uid = %v want %v", uid, stored.UID)
 			}
 		}
 	}

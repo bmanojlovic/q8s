@@ -9,6 +9,7 @@ import (
 	"q8s/internal/quadlet"
 	"q8s/internal/store"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -190,6 +191,68 @@ func TestPodCRUD(t *testing.T) {
 	}
 	if len(st.AllPods()) != 0 {
 		t.Fatal("expected empty AllPods after delete")
+	}
+}
+
+func TestPodRecreatedWithSameNameGetsNewUID(t *testing.T) {
+	st := newStore(t)
+	first, err := st.CreatePod(makePod("default", "nginx", "nginx:latest"))
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if first.UID == "" {
+		t.Fatal("created pod has no UID")
+	}
+	if err := st.DeletePod("default", "nginx"); err != nil {
+		t.Fatalf("DeletePod: %v", err)
+	}
+	second, err := st.CreatePod(makePod("default", "nginx", "nginx:latest"))
+	if err != nil {
+		t.Fatalf("CreatePod after delete: %v", err)
+	}
+	if second.UID == "" {
+		t.Fatal("recreated pod has no UID")
+	}
+	if second.UID == first.UID {
+		t.Fatalf("recreated pod reused UID %q", first.UID)
+	}
+}
+
+func TestDeploymentRecreatedWithSameNameGetsNewUID(t *testing.T) {
+	st := newStore(t)
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"}}
+	first, err := st.CreateDeployment(dep)
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	if first.UID == "" {
+		t.Fatal("created deployment has no UID")
+	}
+	if err := st.DeleteDeployment("default", "web"); err != nil {
+		t.Fatalf("DeleteDeployment: %v", err)
+	}
+	second, err := st.CreateDeployment(&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("CreateDeployment after delete: %v", err)
+	}
+	if second.UID == "" {
+		t.Fatal("recreated deployment has no UID")
+	}
+	if second.UID == first.UID {
+		t.Fatalf("recreated deployment reused UID %q", first.UID)
+	}
+}
+
+func TestCreateKeepsProvidedUID(t *testing.T) {
+	st := newStore(t)
+	pod := makePod("default", "nginx", "nginx:latest")
+	pod.UID = types.UID("provided-uid")
+	created, err := st.CreatePod(pod)
+	if err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if created.UID != pod.UID {
+		t.Fatalf("CreatePod changed provided UID %q to %q", pod.UID, created.UID)
 	}
 }
 
@@ -1104,7 +1167,8 @@ func TestPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load (new file): %v", err)
 	}
-	if _, err := st1.CreatePod(makePod("default", "nginx", "nginx:latest")); err != nil {
+	created, err := st1.CreatePod(makePod("default", "nginx", "nginx:latest"))
+	if err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
 	if _, err := st1.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "staging"}}); err != nil {
@@ -1125,6 +1189,9 @@ func TestPersistence(t *testing.T) {
 	}
 	if pod.Spec.Containers[0].Image != "nginx:latest" {
 		t.Fatalf("unexpected image: %s", pod.Spec.Containers[0].Image)
+	}
+	if pod.UID != created.UID {
+		t.Fatalf("pod UID after reload = %q, want the persisted %q", pod.UID, created.UID)
 	}
 
 	if _, err := st2.GetNamespace("staging"); err != nil {

@@ -23,6 +23,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/uuid"
 
 	"q8s/internal/quadlet"
 	"q8s/internal/traefik"
@@ -123,7 +124,7 @@ func (s *Store) recordEvent(kind, ns, name string, uid types.UID, eventType, rea
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              fmt.Sprintf("%s.%x", name, s.eventSeq),
 			Namespace:         ns,
-			UID:               types.UID(fmt.Sprintf("q8s-event-%d", s.eventSeq)),
+			UID:               uuid.NewUUID(),
 			ResourceVersion:   fmt.Sprintf("%d", s.eventSeq),
 			CreationTimestamp: now,
 		},
@@ -155,6 +156,14 @@ func (s *Store) recordEvent(kind, ns, name string, uid types.UID, eventType, rea
 // quadlet write as a PVC event).
 func (s *Store) RecordEvent(kind, ns, name string, uid types.UID, eventType, reason, message string) {
 	s.recordEvent(kind, ns, name, uid, eventType, reason, message)
+}
+
+// assignUID gives a newly created object a fresh random UID. As in
+// Kubernetes, a UID in the create request is ignored: every incarnation of an
+// object is distinct, which is what binds ServiceAccount certificates to one
+// workload instance.
+func assignUID(obj metav1.Object) {
+	obj.SetUID(uuid.NewUUID())
 }
 
 func eventAPIVersion(kind string) string {
@@ -933,7 +942,7 @@ func (s *Store) CreateNamespace(ns *corev1.Namespace) (*corev1.Namespace, error)
 			return false, fmt.Errorf("namespace %q already exists", ns.Name)
 		}
 		ns.ResourceVersion = s.incRV()
-		ns.UID = types.UID(fmt.Sprintf("q8s-ns-%s", ns.Name))
+		assignUID(ns)
 		if ns.CreationTimestamp.IsZero() {
 			ns.CreationTimestamp = metav1.Now()
 		}
@@ -1146,7 +1155,7 @@ func (s *Store) CreatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 		}
 		pod.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
 		pod.ResourceVersion = s.incRV()
-		pod.UID = types.UID(fmt.Sprintf("q8s-pod-%s-%s", pod.Namespace, pod.Name))
+		assignUID(pod)
 		if pod.Labels == nil {
 			pod.Labels = make(map[string]string)
 		}
@@ -1863,7 +1872,7 @@ func (s *Store) CreateService(svc *corev1.Service) (*corev1.Service, error) {
 			return false, fmt.Errorf("service %q already exists in namespace %q", svc.Name, svc.Namespace)
 		}
 		svc.ResourceVersion = s.incRV()
-		svc.UID = types.UID(fmt.Sprintf("q8s-svc-%s-%s", svc.Namespace, svc.Name))
+		assignUID(svc)
 		if svc.Labels == nil {
 			svc.Labels = make(map[string]string)
 		}
@@ -2001,7 +2010,7 @@ func (s *Store) CreatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 			return false, fmt.Errorf("PVC %q already exists in namespace %q", pvc.Name, pvc.Namespace)
 		}
 		pvc.ResourceVersion = s.incRV()
-		pvc.UID = types.UID(fmt.Sprintf("q8s-pvc-%s-%s", pvc.Namespace, pvc.Name))
+		assignUID(pvc)
 		if pvc.CreationTimestamp.IsZero() {
 			pvc.CreationTimestamp = metav1.Now()
 		}
@@ -2123,7 +2132,7 @@ func (s *Store) CreateConfigMap(cm *corev1.ConfigMap) (*corev1.ConfigMap, error)
 			return false, fmt.Errorf("configmap %q already exists in namespace %q", cm.Name, cm.Namespace)
 		}
 		cm.ResourceVersion = s.incRV()
-		cm.UID = types.UID(fmt.Sprintf("q8s-cm-%s-%s", cm.Namespace, cm.Name))
+		assignUID(cm)
 		if cm.Labels == nil {
 			cm.Labels = make(map[string]string)
 		}
@@ -2225,7 +2234,7 @@ func (s *Store) CreateSecret(sec *corev1.Secret) (*corev1.Secret, error) {
 			return false, fmt.Errorf("secret %q already exists in namespace %q", sec.Name, sec.Namespace)
 		}
 		sec.ResourceVersion = s.incRV()
-		sec.UID = types.UID(fmt.Sprintf("q8s-secret-%s-%s", sec.Namespace, sec.Name))
+		assignUID(sec)
 		if sec.Labels == nil {
 			sec.Labels = make(map[string]string)
 		}
@@ -2327,7 +2336,7 @@ func (s *Store) CreateServiceAccount(sa *corev1.ServiceAccount) (*corev1.Service
 			return false, fmt.Errorf("serviceaccount %q already exists in namespace %q", sa.Name, sa.Namespace)
 		}
 		sa.ResourceVersion = s.incRV()
-		sa.UID = types.UID(fmt.Sprintf("q8s-serviceaccount-%s-%s", sa.Namespace, sa.Name))
+		assignUID(sa)
 		if sa.Labels == nil {
 			sa.Labels = make(map[string]string)
 		}
@@ -2429,7 +2438,7 @@ func (s *Store) CreateJob(job *batchv1.Job) (*batchv1.Job, error) {
 			return false, fmt.Errorf("job %q already exists in namespace %q", job.Name, job.Namespace)
 		}
 		job.ResourceVersion = s.incRV()
-		job.UID = types.UID(fmt.Sprintf("q8s-job-%s-%s", job.Namespace, job.Name))
+		assignUID(job)
 		if job.Labels == nil {
 			job.Labels = make(map[string]string)
 		}
@@ -2574,7 +2583,7 @@ func (s *Store) CreateCronJob(cj *batchv1.CronJob) (*batchv1.CronJob, error) {
 			return false, fmt.Errorf("cronjob %q already exists in namespace %q", cj.Name, cj.Namespace)
 		}
 		cj.ResourceVersion = s.incRV()
-		cj.UID = types.UID(fmt.Sprintf("q8s-cj-%s-%s", cj.Namespace, cj.Name))
+		assignUID(cj)
 		if cj.Labels == nil {
 			cj.Labels = make(map[string]string)
 		}
@@ -2673,7 +2682,7 @@ func (s *Store) CreateIngress(ing *networkingv1.Ingress) (*networkingv1.Ingress,
 			return false, fmt.Errorf("ingress %q already exists in namespace %q", ing.Name, ing.Namespace)
 		}
 		ing.ResourceVersion = s.incRV()
-		ing.UID = types.UID(fmt.Sprintf("q8s-ing-%s-%s", ing.Namespace, ing.Name))
+		assignUID(ing)
 		if ing.Labels == nil {
 			ing.Labels = make(map[string]string)
 		}
@@ -2772,7 +2781,7 @@ func (s *Store) CreateMiddleware(mw *traefik.Middleware) (*traefik.Middleware, e
 			return false, fmt.Errorf("middleware %q already exists in namespace %q", mw.Name, mw.Namespace)
 		}
 		mw.ResourceVersion = s.incRV()
-		mw.UID = types.UID(fmt.Sprintf("q8s-mw-%s-%s", mw.Namespace, mw.Name))
+		assignUID(mw)
 		if mw.Labels == nil {
 			mw.Labels = make(map[string]string)
 		}
@@ -2873,7 +2882,7 @@ func (s *Store) CreateIngressRouteTCP(irt *traefik.IngressRouteTCP) (*traefik.In
 			return false, fmt.Errorf("ingressroutetcp %q already exists in namespace %q", irt.Name, irt.Namespace)
 		}
 		irt.ResourceVersion = s.incRV()
-		irt.UID = types.UID(fmt.Sprintf("q8s-irtcp-%s-%s", irt.Namespace, irt.Name))
+		assignUID(irt)
 		if irt.Labels == nil {
 			irt.Labels = make(map[string]string)
 		}
@@ -2974,7 +2983,7 @@ func (s *Store) CreateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, er
 			return false, fmt.Errorf("deployment %q already exists in namespace %q", dep.Name, dep.Namespace)
 		}
 		dep.ResourceVersion = s.incRV()
-		dep.UID = types.UID(fmt.Sprintf("q8s-dep-%s-%s", dep.Namespace, dep.Name))
+		assignUID(dep)
 		if dep.Labels == nil {
 			dep.Labels = make(map[string]string)
 		}
@@ -3139,7 +3148,7 @@ func (s *Store) CreateRole(role *rbacv1.Role) (*rbacv1.Role, error) {
 			return false, fmt.Errorf("role %q already exists in namespace %q", role.Name, role.Namespace)
 		}
 		role.ResourceVersion = s.incRV()
-		role.UID = types.UID(fmt.Sprintf("q8s-role-%s-%s", role.Namespace, role.Name))
+		assignUID(role)
 		if role.Labels == nil {
 			role.Labels = make(map[string]string)
 		}
@@ -3240,7 +3249,7 @@ func (s *Store) CreateRoleBinding(rb *rbacv1.RoleBinding) (*rbacv1.RoleBinding, 
 			return false, fmt.Errorf("rolebinding %q already exists in namespace %q", rb.Name, rb.Namespace)
 		}
 		rb.ResourceVersion = s.incRV()
-		rb.UID = types.UID(fmt.Sprintf("q8s-rb-%s-%s", rb.Namespace, rb.Name))
+		assignUID(rb)
 		if rb.Labels == nil {
 			rb.Labels = make(map[string]string)
 		}
@@ -3327,7 +3336,7 @@ func (s *Store) CreateClusterRole(cr *rbacv1.ClusterRole) (*rbacv1.ClusterRole, 
 			return false, fmt.Errorf("clusterrole %q already exists", cr.Name)
 		}
 		cr.ResourceVersion = s.incRV()
-		cr.UID = types.UID(fmt.Sprintf("q8s-cr-%s", cr.Name))
+		assignUID(cr)
 		if cr.Labels == nil {
 			cr.Labels = make(map[string]string)
 		}
@@ -3412,7 +3421,7 @@ func (s *Store) CreateClusterRoleBinding(crb *rbacv1.ClusterRoleBinding) (*rbacv
 			return false, fmt.Errorf("clusterrolebinding %q already exists", crb.Name)
 		}
 		crb.ResourceVersion = s.incRV()
-		crb.UID = types.UID(fmt.Sprintf("q8s-crb-%s", crb.Name))
+		assignUID(crb)
 		if crb.Labels == nil {
 			crb.Labels = make(map[string]string)
 		}

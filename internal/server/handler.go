@@ -4683,6 +4683,14 @@ func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) 
 		// below) from mutating the shared deployment template.
 		Spec: *dep.Spec.Template.Spec.DeepCopy(),
 	}
+	// A stored instance keeps the UID of its first incarnation across template
+	// syncs. syncInstancePod creates it only when it is missing, so a newly
+	// materialized instance still gets a fresh UID from the store.
+	if s.config.Store != nil {
+		if existing, err := s.config.Store.GetPod(dep.Namespace, instanceName); err == nil {
+			pod.UID = existing.UID
+		}
+	}
 	pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
 	// A NodePort Service targeting this pod publishes its port on 0.0.0.0.
 	// A host port can only be bound by one process, so only instance 0
@@ -4778,6 +4786,9 @@ func unitFileChanged(changed map[string]bool) bool {
 // if missing, otherwise its spec and metadata replaced (status kept).
 func (s *Server) syncInstancePod(pod *corev1.Pod) {
 	if !s.config.Store.SyncPodTemplate(pod) {
+		// The instance is missing, so any UID copied from a previous lookup
+		// belongs to a deleted incarnation. Let the store assign a fresh one.
+		pod.UID = ""
 		s.config.Store.CreatePod(pod)
 	}
 }

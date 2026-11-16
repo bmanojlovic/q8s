@@ -7,14 +7,11 @@ import (
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 
 	"q8s/internal/store"
 )
@@ -242,7 +239,9 @@ func TestServiceAccountCertificateRevalidatedPerRequest(t *testing.T) {
 }
 
 func TestServiceAccountCertificateRevokedWhenPodRecreatedWithNewUID(t *testing.T) {
-	st := loadWorkloadStoreWithPodUID(t, "q8s-pod-demo-web-old")
+	st := store.New()
+	addWorkloadServiceAccount(t, st, "demo", "worker")
+	first := addWorkloadPodObject(t, st, "demo", "web", "worker")
 	srv, ca := workloadTestServer(t, st, nil)
 	ts := startWorkloadHTTPServer(t, srv, ca)
 
@@ -251,8 +250,9 @@ func TestServiceAccountCertificateRevokedWhenPodRecreatedWithNewUID(t *testing.T
 		t.Fatalf("credentialForLabels: %v", err)
 	}
 	cert := credentialCertificate(t, data)
-	if len(cert.URIs) != 1 || cert.URIs[0].String() != "urn:q8s:workload:pod:demo/web/q8s-pod-demo-web-old" {
-		t.Fatalf("certificate URIs = %v", cert.URIs)
+	wantURI := "urn:q8s:workload:pod:demo/web/" + string(first.UID)
+	if len(cert.URIs) != 1 || cert.URIs[0].String() != wantURI {
+		t.Fatalf("certificate URIs = %v, want %q", cert.URIs, wantURI)
 	}
 	client := credentialHTTPClient(t, data)
 	if got := versionStatus(t, client, ts.URL); got != http.StatusOK {
@@ -263,50 +263,15 @@ func TestServiceAccountCertificateRevokedWhenPodRecreatedWithNewUID(t *testing.T
 		t.Fatalf("delete pod: %v", err)
 	}
 	recreated := addWorkloadPodObject(t, st, "demo", "web", "worker")
-	if string(recreated.UID) == "q8s-pod-demo-web-old" {
+	if recreated.UID == "" {
+		t.Fatal("recreated pod has no UID")
+	}
+	if recreated.UID == first.UID {
 		t.Fatalf("recreated pod reused the old UID %q", recreated.UID)
 	}
 	if got := versionStatus(t, client, ts.URL); got != http.StatusUnauthorized {
 		t.Fatalf("GET /version with the old certificate after recreating the pod = %d, want %d", got, http.StatusUnauthorized)
 	}
-}
-
-func loadWorkloadStoreWithPodUID(t *testing.T, uid string) *store.Store {
-	t.Helper()
-	pod := &corev1.Pod{
-		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "web",
-			Namespace:         "demo",
-			UID:               types.UID(uid),
-			CreationTimestamp: metav1.Now(),
-		},
-		Spec: corev1.PodSpec{
-			ServiceAccountName: "worker",
-			Containers:         []corev1.Container{{Name: "app", Image: "example.com/app:latest"}},
-		},
-	}
-	sa := &corev1.ServiceAccount{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
-		ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "demo"},
-	}
-	data, err := json.Marshal(map[string]interface{}{
-		"resourceVersion": 1,
-		"pods":            []*corev1.Pod{pod},
-		"serviceAccounts": []*corev1.ServiceAccount{sa},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(t.TempDir(), "store.json")
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	st, err := store.Load(path)
-	if err != nil {
-		t.Fatalf("load store: %v", err)
-	}
-	return st
 }
 
 func TestJobAndCronJobServiceAccountCredentials(t *testing.T) {
