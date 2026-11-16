@@ -1178,6 +1178,73 @@ func (s *Store) purgeNamespaceLocked(name string) {
 	}
 }
 
+// checkGeneratedNameCollisionLocked refuses an object when flattening
+// namespace and name with "-" would produce the same generated Podman/systemd
+// name as an object of any q8s kind in a different namespace. These joins are
+// used for container names, unit files and named volumes, so namespace "team"
+// pod "prod-db" and namespace "team-prod" pod "db" would otherwise collide.
+// The caller must hold s.mu (it runs inside mutate with the create), which
+// keeps two concurrent creates from both passing the check.
+func (s *Store) checkGeneratedNameCollisionLocked(kind, ns, name string) error {
+	flat := ns + "-" + name
+	check := func(otherKind, otherNS, otherName string) error {
+		if otherNS == "" || otherNS == ns {
+			return nil
+		}
+		if otherNS+"-"+otherName != flat {
+			return nil
+		}
+		return fmt.Errorf(`%s %q in namespace %q would share the generated name %q with %s %q in namespace %q`,
+			kind, name, ns, flat, otherKind, otherName, otherNS)
+	}
+	for key := range s.pods {
+		if err := check("Pod", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	for key := range s.deployments {
+		if err := check("Deployment", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	for key := range s.jobs {
+		if err := check("Job", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	for key := range s.cronjobs {
+		if err := check("CronJob", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	for key := range s.pvcs {
+		if err := check("PersistentVolumeClaim", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	for key := range s.services {
+		if err := check("Service", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	for key := range s.ingresses {
+		if err := check("Ingress", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	for key := range s.middlewares {
+		if err := check("Middleware", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	for key := range s.ingressRouteTCPs {
+		if err := check("IngressRouteTCP", key.Namespace, key.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- Pods ---
 
 // AllPods returns all pods across all namespaces.
@@ -1211,6 +1278,9 @@ func (s *Store) CreatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 		key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
 		if _, ok := s.pods[key]; ok {
 			return false, fmt.Errorf("pod %q already exists in namespace %q", pod.Name, pod.Namespace)
+		}
+		if err := s.checkGeneratedNameCollisionLocked("Pod", pod.Namespace, pod.Name); err != nil {
+			return false, err
 		}
 		pod.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
 		pod.ResourceVersion = s.incRV()
@@ -1930,6 +2000,9 @@ func (s *Store) CreateService(svc *corev1.Service) (*corev1.Service, error) {
 		if _, ok := s.services[key]; ok {
 			return false, fmt.Errorf("service %q already exists in namespace %q", svc.Name, svc.Namespace)
 		}
+		if err := s.checkGeneratedNameCollisionLocked("Service", svc.Namespace, svc.Name); err != nil {
+			return false, err
+		}
 		svc.ResourceVersion = s.incRV()
 		assignUID(svc)
 		if svc.Labels == nil {
@@ -2067,6 +2140,9 @@ func (s *Store) CreatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 		key := types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}
 		if _, ok := s.pvcs[key]; ok {
 			return false, fmt.Errorf("PVC %q already exists in namespace %q", pvc.Name, pvc.Namespace)
+		}
+		if err := s.checkGeneratedNameCollisionLocked("PersistentVolumeClaim", pvc.Namespace, pvc.Name); err != nil {
+			return false, err
 		}
 		pvc.ResourceVersion = s.incRV()
 		assignUID(pvc)
@@ -2496,6 +2572,9 @@ func (s *Store) CreateJob(job *batchv1.Job) (*batchv1.Job, error) {
 		if _, ok := s.jobs[key]; ok {
 			return false, fmt.Errorf("job %q already exists in namespace %q", job.Name, job.Namespace)
 		}
+		if err := s.checkGeneratedNameCollisionLocked("Job", job.Namespace, job.Name); err != nil {
+			return false, err
+		}
 		job.ResourceVersion = s.incRV()
 		assignUID(job)
 		if job.Labels == nil {
@@ -2641,6 +2720,9 @@ func (s *Store) CreateCronJob(cj *batchv1.CronJob) (*batchv1.CronJob, error) {
 		if _, ok := s.cronjobs[key]; ok {
 			return false, fmt.Errorf("cronjob %q already exists in namespace %q", cj.Name, cj.Namespace)
 		}
+		if err := s.checkGeneratedNameCollisionLocked("CronJob", cj.Namespace, cj.Name); err != nil {
+			return false, err
+		}
 		cj.ResourceVersion = s.incRV()
 		assignUID(cj)
 		if cj.Labels == nil {
@@ -2740,6 +2822,9 @@ func (s *Store) CreateIngress(ing *networkingv1.Ingress) (*networkingv1.Ingress,
 		if _, ok := s.ingresses[key]; ok {
 			return false, fmt.Errorf("ingress %q already exists in namespace %q", ing.Name, ing.Namespace)
 		}
+		if err := s.checkGeneratedNameCollisionLocked("Ingress", ing.Namespace, ing.Name); err != nil {
+			return false, err
+		}
 		ing.ResourceVersion = s.incRV()
 		assignUID(ing)
 		if ing.Labels == nil {
@@ -2838,6 +2923,9 @@ func (s *Store) CreateMiddleware(mw *traefik.Middleware) (*traefik.Middleware, e
 		key := types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}
 		if _, ok := s.middlewares[key]; ok {
 			return false, fmt.Errorf("middleware %q already exists in namespace %q", mw.Name, mw.Namespace)
+		}
+		if err := s.checkGeneratedNameCollisionLocked("Middleware", mw.Namespace, mw.Name); err != nil {
+			return false, err
 		}
 		mw.ResourceVersion = s.incRV()
 		assignUID(mw)
@@ -2940,6 +3028,9 @@ func (s *Store) CreateIngressRouteTCP(irt *traefik.IngressRouteTCP) (*traefik.In
 		if _, ok := s.ingressRouteTCPs[key]; ok {
 			return false, fmt.Errorf("ingressroutetcp %q already exists in namespace %q", irt.Name, irt.Namespace)
 		}
+		if err := s.checkGeneratedNameCollisionLocked("IngressRouteTCP", irt.Namespace, irt.Name); err != nil {
+			return false, err
+		}
 		irt.ResourceVersion = s.incRV()
 		assignUID(irt)
 		if irt.Labels == nil {
@@ -3040,6 +3131,9 @@ func (s *Store) CreateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, er
 		key := types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}
 		if _, ok := s.deployments[key]; ok {
 			return false, fmt.Errorf("deployment %q already exists in namespace %q", dep.Name, dep.Namespace)
+		}
+		if err := s.checkGeneratedNameCollisionLocked("Deployment", dep.Namespace, dep.Name); err != nil {
+			return false, err
 		}
 		dep.ResourceVersion = s.incRV()
 		assignUID(dep)

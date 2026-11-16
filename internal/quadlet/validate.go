@@ -154,6 +154,14 @@ func validateLabelPair(key, value string) error {
 	if err := noControlChars("label value", value); err != nil {
 		return err
 	}
+	// Label= is a whitespace-separated key=value list, so a whitespace in a
+	// value starts another label item. Quotes and a backslash can escape or
+	// terminate the value in the list syntax. The API applies the full
+	// Kubernetes label rule, but this is the render-time guard for objects
+	// that are already in a store.
+	if strings.ContainsAny(value, " \t\n\r\v\f\"'\\") {
+		return fmt.Errorf("label value %q contains a character that cannot be rendered safely", value)
+	}
 	return nil
 }
 

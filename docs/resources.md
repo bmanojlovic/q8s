@@ -168,6 +168,29 @@ spec:
       storage: 1Gi
 ```
 
+### Pod volumes
+
+A Pod or pod template accepts these volume sources: `persistentVolumeClaim`,
+`configMap`, `secret` and `emptyDir`. Any other source such as `hostPath`,
+`nfs`, `projected`, `downwardAPI` or `csi` is rejected with 422. Use a
+`hostpath` PersistentVolumeClaim for a host directory; a pod never mounts one
+directly.
+
+An `emptyDir` is a Podman named volume called
+`q8s_{namespace}_{owner}_{volume}`. `owner` is the pod name for a bare Pod and
+the Deployment, Job or CronJob name for a pod template, so all replicas and
+runs of one workload share the volume and it survives restarts. Kubernetes
+instead gives every pod its own `emptyDir`; the per-workload sharing is a
+deliberate q8s difference. The underscore separator cannot appear in a
+Kubernetes name, so an emptyDir can never collide with another namespace's
+emptyDir or with a PVC volume, which is named `{namespace}-{claim}`. An
+`emptyDir` with `medium: Memory` mounted at `/dev/shm` is rendered as
+`ShmSize=` instead, as described above under Pods.
+
+Only `metadata.labels` values that satisfy the Kubernetes label rule are
+stored, because pod labels are copied onto the generated container as a
+whitespace-separated `Label=` list.
+
 ## apiextensions.k8s.io/v1
 
 | Resource | kubectl verbs | Notes |

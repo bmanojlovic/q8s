@@ -373,17 +373,31 @@ func serveClientFrames(r io.Reader, setDeadline func(), stdin io.WriteCloser, ws
 	}
 }
 
-// podStreamTarget rejects a stream request for a pod that only exists as a
-// CronJob run, whose container is already gone. A missing stored pod falls
-// through and lets the podman command report the failure on the stream.
+// podStreamTarget requires the pod to exist in the URL namespace, or to be a
+// Job/CronJob run that the existing derivation resolves there, and requires
+// ?container= to name one of its containers. A pod name from another
+// namespace would otherwise flatten to the same Podman container name and
+// stream this namespace's request into it.
 func (s *Server) podStreamTarget(w http.ResponseWriter, r *http.Request, ns, name, stream string) bool {
-	if _, err := s.config.Store.GetPod(ns, name); err != nil {
-		if _, ok := s.cronRunFindPod(r.Context(), ns, name); ok {
-			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "CronJob runs cannot be %s'd (the container is gone)", stream)
+	requested := r.URL.Query().Get("container")
+	pod, err := s.config.Store.GetPod(ns, name)
+	if err == nil {
+		if verr := validateRequestedContainer(pod, requested); verr != nil {
+			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", verr.Error())
 			return false
 		}
+		return true
 	}
-	return true
+	if _, ok := s.jobPodFindPod(r.Context(), ns, name); ok {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "Job pods cannot be %s'd", stream)
+		return false
+	}
+	if _, ok := s.cronRunFindPod(r.Context(), ns, name); ok {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "CronJob runs cannot be %s'd (the container is gone)", stream)
+		return false
+	}
+	s.respondStatus(w, http.StatusNotFound, "NotFound", "pods %q not found", name)
+	return false
 }
 
 // execPodmanArgs builds the podman argv for an exec request. marker is the

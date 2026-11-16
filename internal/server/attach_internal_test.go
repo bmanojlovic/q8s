@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/store"
 )
 
@@ -63,7 +65,17 @@ func TestNegotiateWSProtocol(t *testing.T) {
 }
 
 func attachTestServer() *Server {
-	return &Server{config: Config{Store: store.New()}}
+	st := store.New()
+	if _, err := st.CreatePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:  "app",
+			Image: "busybox",
+		}}},
+	}); err != nil {
+		panic(err)
+	}
+	return &Server{config: Config{Store: st}}
 }
 
 // TestAttachSubresourceRoutes pins that pods/POD/attach reaches the attach

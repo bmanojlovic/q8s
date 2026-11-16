@@ -950,7 +950,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodAnnotations("pod", &pod.Spec, pod.Annotations, 0); err != nil {
+		if err := validatePodAnnotations("pod", &pod.Spec, pod.Labels, pod.Annotations, 0); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1053,7 +1053,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodAnnotations("pod", &patched.Spec, patched.Annotations, 0); err != nil {
+		if err := validatePodAnnotations("pod", &patched.Spec, patched.Labels, patched.Annotations, 0); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1144,6 +1144,28 @@ func (s *Server) podContainerName(ns, podName, requested string) string {
 	return fmt.Sprintf("%s-%s-%s", ns, podName, requested)
 }
 
+// validateRequestedContainer answers a logs/exec/attach ?container= query
+// the way Kubernetes does: it must name one of the pod's containers (or
+// initContainers) when it is present. Without this, an arbitrary string
+// reached the Podman container name and could address a container in another
+// namespace whose flattened name happened to match.
+func validateRequestedContainer(pod *corev1.Pod, requested string) error {
+	if requested == "" {
+		return nil
+	}
+	for _, c := range pod.Spec.Containers {
+		if c.Name == requested {
+			return nil
+		}
+	}
+	for _, c := range pod.Spec.InitContainers {
+		if c.Name == requested {
+			return nil
+		}
+	}
+	return fmt.Errorf("container %s is not valid for pod %s", requested, pod.Name)
+}
+
 // podLogUnit returns the systemd unit and Podman container name whose
 // journal output belongs to one container of a stored pod. It mirrors
 // podUnitNames and podContainerName: a single-container pod keeps the
@@ -1171,18 +1193,32 @@ func podmanContainerExists(ctx context.Context, name string) bool {
 }
 
 func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request, ns, name string) {
+	q := r.URL.Query()
 	pod, err := s.config.Store.GetPod(ns, name)
 	if err != nil {
-		if pod, ok := s.jobPodFindPod(r.Context(), ns, name); ok {
-			s.handleJobPodLogs(w, r, pod)
+		if jobPod, ok := s.jobPodFindPod(r.Context(), ns, name); ok {
+			if verr := validateRequestedContainer(jobPod, q.Get("container")); verr != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", verr.Error())
+				return
+			}
+			s.handleJobPodLogs(w, r, jobPod)
 			return
 		}
-		if pod, ok := s.cronRunFindPod(r.Context(), ns, name); ok {
-			s.handleCronRunPodLogs(w, r, pod)
+		if cronPod, ok := s.cronRunFindPod(r.Context(), ns, name); ok {
+			if verr := validateRequestedContainer(cronPod, q.Get("container")); verr != nil {
+				s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", verr.Error())
+				return
+			}
+			s.handleCronRunPodLogs(w, r, cronPod)
 			return
 		}
+		s.respondStatus(w, http.StatusNotFound, "NotFound", "pods %q not found", name)
+		return
 	}
-	q := r.URL.Query()
+	if verr := validateRequestedContainer(pod, q.Get("container")); verr != nil {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", verr.Error())
+		return
+	}
 	containerName := s.podContainerName(ns, name, q.Get("container"))
 
 	// q8s runs containers with --rm, so a finished pod's container is gone
@@ -1499,6 +1535,10 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateLabels("metadata.labels", pvc.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		if s.rejectHostAccess(w, r, "PersistentVolumeClaim", pvc.Name, pvcHostAccessReasons(&pvc)) {
 			return
 		}
@@ -1555,6 +1595,10 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateLabels("metadata.labels", patched.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if s.rejectHostAccess(w, r, "PersistentVolumeClaim", patched.Name, pvcHostAccessReasons(&patched)) {
@@ -1629,6 +1673,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateLabels("metadata.labels", cm.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		if err := validateDataKeys(cm.Data, cm.BinaryData); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
@@ -1660,6 +1708,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		if err := validateName("name", cm.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateLabels("metadata.labels", cm.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if err := validateDataKeys(cm.Data, cm.BinaryData); err != nil {
@@ -1723,6 +1775,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateLabels("metadata.labels", patched.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if err := validateDataKeys(patched.Data, patched.BinaryData); err != nil {
@@ -1803,6 +1859,10 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateLabels("metadata.labels", secret.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		if err := validateDataKeys(secret.StringData, secret.Data); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
@@ -1868,6 +1928,10 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		}
 		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateLabels("metadata.labels", patched.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if err := validateDataKeys(patched.StringData, patched.Data); err != nil {
@@ -1953,6 +2017,10 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateLabels("metadata.labels", sa.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateServiceAccount(&sa)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -1975,6 +2043,10 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 		}
 		if err := validateName("name", sa.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateLabels("metadata.labels", sa.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		updated, err := s.config.Store.UpdateServiceAccount(&sa)
@@ -2029,6 +2101,10 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 		}
 		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateLabels("metadata.labels", patched.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		updated, err := s.config.Store.UpdateServiceAccount(&patched)
@@ -2226,7 +2302,11 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
+		if err := validateDeploymentLabels(&dep); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Labels, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2268,7 +2348,11 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
+		if err := validateDeploymentLabels(&dep); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Labels, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2354,7 +2438,11 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
-		if err := validatePodAnnotations("deployment spec.template", &patched.Spec.Template.Spec, patched.Spec.Template.Annotations, deploymentReplicas(&patched)); err != nil {
+		if err := validateDeploymentLabels(&patched); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validatePodAnnotations("deployment spec.template", &patched.Spec.Template.Spec, patched.Spec.Template.Labels, patched.Spec.Template.Annotations, deploymentReplicas(&patched)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2440,7 +2528,7 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 				dep.Spec.Replicas = patch.Spec.Replicas
 			}
 		}
-		if err := validatePodAnnotations("deployment", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(dep)); err != nil {
+		if err := validatePodAnnotations("deployment", &dep.Spec.Template.Spec, dep.Spec.Template.Labels, dep.Spec.Template.Annotations, deploymentReplicas(dep)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2568,6 +2656,10 @@ func (s *Server) handleNamespacePatch(w http.ResponseWriter, r *http.Request, na
 		s.respondStatus(w, http.StatusBadRequest, "Invalid", "namespace %q: name is immutable", name)
 		return
 	}
+	if err := validateLabels("metadata.labels", patched.Labels); err != nil {
+		s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+		return
+	}
 	updated, err := s.config.Store.UpdateNamespace(&patched)
 	if err != nil {
 		s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
@@ -2585,6 +2677,10 @@ func (s *Server) handleNamespaceCreate(w http.ResponseWriter, r *http.Request) {
 	ns.Kind = "Namespace"
 	if err := validateName("name", ns.Name); err != nil {
 		s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+		return
+	}
+	if err := validateLabels("metadata.labels", ns.Labels); err != nil {
+		s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 		return
 	}
 	created, err := s.config.Store.CreateNamespace(&ns)
@@ -2802,6 +2898,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateJobLabels(&job); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		if err := validateSingleContainer("job spec.template.spec", &job.Spec.Template.Spec, false); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
@@ -2842,6 +2942,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateName("name", job.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateJobLabels(&job); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if err := validateSingleContainer("job spec.template.spec", &job.Spec.Template.Spec, false); err != nil {
@@ -2933,6 +3037,10 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateJobLabels(&patched); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if err := validateSingleContainer("job spec.template.spec", &patched.Spec.Template.Spec, false); err != nil {
@@ -3030,6 +3138,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := validateCronJobLabels(&cj); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
 		if err := validateSingleContainer("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec, false); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
@@ -3073,6 +3185,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		if err := validateName("name", cj.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateCronJobLabels(&cj); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if err := validateSingleContainer("cronjob spec.jobTemplate.spec.template.spec", &cj.Spec.JobTemplate.Spec.Template.Spec, false); err != nil {
@@ -3157,6 +3273,10 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateCronJobLabels(&patched); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
 		if err := validateSingleContainer("cronjob spec.jobTemplate.spec.template.spec", &patched.Spec.JobTemplate.Spec.Template.Spec, false); err != nil {

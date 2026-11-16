@@ -22,6 +22,9 @@ const tcpCatchAllMatch = "HostSNI(`*`)"
 // validateMiddleware checks the supported Middleware subset. The API calls it
 // on create, update, patch and apply, so it is the single choke point.
 func validateMiddleware(mw *traefik.Middleware) error {
+	if err := validateLabels("metadata.labels", mw.Labels); err != nil {
+		return err
+	}
 	set := 0
 	if mw.Spec.IPAllowList != nil {
 		set++
@@ -247,6 +250,9 @@ func containsControlChar(value string) bool {
 
 // validateIngressRouteTCP checks the supported IngressRouteTCP subset.
 func validateIngressRouteTCP(irt *traefik.IngressRouteTCP) error {
+	if err := validateLabels("metadata.labels", irt.Labels); err != nil {
+		return err
+	}
 	if len(irt.Spec.EntryPoints) == 0 {
 		return fmt.Errorf("spec.entryPoints is required and must contain at least one entrypoint")
 	}

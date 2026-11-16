@@ -110,6 +110,18 @@ refused with 400 before authorization. A write whose object names a different
 namespace or name than the URL is refused with 400, as in Kubernetes, so a
 binding in one namespace never lets a user create objects in another.
 
+Generated Podman and systemd names are `<namespace>-<name>`. To stop that join
+from crossing namespaces, creating an object whose kind generates such a name
+is refused with 409 Conflict when the flattened name already belongs to an
+object of another namespace. The guarded kinds are Pod, Deployment, Job,
+CronJob, PersistentVolumeClaim, Service, Ingress, Middleware and
+IngressRouteTCP; pods created for a Deployment go through the same check. The
+`pods/log`, `pods/exec` and `pods/attach` subresources address only a pod
+stored in the URL namespace, or a Job/CronJob run resolved there, and
+`?container=` must name one of that pod's containers. A user permitted in one
+namespace therefore cannot reach a pod in another namespace whose flattened
+name happens to match.
+
 A denied request answers 403 with the Kubernetes message, for example:
 
 ```text

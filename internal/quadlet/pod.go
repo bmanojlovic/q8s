@@ -510,7 +510,12 @@ func writeContainerVolumes(b *strings.Builder, r containerRender) error {
 				if err := validateRefName("volume.name", vol.Name); err != nil {
 					return err
 				}
-				b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, volumeOptions(readOnly, "", userNS)))
+				// emptyDir and any other stored volume source q8s does
+				// not render as a bind mount get a namespace-scoped,
+				// workload-owned volume name. A bare vol.Name would be a
+				// host-global volume shared with every other namespace.
+				volName := EmptyDirVolumeName(pod.Namespace, emptyDirVolumeOwner(pod), vol.Name)
+				b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", volName, vm.MountPath, volumeOptions(readOnly, "", userNS)))
 			}
 		}
 	}
@@ -546,16 +551,12 @@ func podShmSize(pod *corev1.Pod) (size int64, found bool) {
 // a pod member adds io.kubernetes.container.name so status sync and
 // `podman ps --filter label=...` can identify it.
 func writePodLabels(b *strings.Builder, pod *corev1.Pod, containerName string) error {
-	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.name=%s\n", pod.Name))
-	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.namespace=%s\n", pod.Namespace))
-	for _, or := range pod.OwnerReferences {
-		if or.Kind == "Deployment" {
-			b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.deployment=%s\n", or.Name))
-		}
-	}
 	// Propagate the Pod's own labels onto the container so Service selector
 	// matching can be done with a plain `podman ps --filter label=k=v` built
 	// straight from Service.Spec.Selector, with no separate bookkeeping.
+	// User labels go first: podman keeps the last value of a repeated label
+	// key, so the identity labels below must be written after them and can
+	// never be overridden by a stored object that bypassed API validation.
 	// Sorted so an unchanged pod renders byte-identically every time (the
 	// template hash depends on it).
 	keys := make([]string, 0, len(pod.Labels))
@@ -568,6 +569,13 @@ func writePodLabels(b *strings.Builder, pod *corev1.Pod, containerName string) e
 			return err
 		}
 		b.WriteString(fmt.Sprintf("Label=%s=%s\n", k, pod.Labels[k]))
+	}
+	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.name=%s\n", pod.Name))
+	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.namespace=%s\n", pod.Namespace))
+	for _, or := range pod.OwnerReferences {
+		if or.Kind == "Deployment" {
+			b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.deployment=%s\n", or.Name))
+		}
 	}
 	if containerName != "" {
 		b.WriteString(fmt.Sprintf("Label=io.kubernetes.container.name=%s\n", containerName))

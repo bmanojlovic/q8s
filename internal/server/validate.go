@@ -4,13 +4,18 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"q8s/internal/quadlet"
 )
 
@@ -35,6 +40,130 @@ func validateName(kind, value string) error {
 	}
 	if !nameRE.MatchString(value) {
 		return fmt.Errorf("%s %q is invalid: a lowercase RFC 1123 label must consist of lowercase alphanumeric characters or '-', and must start and end with an alphanumeric character", kind, value)
+	}
+	return nil
+}
+
+// validateLabels applies the Kubernetes label rules to a map of labels. q8s
+// copies pod labels onto the generated container, where a value is written
+// into a whitespace-separated Label= list; an unvalidated value could add
+// more label items and claim another pod's identity. The API rejects such a
+// value with 422 before the object is stored.
+func validateLabels(field string, labels map[string]string) error {
+	if len(labels) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if msgs := validation.IsQualifiedName(k); len(msgs) > 0 {
+			return fmt.Errorf("%s: Invalid value: %q: %s", field, k, strings.Join(msgs, "; "))
+		}
+		if msgs := validation.IsValidLabelValue(labels[k]); len(msgs) > 0 {
+			return fmt.Errorf("%s[%q]: Invalid value: %q: %s", field, k, labels[k], strings.Join(msgs, "; "))
+		}
+	}
+	return nil
+}
+
+// validateLabelSelector applies the same key and value rules to a label
+// selector. Selector values are compared with pod labels, so accepting a
+// shape Kubernetes rejects would make a selector that can never match.
+func validateLabelSelector(field string, selector *metav1.LabelSelector) error {
+	if selector == nil {
+		return nil
+	}
+	if err := validateLabels(field+".matchLabels", selector.MatchLabels); err != nil {
+		return err
+	}
+	for i, expr := range selector.MatchExpressions {
+		exprField := fmt.Sprintf("%s.matchExpressions[%d]", field, i)
+		if msgs := validation.IsQualifiedName(expr.Key); len(msgs) > 0 {
+			return fmt.Errorf("%s.key: Invalid value: %q: %s", exprField, expr.Key, strings.Join(msgs, "; "))
+		}
+		for _, value := range expr.Values {
+			if msgs := validation.IsValidLabelValue(value); len(msgs) > 0 {
+				return fmt.Errorf("%s.values: Invalid value: %q: %s", exprField, value, strings.Join(msgs, "; "))
+			}
+		}
+	}
+	return nil
+}
+
+// validateDeploymentLabels validates the labels and selector q8s stores for a
+// Deployment, including the pod template metadata.
+func validateDeploymentLabels(dep *appsv1.Deployment) error {
+	if err := validateLabels("metadata.labels", dep.Labels); err != nil {
+		return err
+	}
+	if err := validateLabelSelector("spec.selector", dep.Spec.Selector); err != nil {
+		return err
+	}
+	return validateLabels("spec.template.metadata.labels", dep.Spec.Template.Labels)
+}
+
+// validateJobLabels validates the labels and selector q8s stores for a Job.
+func validateJobLabels(job *batchv1.Job) error {
+	if err := validateLabels("metadata.labels", job.Labels); err != nil {
+		return err
+	}
+	if err := validateLabelSelector("spec.selector", job.Spec.Selector); err != nil {
+		return err
+	}
+	return validateLabels("spec.template.metadata.labels", job.Spec.Template.Labels)
+}
+
+// validateCronJobLabels validates the labels and selectors q8s stores for a
+// CronJob, including both metadata levels and the pod template.
+func validateCronJobLabels(cj *batchv1.CronJob) error {
+	if err := validateLabels("metadata.labels", cj.Labels); err != nil {
+		return err
+	}
+	if err := validateLabels("spec.jobTemplate.metadata.labels", cj.Spec.JobTemplate.Labels); err != nil {
+		return err
+	}
+	if err := validateLabelSelector("spec.jobTemplate.spec.selector", cj.Spec.JobTemplate.Spec.Selector); err != nil {
+		return err
+	}
+	return validateLabels("spec.jobTemplate.spec.template.metadata.labels", cj.Spec.JobTemplate.Spec.Template.Labels)
+}
+
+// volumeSourceType returns the JSON field name of the one source set on a
+// volume (hostPath, emptyDir, ...). An empty source returns "none".
+func volumeSourceType(vol corev1.Volume) string {
+	src := reflect.ValueOf(vol.VolumeSource)
+	typ := src.Type()
+	for i := 0; i < src.NumField(); i++ {
+		if src.Field(i).IsZero() {
+			continue
+		}
+		tag := typ.Field(i).Tag.Get("json")
+		if tag == "" {
+			return typ.Field(i).Name
+		}
+		return strings.Split(tag, ",")[0]
+	}
+	return "none"
+}
+
+// validateVolumes rejects volume sources q8s cannot render safely. Only
+// persistentVolumeClaim, configMap, secret and emptyDir have a rendering;
+// every other source used to fall through to a host-global named volume named
+// after the pod's volume, sharing storage across namespaces.
+func validateVolumes(spec *corev1.PodSpec) error {
+	if spec == nil {
+		return nil
+	}
+	for i, vol := range spec.Volumes {
+		typ := volumeSourceType(vol)
+		switch typ {
+		case "persistentVolumeClaim", "configMap", "secret", "emptyDir":
+		default:
+			return fmt.Errorf("spec.volumes[%d]: Unsupported value: %s: q8s supports persistentVolumeClaim, configMap, secret and emptyDir volumes", i, typ)
+		}
 	}
 	return nil
 }
@@ -300,6 +429,12 @@ func validateServiceAnnotations(annotations map[string]string) error {
 // validateService checks the fields q8s translates into Traefik config or
 // names outside the pod network on Service create/update/patch.
 func validateService(svc *corev1.Service) error {
+	if err := validateLabels("metadata.labels", svc.Labels); err != nil {
+		return err
+	}
+	if err := validateLabels("spec.selector", svc.Spec.Selector); err != nil {
+		return err
+	}
 	if err := validateServiceAnnotations(svc.Annotations); err != nil {
 		return err
 	}
@@ -379,6 +514,9 @@ func validateTraefikAnnotations(annotations map[string]string) error {
 // validateIngress checks every user-controlled string field that ends up in
 // the generated Traefik dynamic config or references another object by name.
 func validateIngress(ing *networkingv1.Ingress) error {
+	if err := validateLabels("metadata.labels", ing.Labels); err != nil {
+		return err
+	}
 	if err := validateTraefikAnnotations(ing.Annotations); err != nil {
 		return err
 	}
@@ -472,6 +610,9 @@ func validatePodSpecShape(kind string, spec *corev1.PodSpec) error {
 	if err := validateWorkloadMountConflict(kind, spec); err != nil {
 		return err
 	}
+	if err := validateVolumes(spec); err != nil {
+		return err
+	}
 	return validatePodProbes(kind, spec)
 }
 
@@ -551,7 +692,10 @@ func validateCronJobTimeZone(timeZone *string) error {
 // the reserved ServiceAccount workload mount path are checked here too,
 // because Pods and Deployments share this choke point and both are the same
 // kind of unrepresentable spec.
-func validatePodAnnotations(kind string, spec *corev1.PodSpec, annotations map[string]string, replicas int32) error {
+func validatePodAnnotations(kind string, spec *corev1.PodSpec, labels, annotations map[string]string, replicas int32) error {
+	if err := validateLabels("metadata.labels", labels); err != nil {
+		return err
+	}
 	if err := validateUserNSSizeAnnotation(kind, annotations); err != nil {
 		return err
 	}

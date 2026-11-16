@@ -504,7 +504,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 					if err := validateRefName("volume.name", vol.Name); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, volumeOptions(readOnly, "", userNS)))
+					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", EmptyDirVolumeName(ns, name, vol.Name), vm.MountPath, volumeOptions(readOnly, "", userNS)))
 				}
 			}
 		}
@@ -658,7 +658,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 					if err := validateRefName("volume.name", vol.Name); err != nil {
 						return nil, err
 					}
-					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", vol.Name, vm.MountPath, volumeOptions(readOnly, "", userNS)))
+					b.WriteString(fmt.Sprintf("Volume=%s:%s%s\n", EmptyDirVolumeName(ns, name, vol.Name), vm.MountPath, volumeOptions(readOnly, "", userNS)))
 				}
 			}
 		}
@@ -887,6 +887,32 @@ func pvcStorageClass(pvc *corev1.PersistentVolumeClaim) string {
 // what instead of requiring a live cross-reference.
 func PVCVolumeName(ns, name string) string {
 	return fmt.Sprintf("%s-%s", ns, name)
+}
+
+// EmptyDirVolumeName is the Podman named volume backing an emptyDir (or any
+// other non-PVC volume source q8s cannot render as a bind mount). The
+// underscore separator cannot appear in a Kubernetes namespace, owner or
+// volume name, so this name can never equal another namespace's emptyDir or
+// a PVC volume (PVCVolumeName joins with '-'). owner is the pod name for a
+// bare pod and the Deployment, Job or CronJob name for a pod template, so
+// every replica or run of one workload keeps sharing the same volume.
+func EmptyDirVolumeName(ns, owner, name string) string {
+	return fmt.Sprintf("q8s_%s_%s_%s", ns, owner, name)
+}
+
+// emptyDirVolumeOwner returns the workload that owns the emptyDir volume: a
+// Deployment, Job or CronJob name for template-derived pods, otherwise the
+// pod's own name.
+func emptyDirVolumeOwner(pod *corev1.Pod) string {
+	for _, or := range pod.OwnerReferences {
+		switch or.Kind {
+		case "Deployment", "Job", "CronJob":
+			if or.Name != "" {
+				return or.Name
+			}
+		}
+	}
+	return pod.Name
 }
 
 // Volume generates a .volume quadlet file content.

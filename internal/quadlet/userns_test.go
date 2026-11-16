@@ -94,8 +94,8 @@ func TestUserNSStandaloneContainerAndVolumes(t *testing.T) {
 		"Volume=/srv/models:/models:ro,Z,idmap",
 		"Volume=/run/q8s/configmaps/default/app-config:/etc/config:ro,z,idmap",
 		"Volume=/run/q8s/secrets/default/creds:/etc/creds:ro,z,idmap",
-		"Volume=scratch:/scratch:idmap",
-		"Volume=scratch-ro:/scratch-ro:ro,idmap",
+		"Volume=q8s_default_app_scratch:/scratch:idmap",
+		"Volume=q8s_default_app_scratch-ro:/scratch-ro:ro,idmap",
 	} {
 		assertContains(t, out, want)
 	}
@@ -112,8 +112,8 @@ func TestUserNSOffByDefault(t *testing.T) {
 	assertNotContains(t, out, "UserNS")
 	assertNotContains(t, out, "idmap")
 	assertContains(t, out, "Volume=default-data.volume:/data:Z")
-	assertContains(t, out, "Volume=scratch:/scratch\n")
-	assertContains(t, out, "Volume=scratch-ro:/scratch-ro:ro\n")
+	assertContains(t, out, "Volume=q8s_default_app_scratch:/scratch\n")
+	assertContains(t, out, "Volume=q8s_default_app_scratch-ro:/scratch-ro:ro\n")
 
 	files, err := quadlet.PodUnits("multi", multiPod(), "/run/q8s/configmaps", nil, nil, "", nil)
 	if err != nil {
@@ -168,7 +168,7 @@ func TestUserNSMultiContainerPod(t *testing.T) {
 
 	sidecarOut := string(files["default-multi-sidecar.container"])
 	assertNotContains(t, sidecarOut, "UserNS")
-	assertContains(t, sidecarOut, "Volume=scratch:/scratch:idmap")
+	assertContains(t, sidecarOut, "Volume=q8s_default_multi_scratch:/scratch:idmap")
 
 	// The /dev/shm emptyDir is a pod-level ShmSize, not a Volume= line.
 	assertNotContains(t, podOut, "idmap")
@@ -216,7 +216,7 @@ func TestUserNSHostUsersOptOut(t *testing.T) {
 			out := mustContainer(t, pod, "")
 			if tc.wantNS {
 				assertContains(t, out, "UserNS=auto:size=65536\n")
-				assertContains(t, out, "Volume=scratch:/scratch:idmap")
+				assertContains(t, out, "Volume=q8s_default_app_scratch:/scratch:idmap")
 			} else {
 				assertNotContains(t, out, "UserNS")
 				assertNotContains(t, out, "idmap")
@@ -290,7 +290,7 @@ func TestUserNSCronContainer(t *testing.T) {
 	}
 	out := string(b)
 	assertContains(t, out, "UserNS=auto:size=65536\n")
-	assertContains(t, out, "Volume=scratch:/scratch:idmap")
+	assertContains(t, out, "Volume=q8s_ns_c_scratch:/scratch:idmap")
 }
 
 func TestUserNSJobHostNetworkOptOut(t *testing.T) {

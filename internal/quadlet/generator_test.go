@@ -1000,7 +1000,7 @@ func TestContainerOrdinaryEmptyDirKeepsVolumeLine(t *testing.T) {
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch"}}
 	out := mustContainer(t, pod, "")
 
-	assertContains(t, out, "Volume=scratch:/scratch")
+	assertContains(t, out, "Volume=q8s_default_app_scratch:/scratch")
 	assertNotContains(t, out, "ShmSize=")
 }
 
@@ -1220,7 +1220,7 @@ func TestCronContainerReadOnlyEmptyDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CronContainer: %v", err)
 	}
-	assertContains(t, string(b), "Volume=scratch:/scratch:ro")
+	assertContains(t, string(b), "Volume=q8s_ns_c_scratch:/scratch:ro")
 }
 
 func TestCronContainerNoContainersError(t *testing.T) {
@@ -1656,7 +1656,7 @@ func TestContainerEmptyDirReadOnly(t *testing.T) {
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "scratch", MountPath: "/scratch", ReadOnly: true}}
 	out := mustContainer(t, pod, "")
-	assertContains(t, out, "Volume=scratch:/scratch:ro")
+	assertContains(t, out, "Volume=q8s_default_app_scratch:/scratch:ro")
 }
 
 func TestContainerPVCHostpathPrivateSELinuxLabel(t *testing.T) {

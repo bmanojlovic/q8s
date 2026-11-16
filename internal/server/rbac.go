@@ -43,10 +43,16 @@ func validatePolicyRules(rules []rbacv1.PolicyRule, clusterRole bool) error {
 }
 
 func validateRole(role *rbacv1.Role) error {
+	if err := validateLabels("metadata.labels", role.Labels); err != nil {
+		return err
+	}
 	return validatePolicyRules(role.Rules, false)
 }
 
 func validateClusterRole(role *rbacv1.ClusterRole) error {
+	if err := validateLabels("metadata.labels", role.Labels); err != nil {
+		return err
+	}
 	return validatePolicyRules(role.Rules, true)
 }
 
@@ -112,6 +118,9 @@ func validateRoleRefUnchanged(oldRef, newRef rbacv1.RoleRef) error {
 }
 
 func validateRoleBinding(rb *rbacv1.RoleBinding, oldRef *rbacv1.RoleRef) error {
+	if err := validateLabels("metadata.labels", rb.Labels); err != nil {
+		return err
+	}
 	if err := validateRoleRef(rb.RoleRef, false); err != nil {
 		return err
 	}
@@ -125,6 +134,9 @@ func validateRoleBinding(rb *rbacv1.RoleBinding, oldRef *rbacv1.RoleRef) error {
 }
 
 func validateClusterRoleBinding(crb *rbacv1.ClusterRoleBinding, oldRef *rbacv1.RoleRef) error {
+	if err := validateLabels("metadata.labels", crb.Labels); err != nil {
+		return err
+	}
 	if err := validateRoleRef(crb.RoleRef, true); err != nil {
 		return err
 	}
