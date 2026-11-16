@@ -9,6 +9,7 @@ import (
 	"path"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -87,12 +88,13 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 	}
 	urlName := path.Base(urlPath)
 	name, _ := metadata["name"].(string)
-	if name == "" || name != urlName {
-		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "metadata.name %q does not match URL name %q", name, urlName)
+	if name == "" {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "apply body must contain metadata.name")
 		return
 	}
-	if namespace, _ := metadata["namespace"].(string); namespace != "" && namespace != namespaceFromURLPath(urlPath) {
-		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "metadata.namespace %q does not match URL namespace %q", namespace, namespaceFromURLPath(urlPath))
+	namespace, _ := metadata["namespace"].(string)
+	meta := metav1.ObjectMeta{Name: name, Namespace: namespace}
+	if !s.objectIdentityMatchesURL(w, &meta, namespaceFromURLPath(urlPath), urlName) {
 		return
 	}
 

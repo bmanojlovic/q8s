@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"q8s/internal/fsutil"
 )
 
 // MaxIdentityLength is the maximum length of a user name or group, matching
@@ -89,6 +92,13 @@ func IssueClientCertificate(caCertPEM, caKeyPEM []byte, userName string, groups 
 // issues one-hour service account certificates) use the same signing path as
 // the CLI without rounding through whole days.
 func IssueClientCertificateAt(caCertPEM, caKeyPEM []byte, userName string, groups []string, notBefore, notAfter time.Time) (*ClientCertificate, error) {
+	return IssueClientCertificateWithURIsAt(caCertPEM, caKeyPEM, userName, groups, nil, notBefore, notAfter)
+}
+
+// IssueClientCertificateWithURIsAt is IssueClientCertificateAt with URI
+// Subject Alternative Names. The workload socket uses one URI to bind a
+// service account certificate to the object that requested it.
+func IssueClientCertificateWithURIsAt(caCertPEM, caKeyPEM []byte, userName string, groups []string, uris []*url.URL, notBefore, notAfter time.Time) (*ClientCertificate, error) {
 	if err := ValidateIdentity("user name", userName); err != nil {
 		return nil, err
 	}
@@ -135,6 +145,7 @@ func IssueClientCertificateAt(caCertPEM, caKeyPEM []byte, userName string, group
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		URIs:         append([]*url.URL(nil), uris...),
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &template, caCert, &clientKey.PublicKey, caKey)
 	if err != nil {
@@ -257,8 +268,9 @@ func LoadRevokedCertificates(path string) (RevokedCertificates, error) {
 	return revoked, nil
 }
 
-// SaveRevokedCertificates writes revoked atomically with tmp+rename and mode
-// 0600, so a reader never sees a partial list and only the owner can read it.
+// SaveRevokedCertificates writes revoked atomically with fsutil.WriteFileAtomic
+// and mode 0600, so a reader never sees a partial list and only the owner can
+// read it.
 func SaveRevokedCertificates(path string, revoked RevokedCertificates) error {
 	if revoked.Users == nil {
 		revoked.Users = []string{}
@@ -282,30 +294,12 @@ func SaveRevokedCertificates(path string, revoked RevokedCertificates) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".revoked-*.tmp")
+	data, err := json.MarshalIndent(revoked, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		return err
-	}
-	encoder := json.NewEncoder(tmp)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(revoked); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	data = append(data, '\n')
+	return fsutil.WriteFileAtomic(path, data, 0600)
 }
 
 func dedupeStrings(values []string) []string {

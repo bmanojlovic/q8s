@@ -913,8 +913,8 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		pod.APIVersion = "v1"
 		pod.Kind = "Pod"
-		if pod.Namespace == "" {
-			pod.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &pod, ns, "") {
+			return
 		}
 		// k8s defaulting: an unset restartPolicy is Always. Without this,
 		// empty reached the quadlet generator, whose defensive Never
@@ -1019,7 +1019,14 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		if patched.Spec.RestartPolicy == "" {
 			patched.Spec.RestartPolicy = corev1.RestartPolicyAlways
 		}
-		if err := validatePatchedIdentity("pod", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1276,8 +1283,8 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		svc.APIVersion = "v1"
 		svc.Kind = "Service"
-		if svc.Namespace == "" {
-			svc.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &svc, ns, "") {
+			return
 		}
 		if err := validateName("namespace", svc.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -1361,7 +1368,14 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("service", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1452,8 +1466,8 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		pvc.APIVersion = "v1"
 		pvc.Kind = "PersistentVolumeClaim"
-		if pvc.Namespace == "" {
-			pvc.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &pvc, ns, "") {
+			return
 		}
 		if err := validateName("namespace", pvc.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -1507,7 +1521,14 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("persistentvolumeclaim", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1569,8 +1590,8 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		cm.APIVersion = "v1"
 		cm.Kind = "ConfigMap"
-		if cm.Namespace == "" {
-			cm.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &cm, ns, "") {
+			return
 		}
 		if err := validateName("namespace", cm.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -1602,11 +1623,8 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		}
 		cm.APIVersion = "v1"
 		cm.Kind = "ConfigMap"
-		if cm.Namespace == "" {
-			cm.Namespace = ns
-		}
-		if cm.Name == "" {
-			cm.Name = name
+		if !s.objectIdentityMatchesURL(w, &cm, ns, name) {
+			return
 		}
 		if err := validateName("namespace", cm.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -1668,7 +1686,14 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("configmap", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1739,8 +1764,8 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		}
 		secret.APIVersion = "v1"
 		secret.Kind = "Secret"
-		if secret.Namespace == "" {
-			secret.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &secret, ns, "") {
+			return
 		}
 		if err := validateName("namespace", secret.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -1806,7 +1831,14 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("secret", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1882,8 +1914,8 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 		}
 		sa.APIVersion = "v1"
 		sa.Kind = "ServiceAccount"
-		if sa.Namespace == "" {
-			sa.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &sa, ns, "") {
+			return
 		}
 		if err := validateName("namespace", sa.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -1906,13 +1938,14 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 		}
 		sa.APIVersion = "v1"
 		sa.Kind = "ServiceAccount"
-		if sa.Namespace == "" {
-			sa.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &sa, ns, name) {
+			return
 		}
-		if sa.Name == "" {
-			sa.Name = name
+		if err := validateName("namespace", sa.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
 		}
-		if err := validatePatchedIdentity("serviceaccount", sa.Namespace, sa.Name, ns, name); err != nil {
+		if err := validateName("name", sa.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -1959,7 +1992,14 @@ func (s *Server) handleServiceAccounts(w http.ResponseWriter, r *http.Request, n
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("serviceaccount", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2143,8 +2183,8 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		dep.APIVersion = "apps/v1"
 		dep.Kind = "Deployment"
-		if dep.Namespace == "" {
-			dep.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &dep, ns, "") {
+			return
 		}
 		if err := validateName("namespace", dep.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -2182,11 +2222,8 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		dep.APIVersion = "apps/v1"
 		dep.Kind = "Deployment"
-		if dep.Namespace == "" {
-			dep.Namespace = ns
-		}
-		if dep.Name == "" {
-			dep.Name = name
+		if !s.objectIdentityMatchesURL(w, &dep, ns, name) {
+			return
 		}
 		if err := validateName("namespace", dep.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -2202,10 +2239,6 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
-			return
-		}
-		if err := validatePatchedIdentity("deployment", dep.Namespace, dep.Name, ns, name); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
 		existing, err := s.config.Store.GetDeployment(ns, name)
@@ -2272,7 +2305,14 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("deployment", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2348,12 +2388,18 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 			return
 		}
 		var patch struct {
-			Spec struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+			Spec     struct {
 				Replicas *int32 `json:"replicas"`
 			} `json:"spec"`
 		}
-		if err := json.Unmarshal(body, &patch); err == nil && patch.Spec.Replicas != nil {
-			dep.Spec.Replicas = patch.Spec.Replicas
+		if err := json.Unmarshal(body, &patch); err == nil {
+			if !s.objectIdentityMatchesURL(w, &patch.Metadata, ns, name) {
+				return
+			}
+			if patch.Spec.Replicas != nil {
+				dep.Spec.Replicas = patch.Spec.Replicas
+			}
 		}
 		if err := validatePodAnnotations("deployment", &dep.Spec.Template.Spec, dep.Spec.Template.Annotations, deploymentReplicas(dep)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
@@ -2703,8 +2749,8 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		job.APIVersion = "batch/v1"
 		job.Kind = "Job"
-		if job.Namespace == "" {
-			job.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &job, ns, "") {
+			return
 		}
 		if err := validateName("namespace", job.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -2742,11 +2788,8 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		job.APIVersion = "batch/v1"
 		job.Kind = "Job"
-		if job.Namespace == "" {
-			job.Namespace = ns
-		}
-		if job.Name == "" {
-			job.Name = name
+		if !s.objectIdentityMatchesURL(w, &job, ns, name) {
+			return
 		}
 		if err := validateName("namespace", job.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -2766,10 +2809,6 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validateUserNSSizeAnnotation("job spec.template", job.Spec.Template.Annotations); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
-			return
-		}
-		if err := validatePatchedIdentity("job", job.Namespace, job.Name, ns, name); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
 		existing, err := s.config.Store.GetJob(ns, name)
@@ -2837,7 +2876,14 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("job", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -2922,8 +2968,8 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		cj.APIVersion = "batch/v1"
 		cj.Kind = "CronJob"
-		if cj.Namespace == "" {
-			cj.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &cj, ns, "") {
+			return
 		}
 		if err := validateName("namespace", cj.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -2964,11 +3010,8 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		cj.APIVersion = "batch/v1"
 		cj.Kind = "CronJob"
-		if cj.Namespace == "" {
-			cj.Namespace = ns
-		}
-		if cj.Name == "" {
-			cj.Name = name
+		if !s.objectIdentityMatchesURL(w, &cj, ns, name) {
+			return
 		}
 		if err := validateName("namespace", cj.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -2992,10 +3035,6 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		if err := validateCronJobTimeZone(cj.Spec.TimeZone); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
-			return
-		}
-		if err := validatePatchedIdentity("cronjob", cj.Namespace, cj.Name, ns, name); err != nil {
-			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
 		existing, err := s.config.Store.GetCronJob(ns, name)
@@ -3052,7 +3091,14 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("cronjob", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}
@@ -3157,8 +3203,8 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		}
 		ing.APIVersion = "networking.k8s.io/v1"
 		ing.Kind = "Ingress"
-		if ing.Namespace == "" {
-			ing.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &ing, ns, "") {
+			return
 		}
 		if err := validateName("namespace", ing.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -3186,11 +3232,8 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 		}
 		ing.APIVersion = "networking.k8s.io/v1"
 		ing.Kind = "Ingress"
-		if ing.Namespace == "" {
-			ing.Namespace = ns
-		}
-		if ing.Name == "" {
-			ing.Name = name
+		if !s.objectIdentityMatchesURL(w, &ing, ns, name) {
+			return
 		}
 		if err := validateName("namespace", ing.Namespace); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
@@ -3248,7 +3291,14 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 			s.respondStatus(w, http.StatusBadRequest, "BadRequest", "%s", err.Error())
 			return
 		}
-		if err := validatePatchedIdentity("ingress", patched.Namespace, patched.Name, ns, name); err != nil {
+		if !s.objectIdentityMatchesURL(w, &patched, ns, name) {
+			return
+		}
+		if err := validateName("namespace", patched.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", patched.Name); err != nil {
 			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
 			return
 		}

@@ -5,6 +5,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"net/http"
+	"strings"
+
+	"q8s/internal/store"
 )
 
 // userInfo is the authenticated identity of a request, following the
@@ -59,6 +62,7 @@ type AuthMiddleware struct {
 	caCertPool *x509.CertPool
 	enabled    bool
 	revoked    *revokedCache
+	store      *store.Store
 }
 
 // NewAuthMiddleware creates an auth middleware with the given CA cert PEM data.
@@ -73,6 +77,17 @@ func NewAuthMiddleware(caCert []byte) (*AuthMiddleware, error) {
 // NewAuthMiddlewareWithRevocation is NewAuthMiddleware plus certificate
 // revocation from revokedFile. An empty revokedFile disables revocation.
 func NewAuthMiddlewareWithRevocation(caCert []byte, revokedFile string) (*AuthMiddleware, error) {
+	return newAuthMiddleware(caCert, revokedFile, nil)
+}
+
+// NewAuthMiddlewareWithRevocationAndStore is NewAuthMiddlewareWithRevocation
+// plus the store that service account certificates are checked against on
+// every request.
+func NewAuthMiddlewareWithRevocationAndStore(caCert []byte, revokedFile string, st *store.Store) (*AuthMiddleware, error) {
+	return newAuthMiddleware(caCert, revokedFile, st)
+}
+
+func newAuthMiddleware(caCert []byte, revokedFile string, st *store.Store) (*AuthMiddleware, error) {
 	if len(caCert) == 0 {
 		return &AuthMiddleware{enabled: false}, nil
 	}
@@ -86,6 +101,7 @@ func NewAuthMiddlewareWithRevocation(caCert []byte, revokedFile string) (*AuthMi
 		caCertPool: pool,
 		enabled:    true,
 		revoked:    newRevokedCache(revokedFile),
+		store:      st,
 	}, nil
 }
 
@@ -118,6 +134,74 @@ func (a *AuthMiddleware) Handler(next http.Handler) http.Handler {
 			return
 		}
 
+		if strings.HasPrefix(cert.Subject.CommonName, serviceAccountUserPrefix) {
+			if err := validateServiceAccountCertificate(a.store, cert); err != nil {
+				http.Error(w, fmt.Sprintf("invalid service account certificate: %v", err), http.StatusUnauthorized)
+				return
+			}
+		}
+
 		next.ServeHTTP(w, r.WithContext(withUserInfo(r.Context(), userInfoFromCertificate(cert))))
 	})
+}
+
+// serviceAccountUserPrefix is the Kubernetes user name prefix for a ServiceAccount.
+const serviceAccountUserPrefix = "system:serviceaccount:"
+
+// validateServiceAccountCertificate checks a service account certificate
+// against live state. The certificate must carry exactly one workload URI
+// SAN; that workload must still exist with the same UID, its pod template
+// must still name the certificate's ServiceAccount, and the ServiceAccount
+// must exist. Nothing is cached: the checks are a few map lookups.
+func validateServiceAccountCertificate(st *store.Store, cert *x509.Certificate) error {
+	namespace, name, ok := serviceAccountFromUserName(cert.Subject.CommonName)
+	if !ok {
+		return fmt.Errorf("malformed service account user name %q", cert.Subject.CommonName)
+	}
+
+	var binding *workloadRef
+	for _, uri := range cert.URIs {
+		ref, ok := parseWorkloadURI(uri)
+		if !ok {
+			continue
+		}
+		if binding != nil {
+			return fmt.Errorf("certificate has more than one workload URI")
+		}
+		binding = &ref
+	}
+	if binding == nil {
+		return fmt.Errorf("certificate has no workload URI")
+	}
+	if binding.Namespace != namespace {
+		return fmt.Errorf("workload namespace %q does not match service account namespace %q", binding.Namespace, namespace)
+	}
+
+	target, err := lookupWorkloadTarget(st, binding.Kind, binding.Namespace, binding.Name)
+	if err != nil {
+		return err
+	}
+	if target.Ref.UID != binding.UID {
+		return fmt.Errorf("%s %s/%s no longer has the certificate's UID", binding.Kind, binding.Namespace, binding.Name)
+	}
+	if target.ServiceAccount != name {
+		return fmt.Errorf("%s %s/%s does not use service account %q", binding.Kind, binding.Namespace, binding.Name, name)
+	}
+	if _, err := st.GetServiceAccount(namespace, name); err != nil {
+		return fmt.Errorf("serviceaccount %s/%s not found", namespace, name)
+	}
+	return nil
+}
+
+// serviceAccountFromUserName splits system:serviceaccount:<namespace>:<name>.
+func serviceAccountFromUserName(userName string) (namespace, name string, ok bool) {
+	rest, ok := strings.CutPrefix(userName, serviceAccountUserPrefix)
+	if !ok {
+		return "", "", false
+	}
+	namespace, name, ok = strings.Cut(rest, ":")
+	if !ok || namespace == "" || name == "" || strings.Contains(name, ":") {
+		return "", "", false
+	}
+	return namespace, name, true
 }

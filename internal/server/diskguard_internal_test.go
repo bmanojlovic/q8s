@@ -144,7 +144,7 @@ func newGuardServer(t *testing.T) (*Server, *store.Store) {
 		network: &networkState{subnets: map[string]string{}},
 	}
 	s.setupRoutes()
-	s.handler = s.mux
+	s.handler = s.diskGuardMiddleware(s.mux)
 	return s, st
 }
 
@@ -173,7 +173,7 @@ func TestServeHTTPRefusesWritesOnLowDisk(t *testing.T) {
 			if status.Reason != metav1.StatusReason("InsufficientStorage") {
 				t.Errorf("reason = %q, want InsufficientStorage", status.Reason)
 			}
-			if !strings.Contains(status.Message, "q8s refuses changes: low disk space (") {
+			if !strings.Contains(status.Message, "q8s refuses changes: low disk space") {
 				t.Errorf("message = %q, want the low disk space refusal", status.Message)
 			}
 		})

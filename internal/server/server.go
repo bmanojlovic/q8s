@@ -101,7 +101,7 @@ func New(cfg Config) (*Server, error) {
 	if revokedFile == "" && cfg.DataDir != "" {
 		revokedFile = filepath.Join(cfg.DataDir, "revoked.json")
 	}
-	auth, err := NewAuthMiddlewareWithRevocation(cfg.CACert, revokedFile)
+	auth, err := NewAuthMiddlewareWithRevocationAndStore(cfg.CACert, revokedFile, cfg.Store)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set up client-cert auth: %w", err)
 	}
@@ -115,7 +115,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Manager != nil {
 		s.network.ops = podmanNetworkOps{manager: cfg.Manager}
 	}
-	s.handler = auth.Handler(s.authorizeMiddleware(s.applyMiddleware(s.mux)))
+	s.handler = auth.Handler(s.diskGuardMiddleware(s.authorizeMiddleware(s.applyMiddleware(s.mux))))
 
 	s.setupRoutes()
 
@@ -177,20 +177,66 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	if isUncleanAPIPath(r.URL.Path, r.URL.RawPath) {
+		// ServeMux does not clean percent-encoded segments, so a path like
+		// .../secrets%2F%2F can reach a handler as if it were a valid URL.
+		// Refuse it before routing or authorization.
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "invalid API path %q", r.URL.Path)
+		return
+	}
 	if _, dry := r.URL.Query()["dryRun"]; dry && r.Method != http.MethodGet && !isPodWritePath(r.URL.Path) {
 		// Only pods honor dryRun. Refusing it elsewhere is safer than the
 		// alternative of running the write for real.
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "dryRun is only supported for pods")
 		return
 	}
-	if isDiskWrite(r.Method) && !isStreamingSubresource(r.URL.Path) {
-		if low, detail := s.diskPressureLow(); low {
+	s.handler.ServeHTTP(w, r)
+}
+
+// isUncleanAPIPath reports whether path is under /api/ or /apis/ and has an
+// empty, "." or ".." segment, or rawPath carries an encoded slash or dot.
+// A single trailing slash on an otherwise valid path is allowed.
+func isUncleanAPIPath(path, rawPath string) bool {
+	if !strings.HasPrefix(path, "/api/") && !strings.HasPrefix(path, "/apis/") {
+		return false
+	}
+	lowerRaw := strings.ToLower(rawPath)
+	if strings.Contains(lowerRaw, "%2f") || strings.Contains(lowerRaw, "%2e") {
+		return true
+	}
+	trimmed := strings.TrimPrefix(path, "/")
+	trimmed = strings.TrimSuffix(trimmed, "/")
+	for _, part := range strings.Split(trimmed, "/") {
+		if part == "" || part == "." || part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// diskGuardMiddleware refuses writes while a filesystem q8s uses is low on
+// space. It runs after authentication so a missing or revoked certificate is
+// answered with 401 first, and only administrators see the filesystem paths
+// in the message.
+func (s *Server) diskGuardMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isDiskWrite(r.Method) || isStreamingSubresource(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		low, detail := s.diskPressureLow()
+		if !low {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if u, ok := userFromContext(r.Context()); ok && isAdmin(u) {
 			s.respondStatus(w, http.StatusInsufficientStorage, "InsufficientStorage",
 				"q8s refuses changes: low disk space (%s); free space and retry", detail)
 			return
 		}
-	}
-	s.handler.ServeHTTP(w, r)
+		s.respondStatus(w, http.StatusInsufficientStorage, "InsufficientStorage",
+			"q8s refuses changes: low disk space; free space and retry")
+	})
 }
 
 // isDiskWrite reports whether method changes stored state. DELETE is left out

@@ -290,7 +290,7 @@ metadata:
 `)
 		defer resp.Body.Close()
 		assertStatus(t, resp, http.StatusBadRequest)
-		if msg := statusMessage(t, resp); !strings.Contains(msg, "metadata.name") {
+		if msg := statusMessage(t, resp); !strings.Contains(msg, "the name of the object (other) does not match the name on the URL (applied)") {
 			t.Fatalf("message = %q", msg)
 		}
 		resp = get(t, ts.URL+"/api/v1/namespaces/default/configmaps/applied")

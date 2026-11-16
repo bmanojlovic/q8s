@@ -87,21 +87,27 @@ func isBasicUserRequest(a requestAttributes) bool {
 
 // isDiscoveryRequest reports whether a is one of the read-only discovery
 // endpoints every authenticated user may access, the way the
-// system:discovery ClusterRole does in Kubernetes.
+// system:discovery ClusterRole does in Kubernetes. Only the exact discovery
+// shapes count: any other /api or /apis path is a resource request (or an
+// unparseable path the authorizer must deny), never discovery.
 func isDiscoveryRequest(a requestAttributes) bool {
 	if a.Verb != "get" {
 		return false
 	}
-	switch a.Path {
-	case "/api", "/apis", "/version", "/version/", "/healthz", "/openapi/v2", "/openapi/v3":
+	path := strings.TrimSuffix(a.Path, "/")
+	switch path {
+	case "/api", "/api/v1", "/apis", "/version", "/healthz", "/openapi/v2", "/openapi/v3":
 		return true
 	}
-	for _, prefix := range []string{"/api/", "/apis/", "/openapi/v3/"} {
-		if strings.HasPrefix(a.Path, prefix) {
-			return true
-		}
+	if strings.HasPrefix(a.Path, "/openapi/v3/") {
+		return true
 	}
-	return false
+	parts, ok := splitResourcePath(a.Path)
+	if !ok || parts[0] != "apis" {
+		return false
+	}
+	// /apis/<group> and /apis/<group>/<version>.
+	return len(parts) == 2 || len(parts) == 3
 }
 
 // boundPolicyRules returns the PolicyRules granted to u by RoleBindings in

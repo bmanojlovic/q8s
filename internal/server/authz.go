@@ -138,13 +138,20 @@ func (s *Server) handleSelfSubjectRulesReview(w http.ResponseWriter, r *http.Req
 	}
 
 	namespaced, cluster := s.boundPolicyRules(u, review.Spec.Namespace)
-	all := make([]rbacv1.PolicyRule, 0, len(namespaced)+len(cluster))
-	all = append(all, namespaced...)
-	all = append(all, cluster...)
 
-	resourceRules := make([]authorizationv1.ResourceRule, 0, len(all)+2)
+	resourceRules := make([]authorizationv1.ResourceRule, 0, len(namespaced)+len(cluster)+2)
+	for _, rule := range namespaced {
+		if len(rule.NonResourceURLs) > 0 {
+			// A RoleBinding cannot grant non-resource URLs, so a rule with
+			// only those contributes nothing in a namespace.
+			continue
+		}
+		resourceRules = append(resourceRules, resourceRule(rule))
+	}
+	// Only ClusterRoleBinding rules may contribute nonResourceRules, as in
+	// the Kubernetes authorizer.
 	nonResourceRules := make([]authorizationv1.NonResourceRule, 0, len(cluster))
-	for _, rule := range all {
+	for _, rule := range cluster {
 		if len(rule.NonResourceURLs) > 0 {
 			nonResourceRules = append(nonResourceRules, authorizationv1.NonResourceRule{
 				Verbs:           append([]string(nil), rule.Verbs...),
@@ -152,12 +159,7 @@ func (s *Server) handleSelfSubjectRulesReview(w http.ResponseWriter, r *http.Req
 			})
 			continue
 		}
-		resourceRules = append(resourceRules, authorizationv1.ResourceRule{
-			Verbs:         append([]string(nil), rule.Verbs...),
-			APIGroups:     append([]string(nil), rule.APIGroups...),
-			Resources:     append([]string(nil), rule.Resources...),
-			ResourceNames: append([]string(nil), rule.ResourceNames...),
-		})
+		resourceRules = append(resourceRules, resourceRule(rule))
 	}
 	resourceRules = append(resourceRules, selfReviewResourceRules()...)
 
@@ -167,6 +169,17 @@ func (s *Server) handleSelfSubjectRulesReview(w http.ResponseWriter, r *http.Req
 		Incomplete:       false,
 	}
 	encode(w, &review, http.StatusCreated)
+}
+
+// resourceRule converts a stored PolicyRule into the review's ResourceRule
+// shape, copying the slices so the review never aliases stored objects.
+func resourceRule(rule rbacv1.PolicyRule) authorizationv1.ResourceRule {
+	return authorizationv1.ResourceRule{
+		Verbs:         append([]string(nil), rule.Verbs...),
+		APIGroups:     append([]string(nil), rule.APIGroups...),
+		Resources:     append([]string(nil), rule.Resources...),
+		ResourceNames: append([]string(nil), rule.ResourceNames...),
+	}
 }
 
 // selfReviewResourceRules returns the rules every authenticated user holds:

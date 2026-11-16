@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"q8s/internal/podman"
+	"q8s/internal/store"
 	"q8s/pkg/install"
 )
 
@@ -181,11 +183,153 @@ func peerPID(conn net.Conn) (int, error) {
 	return pid, nil
 }
 
-// credentialForConnection resolves the peer to a container and issues its
-// pod's service account credential.
+// workloadURIPrefix starts the URI Subject Alternative Name that binds a
+// service account certificate to the object that requested it. The rest is
+// <kind>:<namespace>/<name>/<uid>, with kind pod, job or cronjob.
+const workloadURIPrefix = "urn:q8s:workload:"
+
+const (
+	workloadKindPod     = "pod"
+	workloadKindJob     = "job"
+	workloadKindCronJob = "cronjob"
+)
+
+// workloadRef identifies the stored object a certificate is bound to.
+type workloadRef struct {
+	Kind      string
+	Namespace string
+	Name      string
+	UID       string
+}
+
+// workloadTarget is the live object plus the pod template fields that decide
+// whether a credential may be issued.
+type workloadTarget struct {
+	Ref                          workloadRef
+	ServiceAccount               string
+	AutomountServiceAccountToken *bool
+}
+
+// URI renders the canonical Subject Alternative Name for r.
+func (r workloadRef) URI() (string, error) {
+	switch r.Kind {
+	case workloadKindPod, workloadKindJob, workloadKindCronJob:
+	default:
+		return "", fmt.Errorf("unsupported workload kind %q", r.Kind)
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"namespace", r.Namespace},
+		{"name", r.Name},
+		{"uid", r.UID},
+	} {
+		if field.value == "" {
+			return "", fmt.Errorf("workload %s is required", field.name)
+		}
+		if strings.ContainsAny(field.value, "/") {
+			return "", fmt.Errorf("workload %s must not contain a slash", field.name)
+		}
+	}
+	return workloadURIPrefix + r.Kind + ":" + r.Namespace + "/" + r.Name + "/" + r.UID, nil
+}
+
+// parseWorkloadURI parses a URI Subject Alternative Name back into a
+// workloadRef. It accepts only the canonical form this server issues.
+func parseWorkloadURI(u *url.URL) (workloadRef, bool) {
+	if u == nil {
+		return workloadRef{}, false
+	}
+	raw := u.String()
+	if !strings.HasPrefix(raw, workloadURIPrefix) {
+		return workloadRef{}, false
+	}
+	kind, rest, ok := strings.Cut(strings.TrimPrefix(raw, workloadURIPrefix), ":")
+	if !ok {
+		return workloadRef{}, false
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) != 3 {
+		return workloadRef{}, false
+	}
+	ref := workloadRef{Kind: kind, Namespace: parts[0], Name: parts[1], UID: parts[2]}
+	canonical, err := ref.URI()
+	if err != nil || canonical != raw {
+		return workloadRef{}, false
+	}
+	return ref, true
+}
+
+// workloadRefFromLabels resolves the object labels on a workload container.
+// Pod containers win, then Job containers, then CronJob containers.
+func workloadRefFromLabels(labels map[string]string) (workloadRef, bool) {
+	namespace := labels["io.kubernetes.pod.namespace"]
+	if namespace == "" {
+		return workloadRef{}, false
+	}
+	if name := labels["io.kubernetes.pod.name"]; name != "" {
+		return workloadRef{Kind: workloadKindPod, Namespace: namespace, Name: name}, true
+	}
+	if name := labels["io.kubernetes.job.name"]; name != "" {
+		return workloadRef{Kind: workloadKindJob, Namespace: namespace, Name: name}, true
+	}
+	if name := labels["io.kubernetes.cronjob.name"]; name != "" {
+		return workloadRef{Kind: workloadKindCronJob, Namespace: namespace, Name: name}, true
+	}
+	return workloadRef{}, false
+}
+
+// lookupWorkloadTarget reads the live object a certificate is bound to and
+// returns its pod template service account fields. The returned UID is the
+// object's current UID, which the caller compares with the UID in the
+// certificate.
+func lookupWorkloadTarget(st *store.Store, kind, namespace, name string) (workloadTarget, error) {
+	if st == nil {
+		return workloadTarget{}, fmt.Errorf("workload store is not configured")
+	}
+	switch kind {
+	case workloadKindPod:
+		pod, err := st.GetPod(namespace, name)
+		if err != nil {
+			return workloadTarget{}, fmt.Errorf("pod %s/%s not found", namespace, name)
+		}
+		return workloadTarget{
+			Ref:                          workloadRef{Kind: kind, Namespace: namespace, Name: name, UID: string(pod.UID)},
+			ServiceAccount:               pod.Spec.ServiceAccountName,
+			AutomountServiceAccountToken: pod.Spec.AutomountServiceAccountToken,
+		}, nil
+	case workloadKindJob:
+		job, err := st.GetJob(namespace, name)
+		if err != nil {
+			return workloadTarget{}, fmt.Errorf("job %s/%s not found", namespace, name)
+		}
+		return workloadTarget{
+			Ref:                          workloadRef{Kind: kind, Namespace: namespace, Name: name, UID: string(job.UID)},
+			ServiceAccount:               job.Spec.Template.Spec.ServiceAccountName,
+			AutomountServiceAccountToken: job.Spec.Template.Spec.AutomountServiceAccountToken,
+		}, nil
+	case workloadKindCronJob:
+		cj, err := st.GetCronJob(namespace, name)
+		if err != nil {
+			return workloadTarget{}, fmt.Errorf("cronjob %s/%s not found", namespace, name)
+		}
+		template := cj.Spec.JobTemplate.Spec.Template.Spec
+		return workloadTarget{
+			Ref:                          workloadRef{Kind: kind, Namespace: namespace, Name: name, UID: string(cj.UID)},
+			ServiceAccount:               template.ServiceAccountName,
+			AutomountServiceAccountToken: template.AutomountServiceAccountToken,
+		}, nil
+	default:
+		return workloadTarget{}, fmt.Errorf("unsupported workload kind %q", kind)
+	}
+}
+
+// credentialForConnection resolves the peer to a workload container and
+// issues its service account credential.
 // credentialForConnection also returns a short description of the caller for
-// the log line: the pid when nothing more is known, else namespace/pod and
-// the ServiceAccount the pod asks for.
+// the log line: the pid when nothing more is known, else the workload and the
+// ServiceAccount it asks for.
 func (s *Server) credentialForConnection(conn net.Conn) ([]byte, string, error) {
 	pid, err := peerPID(conn)
 	if err != nil {
@@ -196,11 +340,10 @@ func (s *Server) credentialForConnection(conn net.Conn) ([]byte, string, error) 
 	if err != nil {
 		return nil, who, fmt.Errorf("resolve peer container: %w", err)
 	}
-	ns, name := labels["io.kubernetes.pod.namespace"], labels["io.kubernetes.pod.name"]
-	if ns != "" && name != "" {
-		who = fmt.Sprintf("pod %s/%s", ns, name)
-		if pod, err := s.config.Store.GetPod(ns, name); err == nil && pod.Spec.ServiceAccountName != "" {
-			who += " serviceaccount " + pod.Spec.ServiceAccountName
+	if ref, ok := workloadRefFromLabels(labels); ok {
+		who = fmt.Sprintf("%s %s/%s", ref.Kind, ref.Namespace, ref.Name)
+		if target, err := lookupWorkloadTarget(s.config.Store, ref.Kind, ref.Namespace, ref.Name); err == nil && target.ServiceAccount != "" {
+			who += " serviceaccount " + target.ServiceAccount
 		}
 	}
 	data, err := s.credentialForLabels(labels)
@@ -208,35 +351,33 @@ func (s *Server) credentialForConnection(conn net.Conn) ([]byte, string, error) 
 }
 
 // credentialForLabels is the policy part of the socket: the labels must name
-// a stored pod, that pod must explicitly ask for a service account, automount
-// must not be disabled and the ServiceAccount must exist. Only then is a
-// certificate issued.
+// a stored pod, Job or CronJob, that object must explicitly ask for a service
+// account, automount must not be disabled and the ServiceAccount must exist.
+// Only then is a certificate issued.
 func (s *Server) credentialForLabels(labels map[string]string) ([]byte, error) {
-	namespace := labels["io.kubernetes.pod.namespace"]
-	podName := labels["io.kubernetes.pod.name"]
-	if namespace == "" || podName == "" {
-		return nil, fmt.Errorf("caller is not a q8s pod container")
+	ref, ok := workloadRefFromLabels(labels)
+	if !ok {
+		return nil, fmt.Errorf("caller is not a q8s workload container")
 	}
-	pod, err := s.config.Store.GetPod(namespace, podName)
+	target, err := lookupWorkloadTarget(s.config.Store, ref.Kind, ref.Namespace, ref.Name)
 	if err != nil {
-		return nil, fmt.Errorf("pod %s/%s not found", namespace, podName)
+		return nil, err
 	}
-	serviceAccount := pod.Spec.ServiceAccountName
-	if serviceAccount == "" {
-		return nil, fmt.Errorf("pod %s/%s does not request a service account", namespace, podName)
+	if target.ServiceAccount == "" {
+		return nil, fmt.Errorf("%s %s/%s does not request a service account", ref.Kind, ref.Namespace, ref.Name)
 	}
-	if pod.Spec.AutomountServiceAccountToken != nil && !*pod.Spec.AutomountServiceAccountToken {
-		return nil, fmt.Errorf("pod %s/%s disables service account credentials", namespace, podName)
+	if target.AutomountServiceAccountToken != nil && !*target.AutomountServiceAccountToken {
+		return nil, fmt.Errorf("%s %s/%s disables service account credentials", ref.Kind, ref.Namespace, ref.Name)
 	}
-	if _, err := s.config.Store.GetServiceAccount(namespace, serviceAccount); err != nil {
-		return nil, fmt.Errorf("serviceaccount %s/%s not found", namespace, serviceAccount)
+	if _, err := s.config.Store.GetServiceAccount(ref.Namespace, target.ServiceAccount); err != nil {
+		return nil, fmt.Errorf("serviceaccount %s/%s not found", ref.Namespace, target.ServiceAccount)
 	}
 
 	caCert, caKey, err := s.loadWorkloadCA()
 	if err != nil {
 		return nil, err
 	}
-	return issueServiceAccountCredential(caCert, caKey, namespace, serviceAccount, time.Now())
+	return issueServiceAccountCredentialForWorkload(caCert, caKey, target, time.Now())
 }
 
 // loadWorkloadCA reads the CA certificate and key from <dataDir>/certs, the
@@ -271,10 +412,24 @@ type execCredentialStatus struct {
 	ExpirationTimestamp   string `json:"expirationTimestamp"`
 }
 
-// issueServiceAccountCredential signs a one-hour client certificate for
-// system:serviceaccount:{namespace}:{name} and wraps it in an ExecCredential.
-// The optional now value makes the validity window deterministic in tests.
-func issueServiceAccountCredential(caCertPEM, caKeyPEM []byte, namespace, name string, now ...time.Time) ([]byte, error) {
+// issueServiceAccountCredentialForWorkload signs the certificate for a
+// workload's service account and binds it to that object with a URI SAN.
+func issueServiceAccountCredentialForWorkload(caCertPEM, caKeyPEM []byte, target workloadTarget, now ...time.Time) ([]byte, error) {
+	raw, err := target.Ref.URI()
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("build workload URI: %w", err)
+	}
+	return issueServiceAccountCredentialWithURIs(caCertPEM, caKeyPEM, target.Ref.Namespace, target.ServiceAccount, []*url.URL{u}, now...)
+}
+
+// issueServiceAccountCredentialWithURIs signs a one-hour client certificate
+// for system:serviceaccount:{namespace}:{name} and wraps it in an
+// ExecCredential. URIs are copied into the certificate's URI SANs.
+func issueServiceAccountCredentialWithURIs(caCertPEM, caKeyPEM []byte, namespace, name string, uris []*url.URL, now ...time.Time) ([]byte, error) {
 	if namespace == "" || name == "" {
 		return nil, fmt.Errorf("serviceaccount namespace and name are required")
 	}
@@ -285,11 +440,12 @@ func issueServiceAccountCredential(caCertPEM, caKeyPEM []byte, namespace, name s
 	at = at.Truncate(time.Second)
 	notBefore := at.Add(-time.Minute)
 	notAfter := at.Add(workloadCredentialTTL)
-	issued, err := install.IssueClientCertificateAt(
+	issued, err := install.IssueClientCertificateWithURIsAt(
 		caCertPEM,
 		caKeyPEM,
 		fmt.Sprintf("system:serviceaccount:%s:%s", namespace, name),
 		[]string{"system:serviceaccounts", "system:serviceaccounts:" + namespace},
+		uris,
 		notBefore,
 		notAfter,
 	)

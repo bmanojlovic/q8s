@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -237,5 +238,38 @@ func TestIssueClientCertificateAtUsesTheGivenWindow(t *testing.T) {
 	}
 	if _, err := IssueClientCertificateAt(ca.caCert, ca.caKey, "alice", nil, notAfter, notBefore); err == nil {
 		t.Fatal("an inverted validity window was accepted")
+	}
+}
+
+func TestIssueClientCertificateWithURIsAt(t *testing.T) {
+	ca := testCA(t)
+	notBefore := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	notAfter := notBefore.Add(time.Hour)
+	uri, err := url.Parse("urn:q8s:workload:pod:demo/web/1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	issued, err := IssueClientCertificateWithURIsAt(
+		ca.caCert,
+		ca.caKey,
+		"system:serviceaccount:demo:worker",
+		[]string{"system:serviceaccounts"},
+		[]*url.URL{uri},
+		notBefore,
+		notAfter,
+	)
+	if err != nil {
+		t.Fatalf("IssueClientCertificateWithURIsAt: %v", err)
+	}
+	block, _ := pem.Decode(issued.CertPEM)
+	if block == nil {
+		t.Fatal("certificate is not PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cert.URIs) != 1 || cert.URIs[0].String() != uri.String() {
+		t.Fatalf("URIs = %v, want [%s]", cert.URIs, uri)
 	}
 }

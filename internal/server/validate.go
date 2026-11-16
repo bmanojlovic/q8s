@@ -3,12 +3,14 @@ package server
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/quadlet"
 )
 
@@ -591,13 +593,40 @@ func validatePodAnnotations(kind string, spec *corev1.PodSpec, annotations map[s
 	return nil
 }
 
+// objectIdentityMatchesURL makes the object from a request body name the same
+// object as the URL: an empty namespace (and an empty name on a named URL) is
+// filled in from the URL. A differing namespace or name is refused with the
+// Kubernetes messages, and the Status has already been written. Every
+// namespaced create, update, patch and apply path uses this helper so
+// authorization always sees the namespace the object will be stored in.
+func (s *Server) objectIdentityMatchesURL(w http.ResponseWriter, obj metav1.Object, urlNS, urlName string) bool {
+	if obj.GetNamespace() == "" {
+		obj.SetNamespace(urlNS)
+	} else if obj.GetNamespace() != urlNS {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest",
+			"the namespace of the provided object does not match the namespace sent on the request")
+		return false
+	}
+	if urlName == "" {
+		return true
+	}
+	if obj.GetName() == "" {
+		obj.SetName(urlName)
+	} else if obj.GetName() != urlName {
+		s.respondStatus(w, http.StatusBadRequest, "BadRequest",
+			"the name of the object (%s) does not match the name on the URL (%s)", obj.GetName(), urlName)
+		return false
+	}
+	return true
+}
+
 // validatePatchedIdentity checks that a PATCH did not alter the object's
 // namespace or name. Real k8s rejects metadata.name/namespace changes, and
-// q8s's Store.Update* keys on the patched object's own identity — so a
-// patch that changed them would either fail the lookup (benign 404-shaped
-// InternalError) or, when a same-named object exists at the target identity,
-// silently re-key and overwrite that other object. Enforcing immutability
-// here keeps the identity that the POST-time validateName call vetted.
+// q8s's Store.Update* keys on the patched object's own identity, so a patch
+// that changed them would either fail the lookup or silently re-key and
+// overwrite another object. namespaced handlers use
+// objectIdentityMatchesURL; this error-returning form stays for the
+// cluster-scoped RBAC path.
 func validatePatchedIdentity(kind, patchedNS, patchedName, urlNS, urlName string) error {
 	if err := validateName("namespace", patchedNS); err != nil {
 		return err
@@ -605,8 +634,11 @@ func validatePatchedIdentity(kind, patchedNS, patchedName, urlNS, urlName string
 	if err := validateName("name", patchedName); err != nil {
 		return err
 	}
-	if patchedNS != urlNS || patchedName != urlName {
-		return fmt.Errorf("%s %q: namespace and name are immutable", kind, urlName)
+	if patchedNS != urlNS {
+		return fmt.Errorf("the namespace of the provided object does not match the namespace sent on the request")
+	}
+	if patchedName != urlName {
+		return fmt.Errorf("the name of the object (%s) does not match the name on the URL (%s)", patchedName, urlName)
 	}
 	return nil
 }

@@ -205,8 +205,8 @@ func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request, ns, name st
 		}
 		role.APIVersion = rbacAPIVersion
 		role.Kind = "Role"
-		if role.Namespace == "" {
-			role.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &role, ns, "") {
+			return
 		}
 		if err := validateName("namespace", role.Namespace); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
@@ -233,13 +233,14 @@ func (s *Server) handleRoles(w http.ResponseWriter, r *http.Request, ns, name st
 		}
 		role.APIVersion = rbacAPIVersion
 		role.Kind = "Role"
-		if role.Namespace == "" {
-			role.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &role, ns, name) {
+			return
 		}
-		if role.Name == "" {
-			role.Name = name
+		if err := validateName("namespace", role.Namespace); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
 		}
-		if err := validatePatchedIdentity("role", role.Namespace, role.Name, ns, name); err != nil {
+		if err := validateName("name", role.Name); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -327,8 +328,8 @@ func (s *Server) handleRoleBindings(w http.ResponseWriter, r *http.Request, ns, 
 		}
 		rb.APIVersion = rbacAPIVersion
 		rb.Kind = "RoleBinding"
-		if rb.Namespace == "" {
-			rb.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &rb, ns, "") {
+			return
 		}
 		if err := validateName("namespace", rb.Namespace); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
@@ -360,13 +361,14 @@ func (s *Server) handleRoleBindings(w http.ResponseWriter, r *http.Request, ns, 
 		}
 		rb.APIVersion = rbacAPIVersion
 		rb.Kind = "RoleBinding"
-		if rb.Namespace == "" {
-			rb.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &rb, ns, name) {
+			return
 		}
-		if rb.Name == "" {
-			rb.Name = name
+		if err := validateName("namespace", rb.Namespace); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
 		}
-		if err := validatePatchedIdentity("rolebinding", rb.Namespace, rb.Name, ns, name); err != nil {
+		if err := validateName("name", rb.Name); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -720,6 +722,11 @@ func (s *Server) patchRBACObject(w http.ResponseWriter, r *http.Request, existin
 	if !ok {
 		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "patched object has no metadata")
 		return false
+	}
+	if ns != "" {
+		if !s.objectIdentityMatchesURL(w, meta, ns, name) {
+			return false
+		}
 	}
 	if err := validateRBACIdentity(kind, meta.GetNamespace(), meta.GetName(), ns, name); err != nil {
 		s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())

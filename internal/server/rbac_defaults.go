@@ -52,27 +52,30 @@ func clusterAdminClusterRole() *rbacv1.ClusterRole {
 }
 
 func editClusterRole() *rbacv1.ClusterRole {
-	role := newBuiltinClusterRole("edit", viewClusterRole().Rules)
-	role.Rules = append(role.Rules,
-		rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"configmaps", "persistentvolumeclaims", "pods", "secrets", "serviceaccounts", "services"}, Verbs: writeVerbs},
-		rbacv1.PolicyRule{APIGroups: []string{"apps"}, Resources: []string{"daemonsets", "deployments", "replicasets", "statefulsets"}, Verbs: writeVerbs},
-		rbacv1.PolicyRule{APIGroups: []string{"batch"}, Resources: []string{"cronjobs", "jobs"}, Verbs: writeVerbs},
-		rbacv1.PolicyRule{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"ingresses"}, Verbs: writeVerbs},
-		rbacv1.PolicyRule{APIGroups: []string{"traefik.io"}, Resources: []string{"ingressroutetcps", "middlewares"}, Verbs: writeVerbs},
-		rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods/attach", "pods/exec", "pods/portforward"}, Verbs: []string{"create"}},
-		rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"pods/log"}, Verbs: []string{"get"}},
+	role := newBuiltinClusterRole("edit", []rbacv1.PolicyRule{
+		{APIGroups: []string{""}, Resources: []string{"configmaps", "persistentvolumeclaims", "pods", "secrets", "serviceaccounts", "services"}, Verbs: writeVerbs},
+		{APIGroups: []string{"apps"}, Resources: []string{"daemonsets", "deployments", "replicasets", "statefulsets"}, Verbs: writeVerbs},
+		{APIGroups: []string{"batch"}, Resources: []string{"cronjobs", "jobs"}, Verbs: writeVerbs},
+		{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"ingresses"}, Verbs: writeVerbs},
+		{APIGroups: []string{"traefik.io"}, Resources: []string{"ingressroutetcps", "middlewares"}, Verbs: writeVerbs},
+		{APIGroups: []string{""}, Resources: []string{"pods/attach", "pods/exec", "pods/portforward"}, Verbs: []string{"create"}},
+		{APIGroups: []string{""}, Resources: []string{"pods/log"}, Verbs: []string{"get"}},
 		// Kubernetes edit reads Secrets in full (view deliberately does not).
-		rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: readVerbs},
-	)
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: readVerbs},
+	})
+	// edit aggregates every ClusterRole labelled aggregate-to-edit, which
+	// includes the built-in view role.
+	role.Labels[aggregateToAdminLabel] = "true"
 	role.AggregationRule = aggregationRule(aggregateToEditLabel)
 	return role
 }
 
 func adminClusterRole() *rbacv1.ClusterRole {
-	role := newBuiltinClusterRole("admin", editClusterRole().Rules)
-	role.Rules = append(role.Rules,
-		rbacv1.PolicyRule{APIGroups: []string{rbacAPIGroup}, Resources: []string{"roles", "rolebindings"}, Verbs: readVerbs},
-	)
+	role := newBuiltinClusterRole("admin", []rbacv1.PolicyRule{
+		{APIGroups: []string{rbacAPIGroup}, Resources: []string{"roles", "rolebindings"}, Verbs: readVerbs},
+	})
+	// admin aggregates every ClusterRole labelled aggregate-to-admin, which
+	// includes the built-in edit role (and through it view).
 	role.AggregationRule = aggregationRule(aggregateToAdminLabel)
 	return role
 }
@@ -90,6 +93,9 @@ func viewClusterRole() *rbacv1.ClusterRole {
 		{APIGroups: []string{"metrics.k8s.io"}, Resources: []string{"nodes", "pods"}, Verbs: readVerbs},
 		{APIGroups: []string{"apiextensions.k8s.io"}, Resources: []string{"customresourcedefinitions"}, Verbs: readVerbs},
 	})
+	// view is aggregated into edit (and then admin) through its label; its
+	// own aggregationRule picks up ClusterRoles labelled aggregate-to-view.
+	role.Labels[aggregateToEditLabel] = "true"
 	role.AggregationRule = aggregationRule(aggregateToViewLabel)
 	return role
 }

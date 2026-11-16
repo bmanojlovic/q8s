@@ -1860,8 +1860,8 @@ func TestCronJobUpdatePutNameMismatch(t *testing.T) {
 	assertStatus(t, resp, http.StatusBadRequest)
 	m := decodeBody(t, resp)
 	msg, _ := m["message"].(string)
-	if !strings.Contains(msg, "namespace and name are immutable") {
-		t.Fatalf("expected immutable identity message, got %q", msg)
+	if !strings.Contains(msg, "the name of the object (other-cron) does not match the name on the URL (origin-cron)") {
+		t.Fatalf("expected name mismatch message, got %q", msg)
 	}
 }
 

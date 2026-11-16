@@ -72,8 +72,8 @@ func (s *Server) handleMiddlewares(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		mw.APIVersion = traefik.APIVersion
 		mw.Kind = "Middleware"
-		if mw.Namespace == "" {
-			mw.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &mw, ns, "") {
+			return
 		}
 		if err := validateName("namespace", mw.Namespace); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
@@ -101,13 +101,14 @@ func (s *Server) handleMiddlewares(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		mw.APIVersion = traefik.APIVersion
 		mw.Kind = "Middleware"
-		if mw.Namespace == "" {
-			mw.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &mw, ns, name) {
+			return
 		}
-		if mw.Name == "" {
-			mw.Name = name
+		if err := validateName("namespace", mw.Namespace); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
 		}
-		if err := validatePatchedIdentity("middleware", mw.Namespace, mw.Name, ns, name); err != nil {
+		if err := validateName("name", mw.Name); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -202,8 +203,8 @@ func (s *Server) handleIngressRouteTCPs(w http.ResponseWriter, r *http.Request, 
 		}
 		irt.APIVersion = traefik.APIVersion
 		irt.Kind = "IngressRouteTCP"
-		if irt.Namespace == "" {
-			irt.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &irt, ns, "") {
+			return
 		}
 		if err := validateName("namespace", irt.Namespace); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
@@ -235,13 +236,14 @@ func (s *Server) handleIngressRouteTCPs(w http.ResponseWriter, r *http.Request, 
 		}
 		irt.APIVersion = traefik.APIVersion
 		irt.Kind = "IngressRouteTCP"
-		if irt.Namespace == "" {
-			irt.Namespace = ns
+		if !s.objectIdentityMatchesURL(w, &irt, ns, name) {
+			return
 		}
-		if irt.Name == "" {
-			irt.Name = name
+		if err := validateName("namespace", irt.Namespace); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
 		}
-		if err := validatePatchedIdentity("ingressroutetcp", irt.Namespace, irt.Name, ns, name); err != nil {
+		if err := validateName("name", irt.Name); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
@@ -372,7 +374,14 @@ func (s *Server) patchTraefikObject(w http.ResponseWriter, r *http.Request, exis
 		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "patched object has no metadata")
 		return nil, false
 	}
-	if err := validatePatchedIdentity(kind, meta.GetNamespace(), meta.GetName(), ns, name); err != nil {
+	if !s.objectIdentityMatchesURL(w, meta, ns, name) {
+		return nil, false
+	}
+	if err := validateName("namespace", meta.GetNamespace()); err != nil {
+		s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+		return nil, false
+	}
+	if err := validateName("name", meta.GetName()); err != nil {
 		s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 		return nil, false
 	}
