@@ -48,11 +48,11 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 	// fieldManager and force are accepted and ignored: q8s keeps no
 	// managedFields, so there is no per-manager ownership to conflict. Apply
 	// here means the applier owns the user sections, as described above.
-	if attrs := parseRequestAttributes(r); attrs.IsResourceRequest && attrs.Subresource != "" {
-		// The create fallback below would otherwise POST to a subresource URL
-		// that authorizeMiddleware authorized for the original PATCH verb.
-		// q8s deliberately supports no apply on a subresource, so refuse them
-		// all rather than fall through to the named object handler.
+	attrs := parseRequestAttributes(r)
+	if attrs.IsResourceRequest && attrs.Subresource != "" && attrs.Subresource != "scale" {
+		// Apply reads the target through the handler chain without a second
+		// authorization, so it must never reach a streaming subresource such
+		// as pods/exec. scale is the only subresource with a PATCH handler.
 		s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
 			"server-side apply is not supported on subresource %q", attrs.Subresource)
 		return
@@ -95,7 +95,13 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "invalid object URL %q", r.URL.Path)
 		return
 	}
-	urlName := path.Base(urlPath)
+	// On a subresource URL the last segment names the subresource, so the
+	// object name is the one before it. parseRequestAttributes already split
+	// the path that way.
+	urlName := attrs.Name
+	if urlName == "" {
+		urlName = path.Base(urlPath)
+	}
 	name, _ := metadata["name"].(string)
 	if name == "" {
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "apply body must contain metadata.name")
@@ -104,9 +110,6 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 	namespace, _ := metadata["namespace"].(string)
 	meta := metav1.ObjectMeta{Name: name, Namespace: namespace}
 	if !s.objectIdentityMatchesURL(w, &meta, namespaceFromURLPath(urlPath), urlName) {
-		return
-	}
-	if s.rejectAppliedHostAccess(w, r, js) {
 		return
 	}
 
@@ -124,6 +127,14 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 	next.ServeHTTP(existing, getRequest)
 
 	if existing.Code == http.StatusNotFound {
+		if attrs.IsResourceRequest && attrs.Subresource != "" {
+			// A create on a subresource URL makes no sense. The original PATCH
+			// was authorized as patch on the subresource, and there is no
+			// collection URL to fall back to for it.
+			s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
+				"server-side apply on subresource %q requires the target object to exist", attrs.Subresource)
+			return
+		}
 		collectionPath := urlPath[:lastSlash]
 		createRequest := r.Clone(r.Context())
 		createRequest.Method = http.MethodPost
@@ -134,12 +145,9 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 		// here, the same way that middleware would. Parsing the collection
 		// path rather than reusing the object attributes gets the namespace
 		// right for cluster-scoped objects such as Namespace.
-		if u, ok := callerInfo(r); ok && !isAdmin(u) {
-			createAttrs := parseRequestAttributes(createRequest)
-			if allowed, _ := s.authorize(u, createAttrs); !allowed {
-				s.respondStatus(w, http.StatusForbidden, "Forbidden", "%s", forbiddenMessage(u, createAttrs))
-				return
-			}
+		createAttrs := parseRequestAttributes(createRequest)
+		if !s.authorizeOrRespond(w, r, createAttrs) {
+			return
 		}
 
 		createRequest.Body = io.NopCloser(bytes.NewReader(js))
@@ -155,15 +163,25 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 		return
 	}
 
-	var current map[string]interface{}
-	if err := json.Unmarshal(existing.Body.Bytes(), &current); err != nil {
-		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "decode existing object: %s", err.Error())
-		return
-	}
-	patchBody, err := json.Marshal(applyPatchOpsForKind(kind, current, applied))
-	if err != nil {
-		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "build apply patch: %s", err.Error())
-		return
+	patchContentType := "application/json-patch+json"
+	var patchBody []byte
+	if attrs.IsResourceRequest && attrs.Subresource != "" {
+		// A subresource handler serves its own object shape (a Scale object
+		// for deployments/scale), so send the applied object as a merge patch
+		// instead of JSON Patch ops built from the main resource.
+		patchContentType = "application/merge-patch+json"
+		patchBody = js
+	} else {
+		var current map[string]interface{}
+		if err := json.Unmarshal(existing.Body.Bytes(), &current); err != nil {
+			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "decode existing object: %s", err.Error())
+			return
+		}
+		patchBody, err = json.Marshal(applyPatchOpsForKind(kind, current, applied))
+		if err != nil {
+			s.respondStatus(w, http.StatusInternalServerError, "InternalError", "build apply patch: %s", err.Error())
+			return
+		}
 	}
 
 	patchRequest := r.Clone(r.Context())
@@ -171,7 +189,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 	patchRequest.Body = io.NopCloser(bytes.NewReader(patchBody))
 	patchRequest.ContentLength = int64(len(patchBody))
 	patchRequest.Header = r.Header.Clone()
-	patchRequest.Header.Set("Content-Type", "application/json-patch+json")
+	patchRequest.Header.Set("Content-Type", patchContentType)
 	patchRequest.Header.Del("Content-Length")
 	next.ServeHTTP(w, patchRequest)
 }

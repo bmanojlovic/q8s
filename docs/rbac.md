@@ -38,13 +38,16 @@ same way the Kubernetes authorizer builds them:
 | pods `log` | `get` |
 
 Rule matching follows Kubernetes: `*` matches every verb, API group and
-resource; `resourceNames` is an exact list of names, a rule with resourceNames
-never grants a collection request, and it never grants `create`; `pods/*`
+resource; `resourceNames` is an exact list of names and never grants a request
+without a name, so it cannot grant a collection request but can grant `exec`,
+`attach` or `portforward` (verb `create`) on the named pod it lists; `pods/*`
 grants every pod subresource, and a rule naming `pods` does not grant
 `pods/log`. A `POST` to a named object URL is answered with 405
-MethodNotAllowed; only the collection URL creates an object, and the named
-subresources that take POST (`pods/exec`, `pods/attach`, `pods/portforward`,
-`pods/eviction`, bindings) are the exception. A RoleBinding
+MethodNotAllowed after authentication and authorization, so an unauthenticated
+request still gets 401 and an unauthorized one 403; only the collection URL
+creates an object, and the named subresources that take POST (`pods/exec`,
+`pods/attach`, `pods/portforward`, `pods/eviction`, bindings) are the
+exception. A RoleBinding
 may point at a Role in its namespace or at a ClusterRole, and the ClusterRole
 rules then apply only in that namespace. ClusterRoleBindings apply in every
 namespace. Aggregation through `aggregationRule` is evaluated at request time.
@@ -72,8 +75,10 @@ Host access is administrator-only, independent of the RBAC verbs a user
 holds. A non-administrator who creates, updates or patches a Pod, Deployment,
 Job, CronJob or PersistentVolumeClaim that uses any of these fields gets 403
 Forbidden, even when the change itself leaves the host-access field untouched.
-A non-administrator also cannot scale a Deployment whose pod template has
-host access, and deletes remain governed by RBAC.
+Scaling is not a host-access change: a non-administrator with `patch` or
+`update` on `deployments/scale` may scale a Deployment whose pod template has
+host access, including to zero, because only `spec.replicas` changes. Deletes
+remain governed by RBAC.
 
 - any container or initContainer with
   `securityContext.privileged: true`
@@ -81,12 +86,16 @@ host access, and deletes remain governed by RBAC.
 - `spec.hostIPC: true`
 - `spec.hostNetwork: true`
 - `spec.hostUsers: true`
-- a PersistentVolumeClaim with `storageClassName: hostpath` or the
-  `q8s.io/host-path` annotation
+- a PersistentVolumeClaim whose resolved storage class is `hostpath` (an
+  empty `storageClassName` resolves to `standard`, so it is not host access)
+  or, on such a claim, the `q8s.io/host-path` annotation
+- the `q8s.io/attach-all-networks: "true"` annotation on a Pod or on a pod
+  template
 
-These fields either disable the rootful user namespace or join a host
-namespace, so they are equivalent to root on the host: a q8s administrator
-is trusted like root on the machine (or the owner of the account, rootless).
+These fields either disable the rootful user namespace, join a host namespace
+or join every namespace network, so they are equivalent to root on the host: a
+q8s administrator is trusted like root on the machine (or the owner of the
+account, rootless).
 A pod of an ordinary user may still mount a hostpath PersistentVolumeClaim
 that an administrator created in its namespace; creating the claim is the
 administrator's decision to hand that directory to the namespace. The GPU device

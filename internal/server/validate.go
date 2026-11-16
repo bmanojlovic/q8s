@@ -462,7 +462,7 @@ func validateSingleContainer(kind string, spec *corev1.PodSpec, allowMultipleCon
 // annAttachAllNetworks asks q8s to attach the pod to every namespace
 // network. Only pods carrying this opted-in annotation may join a network
 // outside their own namespace.
-const annAttachAllNetworks = "q8s.io/attach-all-networks"
+const annAttachAllNetworks = quadlet.AnnotationAttachAllNetworks
 
 // validatePodSpecShape applies the q8s-only pod spec restrictions shared by
 // Pods, Deployments, Jobs and CronJobs. Besides the probe shapes, it rejects

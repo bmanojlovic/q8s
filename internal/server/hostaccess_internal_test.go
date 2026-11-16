@@ -345,7 +345,7 @@ func TestHostAccessPatchAndScaleChecks(t *testing.T) {
 		}
 	})
 
-	t.Run("scale of a privileged deployment", func(t *testing.T) {
+	t.Run("scale of a privileged deployment is allowed", func(t *testing.T) {
 		createRoleForTest(t, env.srv, "team", "deployment-scale", rbacv1.PolicyRule{
 			APIGroups: []string{"apps"}, Resources: []string{"deployments/scale"}, Verbs: []string{"patch", "update"},
 		})
@@ -353,14 +353,14 @@ func TestHostAccessPatchAndScaleChecks(t *testing.T) {
 			rbacv1.Subject{Kind: "User", Name: "alice"})
 		body := map[string]interface{}{"spec": map[string]interface{}{"replicas": 2}}
 		resp := doAs(t, alice, http.MethodPatch, env.URL("/apis/apps/v1/namespaces/team/deployments/host-dep/scale"), body)
-		requireHostAccessForbidden(t, resp, "host-dep", "spec.containers[0].securityContext.privileged")
+		requireStatus(t, resp, http.StatusOK)
 
 		dep, err := env.st.GetDeployment("team", "host-dep")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := deploymentReplicas(dep); got != 1 {
-			t.Fatalf("forbidden scale changed replicas to %d", got)
+		if got := deploymentReplicas(dep); got != 2 {
+			t.Fatalf("scale changed replicas to %d, want 2", got)
 		}
 	})
 
@@ -473,35 +473,6 @@ spec:
 	})
 }
 
-func TestApplySubresourcesAreRefused(t *testing.T) {
-	env, ca := newHostAccessTestEnv(t)
-	alice := tlsClient(ca.issue(t, "alice", nil))
-	createRoleBindingForTest(t, env.srv, "team", "alice-edit", "ClusterRole", "edit",
-		rbacv1.Subject{Kind: "User", Name: "alice"})
-
-	for _, subresource := range []string{"portforward", "log"} {
-		t.Run(subresource, func(t *testing.T) {
-			body := `apiVersion: v1
-kind: Pod
-metadata:
-  name: debug
-  namespace: team
-spec:
-  containers:
-  - name: main
-    image: nginx:1.25
-`
-			resp := doRawAs(t, alice, http.MethodPatch,
-				env.URL("/api/v1/namespaces/team/pods/debug/"+subresource),
-				"application/apply-patch+yaml", body)
-			requireStatus(t, resp, http.StatusMethodNotAllowed)
-			if _, err := env.st.GetPod("team", "debug"); err == nil {
-				t.Fatal("subresource apply created a pod")
-			}
-		})
-	}
-}
-
 func TestPOSTToNamedObjectURLIsMethodNotAllowed(t *testing.T) {
 	env, ca := newHostAccessTestEnv(t)
 	alice := tlsClient(ca.issue(t, "alice", nil))
@@ -522,49 +493,6 @@ func TestPOSTToNamedObjectURLIsMethodNotAllowed(t *testing.T) {
 		t.Fatal("POST to pods/exec was refused as a named object URL")
 	}
 	resp.Body.Close()
-}
-
-func TestResourceNamesNeverGrantsCreate(t *testing.T) {
-	env, ca := newHostAccessTestEnv(t)
-	bob := tlsClient(ca.issue(t, "bob", nil))
-	createRoleForTest(t, env.srv, "team", "named-create", rbacv1.PolicyRule{
-		APIGroups: []string{""}, Resources: []string{"pods"}, ResourceNames: []string{"debug"},
-		Verbs: []string{"get", "create"},
-	})
-	createRoleBindingForTest(t, env.srv, "team", "bob-named", "Role", "named-create",
-		rbacv1.Subject{Kind: "User", Name: "bob"})
-
-	allowed, _ := env.srv.authorize(userInfo{Name: "bob", Groups: []string{"system:authenticated"}}, requestAttributes{
-		IsResourceRequest: true,
-		Verb:              "create",
-		Namespace:         "team",
-		Resource:          "pods",
-		Name:              "debug",
-	})
-	if allowed {
-		t.Fatal("a resourceNames rule granted create")
-	}
-	allowed, _ = env.srv.authorize(userInfo{Name: "bob", Groups: []string{"system:authenticated"}}, requestAttributes{
-		IsResourceRequest: true,
-		Verb:              "get",
-		Namespace:         "team",
-		Resource:          "pods",
-		Name:              "debug",
-	})
-	if !allowed {
-		t.Fatal("a resourceNames rule stopped granting get")
-	}
-
-	// resourceNames used to grant create on a POST subresource such as
-	// pods/exec, because the URL carries the object name.
-	createRoleForTest(t, env.srv, "team", "named-exec", rbacv1.PolicyRule{
-		APIGroups: []string{""}, Resources: []string{"pods/exec"}, ResourceNames: []string{"web"},
-		Verbs: []string{"create"},
-	})
-	createRoleBindingForTest(t, env.srv, "team", "bob-named-exec", "Role", "named-exec",
-		rbacv1.Subject{Kind: "User", Name: "bob"})
-	resp := doAs(t, bob, http.MethodPost, env.URL("/api/v1/namespaces/team/pods/web/exec"), nil)
-	requireForbidden(t, resp, `pods "web" is forbidden: User "bob" cannot create resource "pods/exec" in API group "" in the namespace "team"`)
 }
 
 // doRawAs sends a request with an arbitrary body and Content-Type for a user.

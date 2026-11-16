@@ -277,11 +277,12 @@ func resourceRuleMatches(rule rbacv1.PolicyRule, a requestAttributes) bool {
 		return false
 	}
 	if len(rule.ResourceNames) > 0 {
-		// resourceNames never applies to create in Kubernetes: the object
-		// does not exist when authorization runs, so a name list could not
-		// reliably identify it. A rule restricted to names also never grants
-		// a request without a name, such as list, watch or deletecollection.
-		if a.Verb == "create" || a.Name == "" {
+		// A rule restricted to names never grants a request without a name,
+		// such as list, watch or deletecollection. A named create is always a
+		// named subresource (pods/exec, pods/attach, pods/portforward): a POST
+		// to a named object URL is refused with 405, so resourceNames can
+		// grant those without making collection create possible.
+		if a.Name == "" {
 			return false
 		}
 		for _, candidate := range rule.ResourceNames {
@@ -340,31 +341,48 @@ func resourceMatches(resources []string, resource, subresource string) bool {
 // or a development-mode request, which stays unrestricted as before.
 func (s *Server) authorizeMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, ok := userFromContext(r.Context())
-		if !ok {
-			next.ServeHTTP(w, r)
-			return
-		}
-		impersonated, err := applyImpersonation(r, u)
-		if err != nil {
-			status := http.StatusBadRequest
-			reason := "BadRequest"
-			if err.forbidden {
-				status = http.StatusForbidden
-				reason = "Forbidden"
-			}
-			s.respondStatus(w, status, reason, "%s", err.message)
-			return
-		}
-		u = impersonated
-		r = r.WithContext(withUserInfo(r.Context(), u))
 		a := parseRequestAttributes(r)
-		if allowed, _ := s.authorize(u, a); allowed {
-			next.ServeHTTP(w, r)
+		if u, ok := userFromContext(r.Context()); ok {
+			impersonated, err := applyImpersonation(r, u)
+			if err != nil {
+				status := http.StatusBadRequest
+				reason := "BadRequest"
+				if err.forbidden {
+					status = http.StatusForbidden
+					reason = "Forbidden"
+				}
+				s.respondStatus(w, status, reason, "%s", err.message)
+				return
+			}
+			r = r.WithContext(withUserInfo(r.Context(), impersonated))
+			if !s.authorizeOrRespond(w, r, a) {
+				return
+			}
+		}
+		// Authentication and authorization have run by now, so a POST to a
+		// named object URL may be answered 405 without hiding a 401 or 403.
+		if isPOSTToNamedObject(r.Method, a) {
+			s.respondStatus(w, http.StatusMethodNotAllowed, "MethodNotAllowed",
+				"the server does not allow this method on the requested resource")
 			return
 		}
-		s.respondStatus(w, http.StatusForbidden, "Forbidden", "%s", forbiddenMessage(u, a))
+		next.ServeHTTP(w, r)
 	})
+}
+
+// authorizeOrRespond reports whether the caller may perform attrs and writes
+// the Kubernetes-shaped 403 when it may not. A request without an
+// authenticated identity is allowed, matching development mode.
+func (s *Server) authorizeOrRespond(w http.ResponseWriter, r *http.Request, attrs requestAttributes) bool {
+	u, ok := callerInfo(r)
+	if !ok {
+		return true
+	}
+	if allowed, _ := s.authorize(u, attrs); allowed {
+		return true
+	}
+	s.respondStatus(w, http.StatusForbidden, "Forbidden", "%s", forbiddenMessage(u, attrs))
+	return false
 }
 
 // forbiddenMessage builds the Kubernetes-shaped message for a denied request.

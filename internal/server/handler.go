@@ -954,7 +954,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "Pod", pod.Name, hostAccessReasons(pod.Spec)) {
+		if s.rejectHostAccess(w, r, "Pod", pod.Name, quadlet.HostAccessReasons(pod.Spec, pod.Annotations)) {
 			return
 		}
 		// Fail fast with a proper 400 instead of storing the pod and only
@@ -1057,7 +1057,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "Pod", patched.Name, hostAccessReasons(patched.Spec)) {
+		if s.rejectHostAccess(w, r, "Pod", patched.Name, quadlet.HostAccessReasons(patched.Spec, patched.Annotations)) {
 			return
 		}
 		// Same fail-fast dry-run as create: a patch whose merged spec can't
@@ -2230,7 +2230,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "Deployment", dep.Name, hostAccessReasons(dep.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "Deployment", dep.Name, quadlet.HostAccessReasons(dep.Spec.Template.Spec, dep.Spec.Template.Annotations)) {
 			return
 		}
 		created, err := s.config.Store.CreateDeployment(&dep)
@@ -2272,7 +2272,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "Deployment", dep.Name, hostAccessReasons(dep.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "Deployment", dep.Name, quadlet.HostAccessReasons(dep.Spec.Template.Spec, dep.Spec.Template.Annotations)) {
 			return
 		}
 		existing, err := s.config.Store.GetDeployment(ns, name)
@@ -2358,7 +2358,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "Deployment", patched.Name, hostAccessReasons(patched.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "Deployment", patched.Name, quadlet.HostAccessReasons(patched.Spec.Template.Spec, patched.Spec.Template.Annotations)) {
 			return
 		}
 		updated, err := s.config.Store.UpdateDeployment(&patched)
@@ -2405,11 +2405,8 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 		return
 	}
-	if r.Method == http.MethodPatch || r.Method == http.MethodPut {
-		if s.rejectHostAccess(w, r, "Deployment", dep.Name, hostAccessReasons(dep.Spec.Template.Spec)) {
-			return
-		}
-	}
+	// Scaling changes only replicas, so it is not a host-access change even
+	// when the pod template uses host access. RBAC still governs it.
 	scaleResp := func(dep *appsv1.Deployment) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2817,7 +2814,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "Job", job.Name, hostAccessReasons(job.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "Job", job.Name, quadlet.HostAccessReasons(job.Spec.Template.Spec, job.Spec.Template.Annotations)) {
 			return
 		}
 		ensureJobPodIdentity(&job)
@@ -2859,7 +2856,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "Job", job.Name, hostAccessReasons(job.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "Job", job.Name, quadlet.HostAccessReasons(job.Spec.Template.Spec, job.Spec.Template.Annotations)) {
 			return
 		}
 		existing, err := s.config.Store.GetJob(ns, name)
@@ -2950,7 +2947,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "Job", patched.Name, hostAccessReasons(patched.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "Job", patched.Name, quadlet.HostAccessReasons(patched.Spec.Template.Spec, patched.Spec.Template.Annotations)) {
 			return
 		}
 		ensureJobPodIdentity(&patched)
@@ -3049,7 +3046,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "CronJob", cj.Name, hostAccessReasons(cj.Spec.JobTemplate.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "CronJob", cj.Name, quadlet.HostAccessReasons(cj.Spec.JobTemplate.Spec.Template.Spec, cj.Spec.JobTemplate.Spec.Template.Annotations)) {
 			return
 		}
 		created, err := s.config.Store.CreateCronJob(&cj)
@@ -3094,7 +3091,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "CronJob", cj.Name, hostAccessReasons(cj.Spec.JobTemplate.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "CronJob", cj.Name, quadlet.HostAccessReasons(cj.Spec.JobTemplate.Spec.Template.Spec, cj.Spec.JobTemplate.Spec.Template.Annotations)) {
 			return
 		}
 		existing, err := s.config.Store.GetCronJob(ns, name)
@@ -3178,7 +3175,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		if s.rejectHostAccess(w, r, "CronJob", patched.Name, hostAccessReasons(patched.Spec.JobTemplate.Spec.Template.Spec)) {
+		if s.rejectHostAccess(w, r, "CronJob", patched.Name, quadlet.HostAccessReasons(patched.Spec.JobTemplate.Spec.Template.Spec, patched.Spec.JobTemplate.Spec.Template.Annotations)) {
 			return
 		}
 		updated, err := s.config.Store.UpdateCronJob(&patched)

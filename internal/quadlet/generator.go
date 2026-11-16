@@ -248,20 +248,12 @@ func podUsesUserNS(spec corev1.PodSpec) bool {
 	if !userNSEnabled {
 		return false
 	}
-	if spec.HostNetwork || spec.HostPID || spec.HostIPC {
+	// Every host access reason (a privileged container or a host namespace)
+	// means the pod keeps the host user namespace.
+	if len(HostAccessReasons(spec, nil)) > 0 {
 		return false
 	}
-	for _, c := range spec.InitContainers {
-		if containerPrivileged(c) {
-			return false
-		}
-	}
-	for _, c := range spec.Containers {
-		if containerPrivileged(c) {
-			return false
-		}
-	}
-	return spec.HostUsers == nil || !*spec.HostUsers
+	return true
 }
 
 // writeUserNS emits the UserNS= line for a pod that owns its user namespace.
