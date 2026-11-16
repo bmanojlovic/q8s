@@ -772,6 +772,7 @@ func cmdServe() {
 	if err := srv.Shutdown(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "server shutdown error: %v\n", err)
 	}
+	st.Close()
 	daemon.SdNotify(false, daemon.SdNotifyStopping)
 	fmt.Println("q8s API server stopped")
 }

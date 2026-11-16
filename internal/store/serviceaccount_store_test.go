@@ -22,6 +22,7 @@ func TestServiceAccountPersistenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load (new file): %v", err)
 	}
+	t.Cleanup(st1.Close)
 	created, err := st1.CreateServiceAccount(makeServiceAccount("default", "worker"))
 	if err != nil {
 		t.Fatalf("CreateServiceAccount: %v", err)
@@ -43,7 +44,7 @@ func TestServiceAccountPersistenceRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPurgeNamespaceRemovesServiceAccounts(t *testing.T) {
+func TestDeleteNamespaceWithResourcesRemovesServiceAccounts(t *testing.T) {
 	st := store.New()
 	if _, err := st.CreateServiceAccount(makeServiceAccount("default", "worker")); err != nil {
 		t.Fatal(err)
@@ -52,7 +53,9 @@ func TestPurgeNamespaceRemovesServiceAccounts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st.PurgeNamespace("default")
+	if err := st.DeleteNamespaceWithResources("default"); err != nil {
+		t.Fatalf("DeleteNamespaceWithResources: %v", err)
+	}
 
 	if _, err := st.GetServiceAccount("default", "worker"); err == nil {
 		t.Fatal("default ServiceAccount survived namespace purge")

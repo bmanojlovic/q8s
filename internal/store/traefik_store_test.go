@@ -48,6 +48,7 @@ func TestTraefikKindsPersistenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load (new file): %v", err)
 	}
+	t.Cleanup(st1.Close)
 	createdMW, err := st1.CreateMiddleware(makeMiddleware("default", "allow"))
 	if err != nil {
 		t.Fatalf("CreateMiddleware: %v", err)
@@ -110,7 +111,7 @@ func TestTraefikKindsPersistenceRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPurgeNamespaceRemovesTraefikKinds(t *testing.T) {
+func TestDeleteNamespaceWithResourcesRemovesTraefikKinds(t *testing.T) {
 	st := store.New()
 	if _, err := st.CreateMiddleware(makeMiddleware("default", "allow")); err != nil {
 		t.Fatal(err)
@@ -125,7 +126,9 @@ func TestPurgeNamespaceRemovesTraefikKinds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st.PurgeNamespace("default")
+	if err := st.DeleteNamespaceWithResources("default"); err != nil {
+		t.Fatalf("DeleteNamespaceWithResources: %v", err)
+	}
 
 	if _, err := st.GetMiddleware("default", "allow"); err == nil {
 		t.Fatal("default Middleware survived namespace purge")

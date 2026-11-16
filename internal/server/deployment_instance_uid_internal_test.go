@@ -38,8 +38,8 @@ func TestDeploymentInstancePodKeepsUIDAcrossTemplateSync(t *testing.T) {
 
 	dep.Spec.Template.Spec.Containers[0].Image = "nginx:2"
 	incoming := s.materializeDeploymentInstance(dep, 0)
-	if incoming.UID != created.UID {
-		t.Fatalf("materialized instance UID = %q, want the stored %q", incoming.UID, created.UID)
+	if incoming.UID != "" {
+		t.Fatalf("materialized instance carries UID %q, want the store to keep it", incoming.UID)
 	}
 	s.syncInstancePod(incoming)
 

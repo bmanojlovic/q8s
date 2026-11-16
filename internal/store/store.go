@@ -747,6 +747,18 @@ func (s *Store) armSnapshotTailLocked() {
 	s.snapshotTimer = time.AfterFunc(delay, s.writeTailSnapshot)
 }
 
+// Close writes a snapshot that a pending tail timer was still waiting for and
+// stops the timer, so a shutdown keeps the final state and a timer cannot fire
+// after the store's data directory is gone (tests). The store remains usable.
+func (s *Store) Close() {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if s.snapshotTimer != nil {
+		s.snapshotTimer.Stop()
+		s.writeTailSnapshotLocked()
+	}
+}
+
 // writeTailSnapshot writes the snapshot a throttled save postponed. It takes
 // saveMu, so it either runs before the next mutation or sees that mutation's
 // newer lastGood, and skips when a regular save already snapshotted that
@@ -754,7 +766,11 @@ func (s *Store) armSnapshotTailLocked() {
 func (s *Store) writeTailSnapshot() {
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
+	s.writeTailSnapshotLocked()
+}
 
+// writeTailSnapshotLocked is writeTailSnapshot with saveMu already held.
+func (s *Store) writeTailSnapshotLocked() {
 	s.snapshotTimer = nil
 	if s.dataFile == "" {
 		return
@@ -1061,26 +1077,19 @@ func (s *Store) UpdateNamespace(ns *corev1.Namespace) (*corev1.Namespace, error)
 	return out, nil
 }
 
-// DeleteNamespace deletes a namespace.
-func (s *Store) DeleteNamespace(name string) error {
+// DeleteNamespaceWithResources deletes a namespace together with every
+// resource in it in a single mutation, so a failed final write leaves the
+// whole namespace and its objects in the store. Called by the namespace
+// delete handler after stopping systemd units and removing their files.
+func (s *Store) DeleteNamespaceWithResources(name string) error {
 	return s.mutate(func() (bool, error) {
 		key := types.NamespacedName{Name: name}
 		if _, ok := s.namespaces[key]; !ok {
 			return false, fmt.Errorf("namespace %q not found", name)
 		}
+		s.purgeNamespaceLocked(name)
 		delete(s.namespaces, key)
 		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-		s.incRV()
-		return true, nil
-	})
-}
-
-// PurgeNamespace removes all resources belonging to a namespace from the store
-// in a single mutation. Called by the namespace delete handler after stopping
-// systemd units so the store and disk stay consistent.
-func (s *Store) PurgeNamespace(name string) {
-	_ = s.mutate(func() (bool, error) {
-		s.purgeNamespaceLocked(name)
 		s.incRV()
 		return true, nil
 	})
@@ -3101,6 +3110,48 @@ func (s *Store) GetDeployment(ns, name string) (*appsv1.Deployment, error) {
 		return nil, fmt.Errorf("deployment %q not found in namespace %q", name, ns)
 	}
 	return dep.DeepCopy(), nil
+}
+
+// DeleteDeploymentWithPods deletes a deployment and its instance pods in one
+// mutation, so a failed write leaves all of them in the store. Missing instance
+// pods are ignored: the deployment entry is what the caller is deleting.
+func (s *Store) DeleteDeploymentWithPods(ns, name string, podNames []string) error {
+	type deletedPod struct {
+		name string
+		uid  types.UID
+	}
+	var uid types.UID
+	var pods []deletedPod
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		dep, ok := s.deployments[key]
+		if !ok {
+			return false, fmt.Errorf("deployment %q not found in namespace %q", name, ns)
+		}
+		uid = dep.UID
+		delete(s.deployments, key)
+		for _, podName := range podNames {
+			podKey := types.NamespacedName{Namespace: ns, Name: podName}
+			if pod, ok := s.pods[podKey]; ok {
+				pods = append(pods, deletedPod{name: podName, uid: pod.UID})
+			}
+			delete(s.pods, podKey)
+			s.forgetRunStarts(podKey)
+		}
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	s.recordEvent("Deployment", ns, name, uid, corev1.EventTypeNormal, "Deleted",
+		fmt.Sprintf("Deleted deployment %s/%s", ns, name))
+	for _, pod := range pods {
+		s.recordEvent("Pod", ns, pod.name, pod.uid, corev1.EventTypeNormal, "Deleted",
+			fmt.Sprintf("Deleted pod %s/%s", ns, pod.name))
+	}
+	return nil
 }
 
 // DeleteDeployment deletes a deployment.

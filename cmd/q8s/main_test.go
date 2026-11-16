@@ -262,6 +262,7 @@ func TestRestoreLegacySecretSelfHealsOnLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	t.Cleanup(st.Close)
 
 	secretDir := filepath.Join(tmp, "secrets")
 	restoreSecretFiles(secretDir, st)

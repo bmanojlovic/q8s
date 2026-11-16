@@ -64,6 +64,7 @@ func TestRBACKindsPersistenceRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load (new file): %v", err)
 	}
+	t.Cleanup(st1.Close)
 	createdRole, err := st1.CreateRole(makeRole("default", "reader"))
 	if err != nil {
 		t.Fatalf("CreateRole: %v", err)
@@ -139,7 +140,7 @@ func TestRBACKindsPersistenceRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPurgeNamespaceRemovesRBACKinds(t *testing.T) {
+func TestDeleteNamespaceWithResourcesRemovesRBACKinds(t *testing.T) {
 	st := store.New()
 	if _, err := st.CreateRole(makeRole("default", "reader")); err != nil {
 		t.Fatal(err)
@@ -157,7 +158,9 @@ func TestPurgeNamespaceRemovesRBACKinds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st.PurgeNamespace("default")
+	if err := st.DeleteNamespaceWithResources("default"); err != nil {
+		t.Fatalf("DeleteNamespaceWithResources: %v", err)
+	}
 
 	if _, err := st.GetRole("default", "reader"); err == nil {
 		t.Fatal("default Role survived namespace purge")

@@ -2,7 +2,8 @@ package server
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,10 +12,14 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/quadlet"
 	"q8s/internal/store"
+	"q8s/internal/traefik"
 )
 
 func recordPodmanCalls(t *testing.T) *[]string {
@@ -264,115 +269,293 @@ func TestStalePodUnitRemovesPodmanPod(t *testing.T) {
 	}
 }
 
-// TestDeleteNamespacePersistFailureRestoresWorkload: the namespace purge
-// removes its resources before the namespace entry; a failed final store write
-// restores the files and units of the objects captured before the purge.
-func TestDeleteNamespacePersistFailureRestoresWorkload(t *testing.T) {
+func newDeleteTestServer(t *testing.T) (*store.Store, *Server, string) {
+	t.Helper()
 	dataDir := t.TempDir()
-	file := filepath.Join(dataDir, "store.json")
-	st, err := store.Load(file)
+	st, err := store.Load(filepath.Join(dataDir, "store.json"))
 	if err != nil {
 		t.Fatalf("store.Load: %v", err)
 	}
-	dir := t.TempDir()
-	srv := &Server{config: Config{Store: st, QuadletDir: dir}}
-	if _, err := st.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team"}}); err != nil {
-		t.Fatalf("CreateNamespace: %v", err)
-	}
-	if _, err := st.CreatePod(&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "team"},
-		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
-	}); err != nil {
-		t.Fatalf("CreatePod: %v", err)
-	}
-	podPath := writeOwnedUnit(t, dir, "team-app.container", "team", "app")
+	t.Cleanup(st.Close)
+	return st, &Server{config: Config{Store: st, QuadletDir: t.TempDir()}}, dataDir
+}
 
-	var stops, starts []string
-	srv.stopUnitHook = func(name string) { stops = append(stops, name) }
-	srv.startUnitHook = func(name string) { starts = append(starts, name) }
-	recordPodmanCalls(t)
-
+func breakStoreDir(t *testing.T, dataDir string) {
+	t.Helper()
 	if err := os.RemoveAll(dataDir); err != nil {
 		t.Fatalf("remove data dir: %v", err)
 	}
 	if err := os.WriteFile(dataDir, []byte("not a directory"), 0600); err != nil {
 		t.Fatalf("replace data dir with file: %v", err)
 	}
+}
 
-	rec := httptest.NewRecorder()
-	srv.handleNamespaceDelete(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/team", nil), "team")
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
+func repairStoreDir(t *testing.T, dataDir string) {
+	t.Helper()
+	if err := os.Remove(dataDir); err != nil {
+		t.Fatalf("remove data dir placeholder: %v", err)
 	}
-	if !hasCall(stops, "team-app.service") {
-		t.Fatalf("pod unit was not stopped before the store delete: %v", stops)
-	}
-	if !hasCall(starts, "team-app.service") {
-		t.Fatalf("restored namespace workload was not started: %v", starts)
-	}
-	if _, err := os.Stat(podPath); err != nil {
-		t.Fatalf("namespace pod quadlet was not restored: %v", err)
-	}
-	if _, err := st.GetNamespace("team"); err != nil {
-		t.Fatalf("namespace was not rolled back after failed delete: %v", err)
-	}
-	if _, err := st.GetPod("team", "app"); err != nil {
-		t.Fatalf("namespace pod was not rolled back after failed delete: %v", err)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatalf("repair data dir: %v", err)
 	}
 }
 
-// TestDeletePodPersistFailureRestoresWorkload is the delete-ordering
-// regression: after stopping the unit and removing its quadlet, a failed
-// final store write restores the pod through the create path, keeps it in the
-// store and answers with the persist error.
-func TestDeletePodPersistFailureRestoresWorkload(t *testing.T) {
-	dataDir := t.TempDir()
-	file := filepath.Join(dataDir, "store.json")
-	st, err := store.Load(file)
-	if err != nil {
-		t.Fatalf("store.Load: %v", err)
+func decodeStatus(t *testing.T, rec *httptest.ResponseRecorder) metav1.Status {
+	t.Helper()
+	var status metav1.Status
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v (body %s)", err, rec.Body.String())
 	}
-	dir := t.TempDir()
-	srv := &Server{config: Config{Store: st, QuadletDir: dir}}
+	return status
+}
+
+func wantFailedDeleteMessage(t *testing.T, status metav1.Status, kind, name string) {
+	t.Helper()
+	wantPrefix := kind + ` "` + name + `" was stopped but could not be removed from the store (`
+	if !strings.HasPrefix(status.Message, wantPrefix) {
+		t.Fatalf("message = %q, want prefix %q", status.Message, wantPrefix)
+	}
+	if !strings.HasSuffix(status.Message, "); retry the delete") {
+		t.Fatalf("message = %q, want the retry-the-delete suffix", status.Message)
+	}
+}
+
+// TestDeletePodPersistFailureKeepsObjectForRetry: after the unit is stopped
+// and its files are removed, a failed final store write keeps the pod in the
+// store, starts nothing again and asks the caller to retry. The retry removes
+// the store entry.
+func TestDeletePodPersistFailureKeepsObjectForRetry(t *testing.T) {
+	st, srv, dataDir := newDeleteTestServer(t)
 	if _, err := st.CreatePod(&corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "solo", Namespace: "default"},
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
 	}); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
-	podPath := writeOwnedUnit(t, dir, "default-solo.container", "default", "solo")
+	podPath := writeOwnedUnit(t, srv.config.QuadletDir, "default-solo.container", "default", "solo")
 
 	var stops, starts []string
 	srv.stopUnitHook = func(name string) { stops = append(stops, name) }
 	srv.startUnitHook = func(name string) { starts = append(starts, name) }
 	calls := recordPodmanCalls(t)
 
-	// Every following store write fails (root ignores permissions but not a
-	// regular file where a directory is expected).
-	if err := os.RemoveAll(dataDir); err != nil {
-		t.Fatalf("remove data dir: %v", err)
+	breakStoreDir(t, dataDir)
+	rec := httptest.NewRecorder()
+	srv.handlePods(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/solo", nil), "default", "solo")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
 	}
-	if err := os.WriteFile(dataDir, []byte("not a directory"), 0600); err != nil {
-		t.Fatalf("replace data dir with file: %v", err)
+	status := decodeStatus(t, rec)
+	if status.Reason != metav1.StatusReason("InternalError") {
+		t.Fatalf("reason = %q, want InternalError", status.Reason)
 	}
-
-	err = srv.deletePodByName("default", "solo")
-	if !errors.Is(err, store.ErrPersist) {
-		t.Fatalf("deletePodByName error = %v, want one wrapping ErrPersist", err)
-	}
+	wantFailedDeleteMessage(t, status, "pod", "solo")
 	if !hasCall(stops, "default-solo.service") {
 		t.Fatalf("unit was not stopped before the store delete: %v", stops)
 	}
 	if !hasCall(*calls, "rm -f default-solo") {
 		t.Fatalf("container was not removed before the store delete: %v", *calls)
 	}
-	if !hasCall(starts, "default-solo.service") {
-		t.Fatalf("restored workload was not started: %v", starts)
-	}
-	if _, err := os.Stat(podPath); err != nil {
-		t.Fatalf("quadlet file was not restored after failed persist: %v", err)
+	if len(starts) != 0 {
+		t.Fatalf("failed delete started units: %v", starts)
 	}
 	if _, err := st.GetPod("default", "solo"); err != nil {
-		t.Fatalf("pod was not rolled back after failed persist: %v", err)
+		t.Fatalf("pod was not kept in the store after the failed delete: %v", err)
+	}
+	if _, err := os.Stat(podPath); !os.IsNotExist(err) {
+		t.Fatalf("pod quadlet was restored after the failed delete, stat err=%v", err)
+	}
+
+	repairStoreDir(t, dataDir)
+	rec = httptest.NewRecorder()
+	srv.handlePods(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/solo", nil), "default", "solo")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := st.GetPod("default", "solo"); err == nil {
+		t.Fatal("pod is still in the store after the retried delete")
+	}
+	if len(starts) != 0 {
+		t.Fatalf("retried delete started units: %v", starts)
+	}
+}
+
+// TestDeleteDeploymentPersistFailureKeepsDeploymentAndPods: the deployment and
+// its instance pods are removed in one mutation, so a failed write leaves all
+// of them in the store.
+func TestDeleteDeploymentPersistFailureKeepsDeploymentAndPods(t *testing.T) {
+	st, srv, dataDir := newDeleteTestServer(t)
+	replicas := int32(2)
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx"}}}},
+		},
+	}
+	if _, err := st.CreateDeployment(dep); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	for i := 0; i < int(replicas); i++ {
+		name := fmt.Sprintf("web-%d", i)
+		if _, err := st.CreatePod(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx"}}},
+		}); err != nil {
+			t.Fatalf("CreatePod %s: %v", name, err)
+		}
+		writeOwnedUnit(t, srv.config.QuadletDir, "default-"+name+".container", "default", name)
+	}
+
+	var starts []string
+	srv.startUnitHook = func(name string) { starts = append(starts, name) }
+	recordPodmanCalls(t)
+
+	breakStoreDir(t, dataDir)
+	rec := httptest.NewRecorder()
+	srv.handleDeployments(rec, httptest.NewRequest(http.MethodDelete, "/apis/apps/v1/namespaces/default/deployments/web", nil), "default", "web")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	status := decodeStatus(t, rec)
+	wantFailedDeleteMessage(t, status, "deployment", "web")
+	if _, err := st.GetDeployment("default", "web"); err != nil {
+		t.Fatalf("deployment was not kept in the store after the failed delete: %v", err)
+	}
+	for i := 0; i < int(replicas); i++ {
+		name := fmt.Sprintf("web-%d", i)
+		if _, err := st.GetPod("default", name); err != nil {
+			t.Fatalf("instance pod %s was not kept in the store after the failed delete: %v", name, err)
+		}
+	}
+	if len(starts) != 0 {
+		t.Fatalf("failed delete started units: %v", starts)
+	}
+}
+
+// TestDeleteNamespacePersistFailureKeepsEveryObject: the namespace purge and
+// the namespace delete are one mutation now, so a failed write leaves every
+// object of the namespace in the store.
+func TestDeleteNamespacePersistFailureKeepsEveryObject(t *testing.T) {
+	st, srv, dataDir := newDeleteTestServer(t)
+	if _, err := st.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team"}}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
+
+	meta := func(name string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Name: name, Namespace: "team"}
+	}
+	if _, err := st.CreatePod(&corev1.Pod{
+		ObjectMeta: meta("app"),
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if _, err := st.CreateService(&corev1.Service{ObjectMeta: meta("web")}); err != nil {
+		t.Fatalf("CreateService: %v", err)
+	}
+	if _, err := st.CreatePVC(&corev1.PersistentVolumeClaim{ObjectMeta: meta("data")}); err != nil {
+		t.Fatalf("CreatePVC: %v", err)
+	}
+	if _, err := st.CreateConfigMap(&corev1.ConfigMap{ObjectMeta: meta("cfg")}); err != nil {
+		t.Fatalf("CreateConfigMap: %v", err)
+	}
+	if _, err := st.CreateSecret(&corev1.Secret{ObjectMeta: meta("sec")}); err != nil {
+		t.Fatalf("CreateSecret: %v", err)
+	}
+	if _, err := st.CreateServiceAccount(&corev1.ServiceAccount{ObjectMeta: meta("worker")}); err != nil {
+		t.Fatalf("CreateServiceAccount: %v", err)
+	}
+	replicas := int32(1)
+	if _, err := st.CreateDeployment(&appsv1.Deployment{
+		ObjectMeta: meta("dep"),
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "dep", Image: "nginx"}}}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	if _, err := st.CreateJob(&batchv1.Job{
+		ObjectMeta: meta("job"),
+		Spec:       batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "job", Image: "busybox"}}}}},
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := st.CreateCronJob(&batchv1.CronJob{
+		ObjectMeta: meta("cron"),
+		Spec: batchv1.CronJobSpec{
+			Schedule:    "* * * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "cron", Image: "busybox"}}}}}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateCronJob: %v", err)
+	}
+	if _, err := st.CreateIngress(&networkingv1.Ingress{ObjectMeta: meta("ing")}); err != nil {
+		t.Fatalf("CreateIngress: %v", err)
+	}
+	if _, err := st.CreateMiddleware(&traefik.Middleware{
+		ObjectMeta: meta("mw"),
+		Spec:       traefik.MiddlewareSpec{IPAllowList: &traefik.IPAllowList{SourceRange: []string{"127.0.0.1/32"}}},
+	}); err != nil {
+		t.Fatalf("CreateMiddleware: %v", err)
+	}
+	if _, err := st.CreateIngressRouteTCP(&traefik.IngressRouteTCP{
+		ObjectMeta: meta("tcp"),
+		Spec:       traefik.IngressRouteTCPSpec{EntryPoints: []string{"smtp"}},
+	}); err != nil {
+		t.Fatalf("CreateIngressRouteTCP: %v", err)
+	}
+	if _, err := st.CreateRole(&rbacv1.Role{ObjectMeta: meta("reader")}); err != nil {
+		t.Fatalf("CreateRole: %v", err)
+	}
+	if _, err := st.CreateRoleBinding(&rbacv1.RoleBinding{
+		ObjectMeta: meta("readers"),
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "reader"},
+	}); err != nil {
+		t.Fatalf("CreateRoleBinding: %v", err)
+	}
+
+	var starts []string
+	srv.startUnitHook = func(name string) { starts = append(starts, name) }
+	recordPodmanCalls(t)
+
+	breakStoreDir(t, dataDir)
+	rec := httptest.NewRecorder()
+	srv.handleNamespaceDelete(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/team", nil), "team")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+	status := decodeStatus(t, rec)
+	wantFailedDeleteMessage(t, status, "namespace", "team")
+	if _, err := st.GetNamespace("team"); err != nil {
+		t.Fatalf("namespace was not kept in the store after the failed delete: %v", err)
+	}
+	checks := []struct {
+		kind string
+		get  func() error
+	}{
+		{"pod", func() error { _, err := st.GetPod("team", "app"); return err }},
+		{"service", func() error { _, err := st.GetService("team", "web"); return err }},
+		{"pvc", func() error { _, err := st.GetPVC("team", "data"); return err }},
+		{"configmap", func() error { _, err := st.GetConfigMap("team", "cfg"); return err }},
+		{"secret", func() error { _, err := st.GetSecret("team", "sec"); return err }},
+		{"serviceaccount", func() error { _, err := st.GetServiceAccount("team", "worker"); return err }},
+		{"deployment", func() error { _, err := st.GetDeployment("team", "dep"); return err }},
+		{"job", func() error { _, err := st.GetJob("team", "job"); return err }},
+		{"cronjob", func() error { _, err := st.GetCronJob("team", "cron"); return err }},
+		{"ingress", func() error { _, err := st.GetIngress("team", "ing"); return err }},
+		{"middleware", func() error { _, err := st.GetMiddleware("team", "mw"); return err }},
+		{"ingressroutetcp", func() error { _, err := st.GetIngressRouteTCP("team", "tcp"); return err }},
+		{"role", func() error { _, err := st.GetRole("team", "reader"); return err }},
+		{"rolebinding", func() error { _, err := st.GetRoleBinding("team", "readers"); return err }},
+	}
+	for _, check := range checks {
+		if err := check.get(); err != nil {
+			t.Errorf("%s was not kept in the store after the failed namespace delete: %v", check.kind, err)
+		}
+	}
+	if len(starts) != 0 {
+		t.Fatalf("failed delete started units: %v", starts)
 	}
 }

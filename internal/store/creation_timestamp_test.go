@@ -46,6 +46,7 @@ func TestCreationTimestampSetKeptAndBackfilled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(loaded.Close)
 	if c, _ := loaded.GetConfigMap("default", "old"); c == nil || c.CreationTimestamp.IsZero() {
 		t.Errorf("legacy configmap not backfilled: %+v", c)
 	}

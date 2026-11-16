@@ -79,8 +79,9 @@ type Server struct {
 	// the order of unit stops relative to quadlet file removal; nil uses
 	// config.Manager.
 	stopUnitHook func(name string)
-	// startUnitHook, when set, replaces systemd starts. Tests use it to check
-	// that a restored workload was started again; nil uses config.Manager.
+	// startUnitHook, when set, observes systemd starts. It never replaces the
+	// systemd call, so tests can check whether a start was requested without
+	// changing which call production makes.
 	startUnitHook func(name string)
 	// disk caches the short-lived disk pressure check for write requests.
 	disk diskPressureCache

@@ -110,8 +110,8 @@ func TestNamespaceCRUD(t *testing.T) {
 	}
 
 	// Delete
-	if err := st.DeleteNamespace("production"); err != nil {
-		t.Fatalf("DeleteNamespace: %v", err)
+	if err := st.DeleteNamespaceWithResources("production"); err != nil {
+		t.Fatalf("DeleteNamespaceWithResources: %v", err)
 	}
 	if _, err := st.GetNamespace("production"); err == nil {
 		t.Fatal("expected error after delete")
@@ -129,7 +129,7 @@ func TestNamespaceDuplicate(t *testing.T) {
 
 func TestNamespaceDeleteNotFound(t *testing.T) {
 	st := newStore(t)
-	if err := st.DeleteNamespace("nonexistent"); err == nil {
+	if err := st.DeleteNamespaceWithResources("nonexistent"); err == nil {
 		t.Fatal("expected error deleting nonexistent namespace")
 	}
 }
@@ -1167,6 +1167,7 @@ func TestPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load (new file): %v", err)
 	}
+	t.Cleanup(st1.Close)
 	created, err := st1.CreatePod(makePod("default", "nginx", "nginx:latest"))
 	if err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -1211,6 +1212,7 @@ func TestLoadNonExistentFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load of missing file should return empty store: %v", err)
 	}
+	t.Cleanup(st.Close)
 	// Should have default namespace
 	if _, err := st.GetNamespace("default"); err != nil {
 		t.Fatalf("default namespace missing in new store: %v", err)
@@ -1263,6 +1265,7 @@ func TestLoadNormalizesLegacySecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	t.Cleanup(st.Close)
 
 	tlsOnly, err := st.GetSecret("default", "tls-only")
 	if err != nil {
@@ -1313,6 +1316,7 @@ func TestLoadIgnoresLegacyReplicaPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load of legacy snapshot: %v", err)
 	}
+	t.Cleanup(st.Close)
 	if _, err := st.GetPod("default", "nginx"); err != nil {
 		t.Errorf("legacy snapshot pod not loaded: %v", err)
 	}
@@ -1398,6 +1402,7 @@ func reloadUntil(t *testing.T, file string, ready func(*store.Store) bool) *stor
 	for {
 		st, err := store.Load(file)
 		if err == nil && ready(st) {
+			t.Cleanup(st.Close)
 			return st
 		}
 		if time.Now().After(deadline) {

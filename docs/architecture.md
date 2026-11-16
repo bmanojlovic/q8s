@@ -98,11 +98,13 @@ Mutations are serialized with their save: no other change can happen between
 a mutation and its write. A failed write (full disk, I/O error) answers 500
 `InternalError` and rolls the in-memory state back to the last state that
 reached disk. Deletes stop the units and remove their files first, then
-delete from the store. If that final save fails, the object is rolled back
-and the workload is restored through the same generators a create uses, so
-it is running again instead of surviving in the store with no units. The
-resourceVersion keeps moving forward, so a version already handed to a client
-is never reused.
+delete from the store. If that final save fails, nothing is restored: the
+object stays in the store with its units stopped and its files gone, and the
+request answers 500 `InternalError` with `<kind> "<name>" was stopped but
+could not be removed from the store (<err>); retry the delete`. A retried
+DELETE stops nothing new and removes the store entry. The resourceVersion
+keeps moving forward, so a version already handed to a client is never
+reused.
 
 A successful save also keeps a gzip copy in `{dataDir}/snapshots` as
 `store.<rv>.json.gz` when the newest snapshot is at least a minute old (the

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/store"
@@ -25,6 +26,7 @@ func newFileStore(t *testing.T) (*store.Store, string) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	t.Cleanup(st.Close)
 	return st, file
 }
 
@@ -170,6 +172,7 @@ func TestLoadRecoversNewestSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after corruption: %v", err)
 	}
+	t.Cleanup(loaded.Close)
 	for _, name := range []string{"one", "two"} {
 		if _, err := loaded.GetPod("default", name); err != nil {
 			t.Fatalf("pod %q missing after recovery: %v", name, err)
@@ -223,6 +226,7 @@ func TestLoadSkipsCorruptNewestSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after corruption: %v", err)
 	}
+	t.Cleanup(loaded.Close)
 	if _, err := loaded.GetPod("default", "one"); err != nil {
 		t.Fatalf("older snapshot was not used: %v", err)
 	}
@@ -252,6 +256,7 @@ func TestLoadRecoversWhenStoreFileMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load with only snapshots: %v", err)
 	}
+	t.Cleanup(loaded.Close)
 	if _, err := loaded.GetPod("default", "kept"); err != nil {
 		t.Fatalf("pod missing after recovery: %v", err)
 	}
@@ -317,6 +322,7 @@ func TestSnapshotThrottleSkipsRecentSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	t.Cleanup(loaded.Close)
 	for i := 0; i < 5; i++ {
 		name := fmt.Sprintf("later-%d", i)
 		if _, err := loaded.GetNamespace(name); err != nil {
@@ -371,6 +377,7 @@ func TestSnapshotTailWritesLastBurstState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	t.Cleanup(loaded.Close)
 	for i := 0; i < 5; i++ {
 		name := fmt.Sprintf("burst-%d", i)
 		if _, err := loaded.GetNamespace(name); err != nil {
@@ -398,6 +405,7 @@ func TestLoadRemembersNewestSnapshotTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	t.Cleanup(loaded.Close)
 	if _, err := loaded.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "after"}}); err != nil {
 		t.Fatalf("CreateNamespace after: %v", err)
 	}
@@ -416,6 +424,7 @@ func TestLoadRemembersNewestSnapshotTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
+	t.Cleanup(loaded2.Close)
 	if _, err := loaded2.GetNamespace("after"); err != nil {
 		t.Fatalf("namespace after missing from store.json: %v", err)
 	}
@@ -482,10 +491,77 @@ func TestFailedPersistDoesNotDiscardOtherWritersChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	t.Cleanup(loaded.Close)
 	if _, err := loaded.GetPod("default", "survivor"); err != nil {
 		t.Fatalf("surviving pod missing from disk after returning nil: %v", err)
 	}
 	if _, err := loaded.GetPod("default", "failing"); err == nil {
 		t.Fatal("pod from the failed write is on disk")
+	}
+}
+
+func makeDeployment(ns, name string) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: name, Image: "img"}},
+			}},
+		},
+	}
+}
+
+func TestDeleteDeploymentWithPodsRemovesDeploymentAndPods(t *testing.T) {
+	st, _ := newFileStore(t)
+	if _, err := st.CreateDeployment(makeDeployment("default", "web")); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	for _, name := range []string{"web-0", "web-1"} {
+		if _, err := st.CreatePod(makePod("default", name, "img")); err != nil {
+			t.Fatalf("CreatePod %s: %v", name, err)
+		}
+	}
+	if _, err := st.CreatePod(makePod("default", "keep", "img")); err != nil {
+		t.Fatalf("CreatePod keep: %v", err)
+	}
+
+	if err := st.DeleteDeploymentWithPods("default", "web", []string{"web-0", "web-1"}); err != nil {
+		t.Fatalf("DeleteDeploymentWithPods: %v", err)
+	}
+	if _, err := st.GetDeployment("default", "web"); err == nil {
+		t.Fatal("deployment survived the delete")
+	}
+	for _, name := range []string{"web-0", "web-1"} {
+		if _, err := st.GetPod("default", name); err == nil {
+			t.Fatalf("instance pod %s survived the delete", name)
+		}
+	}
+	if _, err := st.GetPod("default", "keep"); err != nil {
+		t.Fatalf("unrelated pod was removed with the deployment: %v", err)
+	}
+}
+
+func TestDeleteDeploymentWithPodsPersistFailureKeepsEverything(t *testing.T) {
+	st, file := newFileStore(t)
+	if _, err := st.CreateDeployment(makeDeployment("default", "web")); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	for _, name := range []string{"web-0", "web-1"} {
+		if _, err := st.CreatePod(makePod("default", name, "img")); err != nil {
+			t.Fatalf("CreatePod %s: %v", name, err)
+		}
+	}
+	breakDataDir(t, file)
+
+	if err := st.DeleteDeploymentWithPods("default", "web", []string{"web-0", "web-1"}); !errors.Is(err, store.ErrPersist) {
+		t.Fatalf("DeleteDeploymentWithPods error = %v, want one wrapping ErrPersist", err)
+	}
+	if _, err := st.GetDeployment("default", "web"); err != nil {
+		t.Fatalf("deployment missing after a failed delete: %v", err)
+	}
+	for _, name := range []string{"web-0", "web-1"} {
+		if _, err := st.GetPod("default", name); err != nil {
+			t.Fatalf("instance pod %s missing after a failed delete: %v", name, err)
+		}
 	}
 }
