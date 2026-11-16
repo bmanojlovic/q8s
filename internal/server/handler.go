@@ -55,10 +55,11 @@ func encoder() *jsonser.Serializer {
 	return jsonser.NewSerializer(jsonser.SimpleMetaFactory{}, scheme, scheme, false)
 }
 
-// podmanCommand runs one podman invocation. Tests replace it to record the
-// calls without reaching a real podman.
-var podmanCommand = func(ctx context.Context, args ...string) error {
-	return exec.CommandContext(ctx, "podman", args...).Run()
+// podmanCommand runs one podman invocation and returns its stdout. Tests
+// replace it to record the calls (and to fake listings) without reaching a
+// real podman.
+var podmanCommand = func(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "podman", args...).Output()
 }
 
 // readBody reads the request body, mapping MaxBytesReader overflow to a
@@ -2465,7 +2466,15 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		s.regenerateIngressConfigs(ns)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
+		dry, ok := s.dryRunWrite(w, r)
+		if !ok {
+			return
+		}
 		if name == "" {
+			if dry {
+				s.respondDryRunDeleteCollection(w, len(s.config.Store.Deployments(ns)))
+				return
+			}
 			s.deleteCollection(w,
 				func() []string {
 					var names []string
@@ -2475,6 +2484,14 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 					return names
 				},
 				func(n string) error { return s.deleteDeploymentByName(ns, n) })
+			return
+		}
+		if dry {
+			if _, err := s.config.Store.GetDeployment(ns, name); err != nil {
+				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+				return
+			}
+			encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 			return
 		}
 		if err := s.deleteDeploymentByName(ns, name); err != nil {
@@ -2751,6 +2768,10 @@ func (s *Server) cleanupNamespaceResources(ns string) {
 			fmt.Printf("remove secret tree %s/%s: %v\n", secretDir, ns, err)
 		}
 	}
+	// EmptyDir volumes carry the namespace in their name and have no other
+	// owner left once the namespace is gone. PVC volumes are deliberately
+	// kept: their data is never deleted automatically.
+	s.removeNamespaceEmptyDirVolumes(ns)
 }
 
 // removeLegacyServiceSockets deletes per-port .socket files that very old
@@ -2806,6 +2827,14 @@ func (s *Server) sweepOrphanedSockets() bool {
 func (s *Server) handleNamespaceDelete(w http.ResponseWriter, r *http.Request, name string) {
 	if _, err := s.config.Store.GetNamespace(name); err != nil {
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+		return
+	}
+	dry, ok := s.dryRunWrite(w, r)
+	if !ok {
+		return
+	}
+	if dry {
+		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 		return
 	}
 	s.cleanupNamespaceResources(name)
@@ -3075,7 +3104,15 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
+		dry, ok := s.dryRunWrite(w, r)
+		if !ok {
+			return
+		}
 		if name == "" {
+			if dry {
+				s.respondDryRunDeleteCollection(w, len(s.config.Store.Jobs(ns)))
+				return
+			}
 			s.deleteCollection(w,
 				func() []string {
 					var names []string
@@ -3085,6 +3122,14 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 					return names
 				},
 				func(n string) error { return s.deleteJobByName(ns, n) })
+			return
+		}
+		if dry {
+			if _, err := s.config.Store.GetJob(ns, name); err != nil {
+				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+				return
+			}
+			encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 			return
 		}
 		if err := s.deleteJobByName(ns, name); err != nil {
@@ -3306,7 +3351,15 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		s.generateCronJobQuadlets(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
+		dry, ok := s.dryRunWrite(w, r)
+		if !ok {
+			return
+		}
 		if name == "" {
+			if dry {
+				s.respondDryRunDeleteCollection(w, len(s.config.Store.CronJobs(ns)))
+				return
+			}
 			s.deleteCollection(w,
 				func() []string {
 					var names []string
@@ -3316,6 +3369,14 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 					return names
 				},
 				func(n string) error { return s.deleteCronJobByName(ns, n) })
+			return
+		}
+		if dry {
+			if _, err := s.config.Store.GetCronJob(ns, name); err != nil {
+				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+				return
+			}
+			encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 			return
 		}
 		if err := s.deleteCronJobByName(ns, name); err != nil {
@@ -4302,6 +4363,62 @@ func (s *Server) stopAndRemovePod(ns, name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	podmanCommand(ctx, "pod", "rm", "-f", "--ignore", fmt.Sprintf("%s-%s", ns, name))
+}
+
+// removeEmptyDirVolumes removes the Podman volumes backing a workload's
+// emptyDir data. Every name must come from quadlet.EmptyDirVolumeName (or
+// the equivalent set helper), so this can never touch a PVC volume or a
+// volume q8s did not create. Callers run it only after the units are stopped
+// and the containers removed: an in-use volume cannot be removed. A failure
+// is logged and otherwise ignored, because the object is already gone and
+// `q8s doctor` reports the leftover.
+func (s *Server) removeEmptyDirVolumes(names []string) {
+	for _, name := range names {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, err := podmanCommand(ctx, "volume", "rm", "--force", name)
+		cancel()
+		if err != nil {
+			fmt.Printf("remove emptyDir volume %s: %v\n", name, err)
+		}
+	}
+}
+
+// removeNamespaceEmptyDirVolumes removes every Podman volume whose name
+// starts with q8s_<ns>_. That is the namespace's emptyDir name space (PVC
+// volumes are <ns>-<claim> and keep their data). The listing is filtered in
+// Go rather than with a podman filter so the exact prefix is checked here.
+func (s *Server) removeNamespaceEmptyDirVolumes(ns string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	out, err := podmanCommand(ctx, "volume", "ls", "--format", "{{.Name}}")
+	cancel()
+	if err != nil {
+		fmt.Printf("list volumes for namespace %s: %v\n", ns, err)
+		return
+	}
+	prefix := fmt.Sprintf("q8s_%s_", ns)
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" || !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		names = append(names, name)
+	}
+	s.removeEmptyDirVolumes(names)
+}
+
+// podOwnedByWorkload reports whether a pod is a replica or run of a
+// Deployment, Job or CronJob. Such a pod shares its template's emptyDir
+// volumes with the other replicas, so deleting the pod alone must keep them;
+// the owner's own delete removes them.
+func podOwnedByWorkload(pod *corev1.Pod) bool {
+	for _, or := range pod.OwnerReferences {
+		switch or.Kind {
+		case "Deployment", "Job", "CronJob":
+			return true
+		}
+	}
+	return false
 }
 
 // stopUnit stops one systemd unit through the test hook or config.Manager.
@@ -5726,6 +5843,9 @@ func (s *Server) deletePodByName(ns, name string) error {
 	if err := s.config.Store.DeletePod(ns, name); err != nil {
 		return deleteStoreError("pod", name, err)
 	}
+	if !podOwnedByWorkload(pod) {
+		s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNames(pod))
+	}
 	s.regenerateIngressConfigs(ns)
 	return nil
 }
@@ -5786,6 +5906,7 @@ func (s *Server) deleteDeploymentByName(ns, name string) error {
 	if err := s.config.Store.DeleteDeploymentWithPods(ns, name, podNames); err != nil {
 		return deleteStoreError("deployment", name, err)
 	}
+	s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNamesForSpec(dep.Namespace, dep.Name, &dep.Spec.Template.Spec))
 	s.regenerateIngressConfigs(dep.Namespace)
 	return nil
 }
@@ -5800,6 +5921,7 @@ func (s *Server) deleteJobByName(ns, name string) error {
 	if err := s.config.Store.DeleteJob(ns, name); err != nil {
 		return deleteStoreError("job", name, err)
 	}
+	s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNamesForSpec(job.Namespace, job.Name, &job.Spec.Template.Spec))
 	return nil
 }
 
@@ -5812,6 +5934,7 @@ func (s *Server) deleteCronJobByName(ns, name string) error {
 	if err := s.config.Store.DeleteCronJob(ns, name); err != nil {
 		return deleteStoreError("cronjob", name, err)
 	}
+	s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNamesForSpec(cj.Namespace, cj.Name, &cj.Spec.JobTemplate.Spec.Template.Spec))
 	return nil
 }
 

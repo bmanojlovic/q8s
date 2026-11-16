@@ -96,6 +96,14 @@ func runKubeconfig(args []string, d dirs, stdout, stderr io.Writer) error {
 		return fmt.Errorf("failed to read %s: %w", filepath.Join(certDir, "ca.key"), err)
 	}
 
+	// Revocation by user name is permanent: a new certificate for that name
+	// would be rejected on its first request, so refuse to issue one rather
+	// than hand out a kubeconfig that only ever gets 401.
+	if revoked, err := install.LoadRevokedCertificates(install.RevokedPath(d.dataDir)); err != nil {
+		return err
+	} else if revoked.HasUser(opts.user) {
+		return fmt.Errorf("user %q is revoked: every certificate for that name is rejected, including new ones; issue the kubeconfig under another user name", opts.user)
+	}
 	issued, err := install.IssueClientCertificate(caCert, caKey, opts.user, opts.groups, opts.days)
 	if err != nil {
 		return err

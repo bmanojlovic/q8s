@@ -329,6 +329,23 @@ func Load(dataFile string) (*Store, error) {
 	return s, nil
 }
 
+// LoadReadOnly builds a Store from store.json contents without writing
+// anything, taking no lock and falling back to no snapshot. `q8s doctor` uses
+// it to inspect the stored objects while the server may be running; a
+// missing or unreadable file is an error, never a fresh empty store.
+// Backfilled creation timestamps stay in memory only.
+func LoadReadOnly(data []byte) (*Store, error) {
+	var snap snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, fmt.Errorf("parsing store file: %w", err)
+	}
+	s := newEmpty()
+	s.mu.Lock()
+	s.installSnapshotLocked(&snap)
+	s.mu.Unlock()
+	return s, nil
+}
+
 // adoptSnapshot installs a recovered snapshot, records it as the last good
 // state, logs the recovery and rewrites store.json so the next start is clean.
 func (s *Store) adoptSnapshot(file string, snap *snapshot, raw []byte, readErr error) {

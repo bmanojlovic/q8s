@@ -26,9 +26,9 @@ func recordPodmanCalls(t *testing.T) *[]string {
 	t.Helper()
 	calls := &[]string{}
 	old := podmanCommand
-	podmanCommand = func(ctx context.Context, args ...string) error {
+	podmanCommand = func(ctx context.Context, args ...string) ([]byte, error) {
 		*calls = append(*calls, strings.Join(args, " "))
-		return nil
+		return nil, nil
 	}
 	t.Cleanup(func() { podmanCommand = old })
 	return calls
@@ -95,14 +95,14 @@ func TestDeleteMultiContainerPodStopsPodBeforeQuadletRemoval(t *testing.T) {
 		}
 	}
 	old := podmanCommand
-	podmanCommand = func(ctx context.Context, args ...string) error {
+	podmanCommand = func(ctx context.Context, args ...string) ([]byte, error) {
 		events = append(events, "podman "+strings.Join(args, " "))
 		if len(args) > 1 && args[0] == "pod" && args[1] == "rm" {
 			if _, err := os.Stat(podPath); err != nil {
 				filePresentAtStop = false
 			}
 		}
-		return nil
+		return nil, nil
 	}
 	t.Cleanup(func() { podmanCommand = old })
 

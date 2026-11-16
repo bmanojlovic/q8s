@@ -149,6 +149,12 @@ claim colliding with a volume some unrelated non-q8s deployment created —
 never share one backing volume, and `podman volume ls` shows which
 namespace/claim owns each volume.
 
+Deleting a PVC removes its `.volume` quadlet file but keeps the Podman
+volume `{namespace}-{name}` and the data in it: q8s never deletes PVC
+data automatically. Remove it manually when the data is no longer needed:
+`podman volume rm {namespace}-{name}`. `q8s doctor` lists such a leftover as
+`data of deleted PVC`.
+
 The `hostpath` class requires a `q8s.io/host-path` annotation on the PVC specifying the absolute host directory. It also honours an optional `q8s.io/selinux-label` annotation: `private` (the default, `:Z`) relabels the host directory for one container, while `shared` (`:z`) lets several containers mount it without locking each other out. Any other value is rejected.
 
 Mounts with `readOnly: true`, or PVC volume sources with `persistentVolumeClaim.readOnly: true`, get the Podman `ro` mount option (`:ro,Z`, `:ro,z`, or `:ro`).
@@ -186,6 +192,14 @@ Kubernetes name, so an emptyDir can never collide with another namespace's
 emptyDir or with a PVC volume, which is named `{namespace}-{claim}`. An
 `emptyDir` with `medium: Memory` mounted at `/dev/shm` is rendered as
 `ShmSize=` instead, as described above under Pods.
+
+An emptyDir lives as long as its Pod, Deployment, Job or CronJob: deleting
+that object through the API removes its emptyDir volumes in the same request,
+after the units are stopped and the containers are removed. Deleting a single
+Deployment replica pod, scaling the Deployment, or rolling out a new template
+keeps the shared volume, because the other replicas still use it. A volume
+that stays behind is reported by `q8s doctor`, which prints the
+`podman volume rm` command to clean it up.
 
 Only `metadata.labels` values that satisfy the Kubernetes label rule are
 stored, because pod labels are copied onto the generated container as a

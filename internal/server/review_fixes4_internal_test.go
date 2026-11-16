@@ -524,3 +524,23 @@ func TestApplyRefusesNonScaleSubresource(t *testing.T) {
 		}
 	}
 }
+
+func TestEditAndViewIncludeScaleSubresources(t *testing.T) {
+	for _, tc := range []struct {
+		role *rbacv1.ClusterRole
+		verb string
+	}{{editClusterRole(), "patch"}, {viewClusterRole(), "get"}} {
+		for _, res := range []string{"deployments", "replicasets", "statefulsets"} {
+			a := requestAttributes{IsResourceRequest: true, Verb: tc.verb, APIGroup: "apps", Resource: res, Subresource: "scale", Name: "x", Namespace: "t"}
+			found := false
+			for _, rule := range tc.role.Rules {
+				if resourceRuleMatches(rule, a) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("%s: %s %s/scale not granted", tc.role.Name, tc.verb, res)
+			}
+		}
+	}
+}

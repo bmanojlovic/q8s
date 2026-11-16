@@ -468,3 +468,40 @@ func TestUnitPhaseFastExitAfterCreationSucceeds(t *testing.T) {
 		t.Fatalf("unit started before the pod existed: %s, want Pending", got)
 	}
 }
+
+func TestPVCVolumeRemovalHintsUseRealVolumeName(t *testing.T) {
+	standard := "standard"
+	hostpath := "hostpath"
+	pvcs := []*corev1.PersistentVolumeClaim{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &standard},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "host", Namespace: "default"},
+			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &hostpath},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "gone", Namespace: "team"},
+			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &standard},
+		},
+	}
+	var inspected []string
+	hints := pvcVolumeRemovalHints(pvcs, func(name string) bool {
+		inspected = append(inspected, name)
+		return name == "default-data"
+	})
+
+	want := "podman volume rm default-data   # PVC default/data"
+	if len(hints) != 1 || hints[0] != want {
+		t.Fatalf("hints = %v, want [%q]", hints, want)
+	}
+	for _, name := range inspected {
+		if name == "data" || name == "host" {
+			t.Errorf("inspected a claim name or hostpath volume instead of the Podman volume: %v", inspected)
+		}
+	}
+	if len(inspected) != 2 || inspected[0] != "default-data" || inspected[1] != "team-gone" {
+		t.Errorf("inspected volumes = %v, want [default-data team-gone]", inspected)
+	}
+}

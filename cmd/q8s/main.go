@@ -360,23 +360,51 @@ func cmdUninstall() {
 		fmt.Println("Run 'q8s install && q8s serve' to reinstall — existing resources will be restored from backup.")
 	}
 
-	// List any Podman volumes that belonged to q8s PVCs — data is never deleted automatically.
+	// List any Podman volumes that belonged to q8s PVCs: data is never deleted automatically.
 	if storeErr == nil {
-		pvcs := st.AllPVCs()
-		if len(pvcs) > 0 {
+		hints := pvcVolumeRemovalHints(st.AllPVCs(), func(name string) bool {
+			out, err := exec.Command("podman", "volume", "inspect", "--format", "{{.Name}}", name).Output()
+			return err == nil && len(out) > 0
+		})
+		if len(hints) > 0 {
 			fmt.Println()
 			fmt.Println("The following Podman volumes still contain your data and were NOT deleted:")
-			for _, pvc := range pvcs {
-				// Check if the volume actually exists in Podman before listing it.
-				out, err := exec.Command("podman", "volume", "inspect", "--format", "{{.Name}}", pvc.Name).Output()
-				if err == nil && len(out) > 0 {
-					fmt.Printf("  podman volume rm %s   # PVC %s/%s\n", pvc.Name, pvc.Namespace, pvc.Name)
-				}
+			for _, hint := range hints {
+				fmt.Printf("  %s\n", hint)
 			}
 			fmt.Println()
 			fmt.Println("Delete them manually with the commands above if you no longer need the data.")
 		}
 	}
+}
+
+// pvcVolumeRemovalHints returns the `podman volume rm` command for every PVC
+// whose Podman volume still exists. A PVC's volume is PVCVolumeName, not the
+// claim name; hostpath claims have no Podman volume at all. inspect reports
+// whether a volume exists, so the command is only printed when it would work.
+func pvcVolumeRemovalHints(pvcs []*corev1.PersistentVolumeClaim, inspect func(name string) bool) []string {
+	var hints []string
+	for _, pvc := range pvcs {
+		if pvcUsesHostPath(pvc) {
+			continue
+		}
+		volName := quadlet.PVCVolumeName(pvc.Namespace, pvc.Name)
+		if !inspect(volName) {
+			continue
+		}
+		hints = append(hints, fmt.Sprintf("podman volume rm %s   # PVC %s/%s", volName, pvc.Namespace, pvc.Name))
+	}
+	return hints
+}
+
+// pvcUsesHostPath reports whether a PVC binds a host directory instead of a
+// Podman named volume.
+func pvcUsesHostPath(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.StorageClassName != nil && *pvc.Spec.StorageClassName == quadlet.StorageClassHostPath {
+		return true
+	}
+	_, ok := pvc.Annotations[quadlet.AnnotationHostPath]
+	return ok
 }
 
 func cmdStatus() {

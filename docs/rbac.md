@@ -149,7 +149,7 @@ synthetic: they are served by get and list, carry the
 `kubernetes.io/bootstrapping: rbac-defaults` label and are read-only. Their
 rules follow the Kubernetes defaults for the resources q8s serves. `view` can
 read workloads, logs, services, ConfigMaps, nodes and metrics but not Secrets;
-`edit` adds writes to workloads plus full read of Secrets; `admin` adds read
+`edit` adds writes to workloads (including `deployments/scale`) plus full read of Secrets; `admin` adds read
 of Roles and RoleBindings in a namespace; `cluster-admin` is the wildcard.
 
 ## User kubeconfigs
@@ -186,7 +186,9 @@ q8s kubeconfig --revoked
 `--revoke` adds a user name, `--revoke-serial` a lowercase hexadecimal serial,
 and `--revoked` prints the list. A user revocation matches the certificate
 CommonName, so it covers every certificate issued for that user; a serial
-revocation covers one certificate. The file is `{dataDir}/revoked.json`
+revocation covers one certificate, and it is permanent: it also rejects
+certificates issued later, so `q8s kubeconfig --user` refuses a revoked name.
+Issue the new kubeconfig under another user name. The file is `{dataDir}/revoked.json`
 (rootful `/etc/q8s/revoked.json`, rootless
 `~/.local/share/q8s/revoked.json`), written with mode 0600 through a temporary
 file and rename. The server checks it on every request and re-reads it when

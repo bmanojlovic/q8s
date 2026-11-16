@@ -74,30 +74,6 @@ func TestUnsupportedStoredVolumeRendersNamespacedEmptyDirName(t *testing.T) {
 	assertNotContains(t, out, "Volume=host:/host")
 }
 
-// TestPodIdentityLabelsComeAfterUserLabels pins the label order: podman keeps
-// the last value of a repeated label key, so q8s identity labels must be
-// written after the user labels they protect.
-func TestPodIdentityLabelsComeAfterUserLabels(t *testing.T) {
-	pod := simplePod("default", "app", "img")
-	pod.Labels = map[string]string{"zebra": "last", "app": "demo"}
-
-	out := string(mustContainer(t, pod, ""))
-	user := strings.Index(out, "Label=app=demo")
-	identity := []int{
-		strings.Index(out, "Label=io.kubernetes.pod.name=app"),
-		strings.Index(out, "Label=io.kubernetes.pod.namespace=default"),
-		strings.Index(out, "Label=app.kubernetes.io/managed-by=q8s"),
-	}
-	if user < 0 {
-		t.Fatalf("user label not found:\n%s", out)
-	}
-	for _, i := range identity {
-		if i < 0 || i < user {
-			t.Fatalf("identity label is missing or comes before the user labels:\n%s", out)
-		}
-	}
-}
-
 // TestStoredLabelValueCannotInjectLabelItems: the render-time guard rejects a
 // value that would start another Label= item even when the API was bypassed.
 func TestStoredLabelValueCannotInjectLabelItems(t *testing.T) {
@@ -112,6 +88,47 @@ func TestStoredLabelValueCannotInjectLabelItems(t *testing.T) {
 		pod.Labels = map[string]string{"app": value}
 		if _, err := quadlet.Container(pod.Name, pod, "", nil, nil, "", nil); err == nil {
 			t.Errorf("label value %q was rendered without an error", value)
+		}
+	}
+}
+
+// TestEmptyDirVolumeNameSetsMatchTheStoredVolumes pins that delete and doctor
+// compute the emptyDir names from the stored spec with the same owner and
+// that PVC, ConfigMap and Secret sources are not treated as emptyDir volumes.
+func TestEmptyDirVolumeNameSetsMatchTheStoredVolumes(t *testing.T) {
+	pod := simplePod("default", "web-0", "img")
+	pod.OwnerReferences = []metav1.OwnerReference{{Kind: "Deployment", Name: "web"}}
+	pod.Spec.Volumes = []corev1.Volume{
+		{Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "scratch", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "shm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}}},
+		{Name: "claim", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}}},
+		{Name: "config", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{}}},
+		{Name: "secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{}}},
+	}
+	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "cache", MountPath: "/cache"}}
+
+	want := []string{"q8s_default_web_cache", "q8s_default_web_scratch", "q8s_default_web_shm"}
+	names := quadlet.EmptyDirVolumeNames(pod)
+	if len(names) != len(want) {
+		t.Fatalf("EmptyDirVolumeNames = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("EmptyDirVolumeNames = %v, want %v", names, want)
+		}
+	}
+	bases := quadlet.EmptyDirVolumeBases(&pod.Spec)
+	if len(bases) != 3 || bases[0] != "cache" || bases[1] != "scratch" || bases[2] != "shm" {
+		t.Fatalf("EmptyDirVolumeBases = %v, want [cache scratch shm]", bases)
+	}
+	fromSpec := quadlet.EmptyDirVolumeNamesForSpec("default", "web", &pod.Spec)
+	if len(fromSpec) != len(names) {
+		t.Fatalf("EmptyDirVolumeNamesForSpec = %v, want %v", fromSpec, names)
+	}
+	for i := range names {
+		if fromSpec[i] != names[i] {
+			t.Fatalf("EmptyDirVolumeNamesForSpec = %v, want %v", fromSpec, names)
 		}
 	}
 }

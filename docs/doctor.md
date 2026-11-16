@@ -5,9 +5,12 @@ the operator: what does this machine give my workloads, and what does it not?
 
 The command never writes a file, starts a container, runs `podman run`, or
 changes a setting. The only external commands it runs are `podman version`,
-`podman info`, `systemctl` (rootful only, for firewalld state), and (rootless
-only) `loginctl` through `install.LingerEnabled`. Everything else is a read of
-an existing file or a `statfs` call.
+`podman info`, `podman volume ls` (for the orphaned volumes check),
+`systemctl` (rootful only, for firewalld state), and (rootless only)
+`loginctl` through `install.LingerEnabled`. Everything else is a read of an
+existing file or a `statfs` call. The orphaned volumes check reads
+`<data dir>/store.json` read-only: it takes no lock and writes nothing, so it
+is safe while `q8s serve` is running.
 
 ```sh
 q8s doctor          # human report
@@ -213,6 +216,29 @@ the threshold is a warn: `POST`, `PUT` and `PATCH` answer 507 and the node
 reports `DiskPressure`, while running containers keep running. The fix names
 the low paths. Otherwise the check is ok.
 
+### `volumes`
+
+Reports Podman volumes that no stored object uses anymore. It never deletes
+anything; the `fix:` lines are the `podman volume rm <name>` commands an
+administrator can run after checking the data is no longer needed.
+
+It reads `<data dir>/store.json` read-only and computes the expected volume
+names from the stored Pods, Deployments, Jobs, CronJobs and PVCs. A
+`q8s_<namespace>_<owner>_<volume>` volume that no stored emptyDir produces is
+an orphan of a deleted workload. A volume carrying the label
+`app.kubernetes.io/managed-by=q8s` that is not the volume of a stored PVC is
+the data of a deleted PVC (PVC data is never deleted automatically). A volume
+whose name equals the plain volume name of an emptyDir in a stored workload
+and has no managed-by label is a legacy emptyDir name from before v0.11.1.
+
+A stored emptyDir or PVC volume is never reported, and neither is a volume
+without the `q8s_` prefix, without the label, and without a stored legacy
+emptyDir name. When the store cannot be read (for example because q8s is not
+installed or `q8s serve` has not created it yet), the check is informational
+and says `skipped: <reason>`. The podman call goes through the same Env
+command runner as the other checks, so the check is unit-tested without a
+real podman.
+
 ## Summary
 
 The five summary lines are always present and are derived from the checks:
@@ -233,4 +259,4 @@ in scripts:
 
 `podman`, `kernel`, `userns`, `idmap`, `linger` (rootless only), `cgroups`,
 `network`, `firewall-reload` (rootful only), `certificates`, `traefik-dir`,
-`disk`.
+`disk`, `volumes`.

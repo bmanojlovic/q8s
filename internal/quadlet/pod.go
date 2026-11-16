@@ -551,12 +551,21 @@ func podShmSize(pod *corev1.Pod) (size int64, found bool) {
 // a pod member adds io.kubernetes.container.name so status sync and
 // `podman ps --filter label=...` can identify it.
 func writePodLabels(b *strings.Builder, pod *corev1.Pod, containerName string) error {
+	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.name=%s\n", pod.Name))
+	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.namespace=%s\n", pod.Namespace))
+	for _, or := range pod.OwnerReferences {
+		if or.Kind == "Deployment" {
+			b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.deployment=%s\n", or.Name))
+		}
+	}
 	// Propagate the Pod's own labels onto the container so Service selector
 	// matching can be done with a plain `podman ps --filter label=k=v` built
 	// straight from Service.Spec.Selector, with no separate bookkeeping.
-	// User labels go first: podman keeps the last value of a repeated label
-	// key, so the identity labels below must be written after them and can
-	// never be overridden by a stored object that bypassed API validation.
+	// The identity labels stay first so an upgrade does not re-render (and
+	// restart) every unit. A user label cannot override them: keys are
+	// checked against the reserved list and values may not contain
+	// whitespace or quotes (validateLabelPair), so each user label is exactly
+	// one key=value item.
 	// Sorted so an unchanged pod renders byte-identically every time (the
 	// template hash depends on it).
 	keys := make([]string, 0, len(pod.Labels))
@@ -569,13 +578,6 @@ func writePodLabels(b *strings.Builder, pod *corev1.Pod, containerName string) e
 			return err
 		}
 		b.WriteString(fmt.Sprintf("Label=%s=%s\n", k, pod.Labels[k]))
-	}
-	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.name=%s\n", pod.Name))
-	b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.namespace=%s\n", pod.Namespace))
-	for _, or := range pod.OwnerReferences {
-		if or.Kind == "Deployment" {
-			b.WriteString(fmt.Sprintf("Label=io.kubernetes.pod.deployment=%s\n", or.Name))
-		}
 	}
 	if containerName != "" {
 		b.WriteString(fmt.Sprintf("Label=io.kubernetes.container.name=%s\n", containerName))

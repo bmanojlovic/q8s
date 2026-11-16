@@ -15,12 +15,18 @@ package hostcheck
 
 import (
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"q8s/internal/quadlet"
+	"q8s/internal/store"
 )
 
 type Status string
@@ -167,6 +173,7 @@ func Run(env Env) Report {
 	r.Checks = append(r.Checks, certCheck)
 	r.Checks = append(r.Checks, checkTraefikDir(env))
 	r.Checks = append(r.Checks, checkDiskSpace(env))
+	r.Checks = append(r.Checks, checkOrphanedVolumes(env))
 
 	r.Summary = buildSummary(env, r.Checks, certInfo)
 	if r.Summary == nil {
@@ -806,6 +813,143 @@ func checkDiskSpace(env Env) Check {
 	c.Status = StatusOK
 	c.Gain = "q8s can persist changes"
 	return c
+}
+
+// managedByVolumeLabel is the label q8s writes on a PVC's .volume quadlet.
+const managedByVolumeLabel = "app.kubernetes.io/managed-by"
+
+// podmanVolume is the subset of `podman volume ls --format json` the
+// orphaned volumes check needs.
+type podmanVolume struct {
+	Name   string            `json:"Name"`
+	Labels map[string]string `json:"Labels"`
+}
+
+// checkOrphanedVolumes lists Podman volumes no stored object uses anymore.
+// It is report only: it never removes a volume, it prints the
+// `podman volume rm` command an administrator can run. The store is read
+// through Env.ReadFile from <data dir>/store.json and parsed without writing
+// or locking, so the check also works while the server is running.
+func checkOrphanedVolumes(env Env) Check {
+	c := Check{ID: "volumes", Title: "podman volumes"}
+	if env.Dirs.Data == "" {
+		c.Status = StatusInfo
+		c.Detail = "skipped: no data directory"
+		return c
+	}
+	storeFile := filepath.Join(env.Dirs.Data, "store.json")
+	data, err := env.readFile(storeFile)
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + storeFile + ": " + err.Error()
+		return c
+	}
+	st, err := store.LoadReadOnly(data)
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + storeFile + ": " + err.Error()
+		return c
+	}
+
+	inUseEmptyDir, legacyEmptyDir, inUsePVC := expectedVolumes(st)
+
+	out, err := env.command("podman", "volume", "ls", "--format", "json")
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: podman volume ls: " + err.Error()
+		return c
+	}
+	var volumes []podmanVolume
+	if err := json.Unmarshal(out, &volumes); err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: podman volume ls: " + err.Error()
+		return c
+	}
+	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
+
+	var found, fix []string
+	for _, vol := range volumes {
+		var reason string
+		switch {
+		case inUseEmptyDir[vol.Name] || inUsePVC[vol.Name]:
+			continue
+		case strings.HasPrefix(vol.Name, "q8s_"):
+			reason = "no stored workload uses it"
+		case legacyEmptyDir[vol.Name] && vol.Labels[managedByVolumeLabel] != "q8s":
+			reason = "legacy emptyDir name (before v0.11.1)"
+		case vol.Labels[managedByVolumeLabel] == "q8s":
+			reason = "data of deleted PVC"
+		default:
+			continue
+		}
+		found = append(found, vol.Name+" ("+reason+")")
+		fix = append(fix, "podman volume rm "+vol.Name)
+	}
+
+	if len(found) == 0 {
+		c.Status = StatusOK
+		c.Detail = "no orphaned volumes"
+		c.Gain = "no leftover emptyDir or PVC data volume takes disk space"
+		return c
+	}
+	c.Status = StatusWarn
+	c.Detail = fmt.Sprintf("%d volume(s) no stored object uses: %s", len(found), strings.Join(found, ", "))
+	c.Loss = "these volumes still take disk space and nothing references them"
+	c.Fix = strings.Join(fix, "\n")
+	return c
+}
+
+// expectedVolumes computes the volume names the stored objects still use:
+// the current emptyDir names, their plain legacy names, and the PVC volume
+// names. Hostpath PVCs have no Podman volume.
+func expectedVolumes(st *store.Store) (emptyDir, legacy, pvc map[string]bool) {
+	emptyDir = make(map[string]bool)
+	legacy = make(map[string]bool)
+	pvc = make(map[string]bool)
+
+	addSpec := func(ns, owner string, spec *corev1.PodSpec) {
+		for _, name := range quadlet.EmptyDirVolumeNamesForSpec(ns, owner, spec) {
+			emptyDir[name] = true
+		}
+		for _, name := range quadlet.EmptyDirVolumeBases(spec) {
+			legacy[name] = true
+		}
+	}
+
+	for _, pod := range st.AllPods() {
+		for _, name := range quadlet.EmptyDirVolumeNames(pod) {
+			emptyDir[name] = true
+		}
+		for _, name := range quadlet.EmptyDirVolumeBases(&pod.Spec) {
+			legacy[name] = true
+		}
+	}
+	for _, dep := range st.AllDeployments() {
+		addSpec(dep.Namespace, dep.Name, &dep.Spec.Template.Spec)
+	}
+	for _, job := range st.AllJobs() {
+		addSpec(job.Namespace, job.Name, &job.Spec.Template.Spec)
+	}
+	for _, cj := range st.AllCronJobs() {
+		addSpec(cj.Namespace, cj.Name, &cj.Spec.JobTemplate.Spec.Template.Spec)
+	}
+	for _, claim := range st.AllPVCs() {
+		if pvcUsesHostPath(claim) {
+			continue
+		}
+		pvc[quadlet.PVCVolumeName(claim.Namespace, claim.Name)] = true
+	}
+	return emptyDir, legacy, pvc
+}
+
+// pvcUsesHostPath reports whether a PVC mounts a host directory instead of a
+// Podman named volume.
+func pvcUsesHostPath(pvc *corev1.PersistentVolumeClaim) bool {
+	if pvc.Spec.StorageClassName != nil && *pvc.Spec.StorageClassName == quadlet.StorageClassHostPath {
+		return true
+	}
+	_, ok := pvc.Annotations[quadlet.AnnotationHostPath]
+	return ok
 }
 
 func humanBytes(n uint64) string {

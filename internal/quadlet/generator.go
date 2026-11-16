@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -898,6 +899,47 @@ func PVCVolumeName(ns, name string) string {
 // every replica or run of one workload keeps sharing the same volume.
 func EmptyDirVolumeName(ns, owner, name string) string {
 	return fmt.Sprintf("q8s_%s_%s_%s", ns, owner, name)
+}
+
+// EmptyDirVolumeNames returns the Podman volume names of a pod's emptyDir
+// sources (and any other non-PVC, non-ConfigMap, non-Secret source the
+// generator renders as a named volume). Delete uses it to remove exactly the
+// volumes of the owner that is going away, and `q8s doctor` uses it to build
+// the set of volumes still in use. The names are sorted and unique.
+func EmptyDirVolumeNames(pod *corev1.Pod) []string {
+	return EmptyDirVolumeNamesForSpec(pod.Namespace, emptyDirVolumeOwner(pod), &pod.Spec)
+}
+
+// EmptyDirVolumeNamesForSpec is EmptyDirVolumeNames for a stored pod
+// template, with owner being the Deployment, Job or CronJob name.
+func EmptyDirVolumeNamesForSpec(ns, owner string, spec *corev1.PodSpec) []string {
+	bases := EmptyDirVolumeBases(spec)
+	names := make([]string, 0, len(bases))
+	for _, base := range bases {
+		names = append(names, EmptyDirVolumeName(ns, owner, base))
+	}
+	return names
+}
+
+// EmptyDirVolumeBases returns the plain volume names (metadata.name, not the
+// Podman volume name) of the pod spec's emptyDir-backed sources. It is the
+// set q8s used as Podman volume names before v0.11.1, so `q8s doctor` can
+// recognise those legacy volumes. The names are sorted and unique.
+func EmptyDirVolumeBases(spec *corev1.PodSpec) []string {
+	seen := make(map[string]bool)
+	names := make([]string, 0, len(spec.Volumes))
+	for _, vol := range spec.Volumes {
+		if vol.PersistentVolumeClaim != nil || vol.ConfigMap != nil || vol.Secret != nil {
+			continue
+		}
+		if seen[vol.Name] {
+			continue
+		}
+		seen[vol.Name] = true
+		names = append(names, vol.Name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // emptyDirVolumeOwner returns the workload that owns the emptyDir volume: a

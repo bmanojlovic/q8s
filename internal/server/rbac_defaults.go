@@ -55,6 +55,7 @@ func editClusterRole() *rbacv1.ClusterRole {
 	role := newBuiltinClusterRole("edit", []rbacv1.PolicyRule{
 		{APIGroups: []string{""}, Resources: []string{"configmaps", "persistentvolumeclaims", "pods", "secrets", "serviceaccounts", "services"}, Verbs: writeVerbs},
 		{APIGroups: []string{"apps"}, Resources: []string{"daemonsets", "deployments", "replicasets", "statefulsets"}, Verbs: writeVerbs},
+		{APIGroups: []string{"apps"}, Resources: []string{"deployments/scale", "replicasets/scale", "statefulsets/scale"}, Verbs: writeVerbs},
 		{APIGroups: []string{"batch"}, Resources: []string{"cronjobs", "jobs"}, Verbs: writeVerbs},
 		{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"ingresses"}, Verbs: writeVerbs},
 		{APIGroups: []string{"traefik.io"}, Resources: []string{"ingressroutetcps", "middlewares"}, Verbs: writeVerbs},
@@ -85,6 +86,7 @@ func viewClusterRole() *rbacv1.ClusterRole {
 		{APIGroups: []string{""}, Resources: []string{"configmaps", "events", "namespaces", "nodes", "persistentvolumeclaims", "pods", "serviceaccounts", "services"}, Verbs: readVerbs},
 		{APIGroups: []string{""}, Resources: []string{"pods/log", "pods/status"}, Verbs: readVerbs},
 		{APIGroups: []string{"apps"}, Resources: []string{"daemonsets", "deployments", "replicasets", "statefulsets"}, Verbs: readVerbs},
+		{APIGroups: []string{"apps"}, Resources: []string{"deployments/scale", "replicasets/scale", "statefulsets/scale"}, Verbs: readVerbs},
 		{APIGroups: []string{"batch"}, Resources: []string{"cronjobs", "jobs"}, Verbs: readVerbs},
 		{APIGroups: []string{"networking.k8s.io"}, Resources: []string{"ingresses"}, Verbs: readVerbs},
 		{APIGroups: []string{"traefik.io"}, Resources: []string{"ingressroutetcps", "middlewares"}, Verbs: readVerbs},

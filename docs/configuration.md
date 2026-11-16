@@ -173,6 +173,8 @@ PVCs can specify a `storageClassName` to control how volumes are mounted:
 
 The `hostpath` class reads the host directory from the `q8s.io/host-path` annotation on the PVC. No `.volume` file is generated for hostpath PVCs. An optional `q8s.io/selinux-label` annotation selects the relabel mode for the host directory: `private` (default) emits `:Z`, `shared` emits `:z`, and any other value is rejected.
 
+Deleting a `standard` or `standard-shared` PVC removes only its `.volume` quadlet file. The Podman volume `{namespace}-{name}` and its data are kept, because q8s never deletes PVC data automatically. Remove it by hand when the data is no longer needed: `podman volume rm {namespace}-{name}`. `q8s doctor` reports such a leftover as `data of deleted PVC`. A `hostpath` claim has no Podman volume; deleting it only removes the claim.
+
 Host path storage is available to administrators only: a non-administrator creating or patching a PVC with `storageClassName: hostpath` or the `q8s.io/host-path` annotation gets 403 Forbidden. See [Host access](rbac.md#host-access).
 
 ### Host access

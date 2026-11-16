@@ -359,3 +359,21 @@ func TestRunKubeconfigNameAndServerOverride(t *testing.T) {
 		}
 	}
 }
+
+func TestRunKubeconfigRefusesRevokedUser(t *testing.T) {
+	t.Setenv("Q8S_PORT", "6443")
+	dir := t.TempDir()
+	writeTestCA(t, dir)
+	d := dirs{dataDir: dir}
+	var stdout, stderr bytes.Buffer
+	if err := runKubeconfig([]string{"--revoke", "alice"}, d, &stdout, &stderr); err != nil {
+		t.Fatalf("--revoke alice: %v", err)
+	}
+	err := runKubeconfig([]string{"--user", "alice"}, d, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "is revoked") {
+		t.Fatalf("issuing a revoked user: err = %v", err)
+	}
+	if err := runKubeconfig([]string{"--user", "alice2"}, d, &stdout, &stderr); err != nil {
+		t.Fatalf("another name: %v", err)
+	}
+}
