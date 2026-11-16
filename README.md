@@ -11,7 +11,11 @@ kubectl  ─── HTTPS/mTLS ──▶  q8s  ──▶  Podman Quadlets + syste
 - `kubectl get nodes` — real hostname, IP, OS, CPU/memory/disk, podman version
 - `kubectl top nodes` / `kubectl top pods` — live CPU and memory usage
 - `kubectl describe node` — full output with conditions, capacity, lease
-- Pods, Deployments (scale, rollout restart, env), Services, ConfigMaps, Secrets, Jobs, CronJobs, Namespaces
+- Pods, Deployments (scale, rollout restart, env), Services, ConfigMaps, Secrets, ServiceAccounts, Jobs, CronJobs, Namespaces
+- RBAC: user kubeconfigs, Roles and Bindings, impersonation, certificate revocation ([docs/rbac.md](docs/rbac.md))
+- ServiceAccounts with on-demand pod credentials and no token Secrets ([details](docs/rbac.md#serviceaccounts-in-pods))
+- `kubectl auth can-i`, `kubectl auth can-i --list` and `kubectl auth whoami`
+- Synchronous store saves with gzip snapshots and recovery from a corrupt store ([details](docs/architecture.md#state-persistence))
 - PersistentVolumeClaims backed by Podman volumes or host directories ([storage classes](docs/configuration.md#storage-classes))
 - Ingress, plus Traefik `Middleware` and `IngressRouteTCP` (`traefik.io/v1alpha1`); see [docs/ingress.md](docs/ingress.md) and [docs/traefik.md](docs/traefik.md) (run Traefik v3.7.17 or newer)
 - `kubectl logs`, `kubectl exec -it`, `kubectl get -w` (watch), `kubectl apply --server-side`

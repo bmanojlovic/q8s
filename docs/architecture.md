@@ -7,13 +7,13 @@ kubectl  ─── HTTPS/mTLS ──▶  q8s serve  ──▶  Quadlet files (.c
                                               └──▶  systemd daemon-reload  ──▶  Podman
 ```
 
-When you `kubectl apply` a Pod, q8s writes a Podman Quadlet `.container` file and tells systemd to reload. systemd then starts the container via Podman. Every resource maps directly to a native Linux primitive:
+When you `kubectl apply` a Pod, q8s writes a Podman Quadlet `.container` file (a `.pod` file plus one `.container` per member for a multi-container pod) and tells systemd to reload. systemd then starts the container via Podman. Every resource maps directly to a native Linux primitive:
 
 | Kubernetes resource | Linux primitive |
 |---|---|
 | Namespace | Podman network (`q8s-{ns}.network`) |
-| Pod | Quadlet `.container` unit |
-| Deployment | N indexed Quadlet `.container` units (`{name}-0` … `{name}-N`) with `Restart=on-failure` |
+| Pod | Quadlet `.container` unit, plus a `.pod` unit when the pod has more than one container |
+| Deployment | N indexed pods (`{name}-0` … `{name}-N`), each a `.container` unit or, when multi-container, a `.pod` unit with its containers, with `Restart=on-failure` |
 | PersistentVolumeClaim | Quadlet `.volume` unit (named Podman volume) or host bind mount |
 | ConfigMap | Directory of files bind-mounted into containers |
 | Secret | Directory of files (mode 0600) bind-mounted into containers |
@@ -39,7 +39,15 @@ internal/
     openapi_v2.json  Generated Swagger 2.0 schema for client-side validation
     crds.json     Generated Traefik CRD list
     metrics.go    metrics.k8s.io (kubectl top), coordination.k8s.io (lease)
-    auth.go       mTLS client certificate middleware
+    auth.go       mTLS client certificate middleware and request identity
+    authorizer.go Per-request RBAC authorization
+    rbac.go       Role, RoleBinding, ClusterRole and ClusterRoleBinding handlers
+    rbac_defaults.go  Built-in ClusterRoles
+    authz.go      SelfSubjectAccessReview, SelfSubjectRulesReview, SubjectAccessReview and SelfSubjectReview
+    impersonation.go  Impersonate-User and Impersonate-Group handling
+    revocation.go Revoked certificate cache
+    requestinfo.go    Request path to RBAC attributes
+    workload.go   ServiceAccount credential socket
     table.go      Table response rendering for kubectl get
     selector.go   Label selector filtering
     exec.go       kubectl exec WebSocket handler
@@ -50,7 +58,10 @@ internal/
     deepcopy.go   Hand-written DeepCopy/DeepCopyObject for runtime.Object
 
   store/
-    store.go      In-memory resource store with JSON persistence
+    store.go      In-memory resource store with synchronous JSON persistence and snapshots
+
+  fsutil/
+    fsutil.go     Atomic file writes (temporary file, fsync, rename)
 
 hack/
   gen-openapi/    Generator for internal/server/openapi_v2.json and crds.json
@@ -74,9 +85,60 @@ pkg/
 
 ## State persistence
 
-The store is serialized to `{dataDir}/store.json` on every mutation (atomic write: `.tmp` + rename). On startup, state is loaded from this file. The default namespace is always ensured to exist.
+Every store mutation is written to `{dataDir}/store.json` before the API
+answers. The write is synchronous and atomic: a temporary file in the same
+directory, `fsync`, then `rename`. Each save logs one line with the
+resourceVersion that reached disk:
+
+```text
+store: saved rv 42 (128 KB, 3 ms, snapshot 12 KB)
+```
+
+Mutations are serialized with their save: no other change can happen between
+a mutation and its write. A failed write (full disk, I/O error) answers 500
+`InternalError` and rolls the in-memory state back to the last state that
+reached disk. Deletes remove the object from the store first and only then
+stop its units, so a delete whose save fails leaves the workload running. The
+resourceVersion keeps moving forward, so a version already handed to a client
+is never reused, and the handler stops before it writes any unit file.
+
+A successful save also keeps a gzip copy in `{dataDir}/snapshots` as
+`store.<rv>.json.gz` when the newest snapshot is at least a minute old (the
+log line then says `no snapshot`); the newest 20 are kept, so they reach back
+at least 20 minutes. A snapshot failure is logged but
+does not fail the save. If `store.json` is missing or does not parse while
+snapshots exist, startup loads the newest readable snapshot, renames the
+broken file to `store.json.corrupt-<unix time>` and rewrites `store.json`.
+Each delete advances the resourceVersion as well, so a version names exactly
+one state.
+
+Generated files are written atomically too, through `internal/fsutil`
+(temporary file in the same directory, `fsync`, `rename`): Quadlet units,
+systemd units, ConfigMap and Secret data files, Secret-derived env files,
+Traefik files, the workload kubeconfig and the workload binary copy. A crash
+or a full disk therefore never leaves a truncated file. ConfigMap and Secret
+volumes are directory mounts, so a running container sees the replaced files.
+The stale file cleanup ignores leftover dot-prefixed temporary files.
 
 On startup q8s also re-renders the quadlet file of every stored Pod and Deployment instance. A file whose rendering is unchanged is left alone. A file that changed (typically after a q8s upgrade that renders units differently) is rewritten, and if its service is running it is restarted so the upgrade reaches it; a stopped or finished unit only gets the new file. To apply a change to a running pod without restarting q8s, use `kubectl rollout restart deployment/<name>`.
+
+## Disk guard
+
+While any filesystem q8s writes to has less free space than
+`min(100 MiB, 5% of its size)`, `POST`, `PUT` and `PATCH` answer 507
+`InsufficientStorage` with the low path, its free space and the threshold.
+The check covers the store, Quadlet, systemd, ConfigMap and Traefik
+directories, is cached for 2 seconds, and walks up to the nearest existing
+ancestor of a path that does not exist yet. `DELETE`, pod `exec`, `attach` and
+`portforward` are not blocked, so space can still be freed.
+
+The node's `DiskPressure` condition comes from the same check instead of being
+hard-coded: `True` with reason `KubeletHasDiskPressure` and the low path in
+the message while the guard is active, `False` with reason
+`KubeletHasNoDiskPressure` otherwise. The node then carries the
+`node.kubernetes.io/disk-pressure:NoSchedule` taint, as a kubelet would set
+it. `q8s doctor` reports the same state through the same threshold code; see
+[docs/doctor.md](doctor.md#disk).
 
 ## Sync loop
 
@@ -90,6 +152,13 @@ A background goroutine reconciles state from Podman/systemd every 30 seconds, pl
 | `inactive` + result `exit-code/signal/…` | Failed |
 | `failed` | Failed |
 | anything else | Pending |
+
+A `restartPolicy: Never` pod whose container exits quickly still reaches
+`Succeeded`. Its `--rm` container can already be gone when the next status
+sync runs, and systemd then reports inactive with `Result=success`, exactly
+like a unit that has not started. q8s compares the unit's
+`ExecMainStartTimestamp` with the pod's creation time: a unit that started at
+or after the pod was created ran for this pod.
 
 Deployment-owned pods are restored from container labels on startup if the deployment is missing from the store.
 
@@ -123,7 +192,19 @@ Deployment-owned pods are restored from container labels on startup if the deplo
 
 ## Security
 
-All API traffic uses mutual TLS (mTLS). No certificate = 401. Certificates are ECDSA P-256, valid 1 year. Having the client cert implies full access (single-user system, no RBAC).
+All API traffic uses mutual TLS (mTLS). No certificate = 401. Certificates are
+ECDSA P-256. The administrator certificate from `q8s install` and user
+certificates from `q8s kubeconfig --user` default to 1 year; a pod's
+ServiceAccount certificate is valid for 1 hour.
+
+The client certificate is the identity: CommonName is the user, Organization
+entries are groups, and `system:authenticated` is added. Members of
+`system:masters` or `q8s-user` are administrators and bypass authorization.
+Every other request is authorized against Roles, RoleBindings, ClusterRoles
+and ClusterRoleBindings, with the review endpoints and impersonation described
+in [RBAC and user identities](rbac.md). Revoked certificates are refused with
+401 before authorization runs. The workload credential socket is local and
+unix domain only, and the API itself stays mTLS-only.
 
 ## User namespaces (rootful)
 
@@ -187,9 +268,14 @@ user's subordinate uid range.
 
 ```
 ~/.local/share/q8s/                  # dataDir (rootless)
-  config.json                        # persistent install config (port, serverURL, SANs)
+  config.json                        # persistent install config (name, port, serverURL, SANs)
   store.json                         # persisted resource state
+  store.json.corrupt-<time>          # kept after a recovery from a snapshot
+  snapshots/store.<rv>.json.gz       # newest 20 snapshots
   certs/                             # TLS certificates
+  revoked.json                       # revoked users and serials, after a revocation
+  workload-bin/q8s                   # exec credential plugin copy
+  traefik/                           # generated Traefik dynamic configuration
 
 ~/.config/containers/systemd/        # Podman quadlet directory
   q8s-default.network
@@ -204,7 +290,17 @@ $XDG_RUNTIME_DIR/q8s/               # runtime (tmpfs)
   api.sock
   configmaps/{ns}/{name}/{key}
   secrets/{ns}/{name}/{key}          # mode 0600
+  workload/kubeconfig
+  workload/ns/{ns}/kubeconfig
+  workload/sa.sock                   # ServiceAccount credential socket
 ```
+
+Rootful uses `/etc/q8s` for the data directory and `/run/q8s` for the runtime
+directory. `q8s-api.service` sets `RuntimeDirectoryPreserve=yes`, so a q8s
+restart or upgrade keeps `/run/q8s` in place. Running pods keep their bind
+mounts on the ConfigMap and Secret directories under it; without the setting
+systemd would delete the tree on stop and the next start would create new
+directories, leaving those pods with empty volumes.
 
 ## Design boundary: translate, don't operate
 
@@ -216,6 +312,6 @@ another component already owns. Consequences:
 - **Public TLS** is Traefik's (`secretName` on Ingress is accepted, not read).
 - **Service fan-out** is Traefik's `loadBalancer.servers`, kept in sync from
   selectors — q8s doesn't proxy traffic itself.
-- **DNS/ACME/cert renewal, RBAC, scheduling, multi-node** — out of scope by
+- **DNS/ACME/cert renewal, scheduling, multi-node**: out of scope by
   design; if a feature needs q8s to become a participant in a runtime path,
   the default answer is no.

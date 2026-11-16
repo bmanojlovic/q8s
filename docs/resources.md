@@ -1,6 +1,6 @@
 # Supported Resources
 
-Every pod spec q8s accepts must contain exactly one container; specs with additional containers, initContainers, or ephemeralContainers are rejected.
+Pods and Deployments accept one or more containers; multiple containers run as one Podman pod. Jobs and CronJobs run exactly one container; sidecars there, and `initContainers` and `ephemeralContainers` everywhere, are rejected.
 
 ## core/v1
 
@@ -8,18 +8,28 @@ Every pod spec q8s accepts must contain exactly one container; specs with additi
 |---|---|---|
 | `nodes` | get, list | Synthetic single node with real machine stats |
 | `namespaces` | get, list, create, patch, delete | Creates a `q8s-{ns}.network` Podman network; patch updates labels and annotations |
-| `pods` | get, list, create, patch, delete | Writes a `.container` Quadlet; patch rewrites and restarts; also lists derived CronJob runs |
+| `pods` | get, list, create, patch, delete | Writes a `.container` Quadlet, or `.container` units plus a `.pod` unit for a multi-container pod; patch rewrites and restarts; also lists derived CronJob runs |
 | `services` | get, list, create, patch, delete | Selector + port map: DNS aliases (NetworkAlias) and ingress backend resolution; never binds a host port |
 | `persistentvolumeclaims` | get, list, create, patch, delete | Named Podman volume; storageClass selects mount mode |
-| `configmaps` | get, list, create, update, patch, delete | Files at `{configDir}/{ns}/{name}/` |
-| `secrets` | get, list, create, patch, delete | Files at `{secretDir}/{ns}/{name}/` (mode 0600) |
+| `configmaps` | get, list, create, update, patch, delete | Files at `{configDir}/{ns}/{name}/`; `data` and `binaryData` values, 1 MiB total |
+| `secrets` | get, list, create, patch, delete | Files at `{secretDir}/{ns}/{name}/` (mode 0600); `data` and `stringData` values, 1 MiB total |
+| `serviceaccounts` | get, list, create, update, patch, delete | Identity for pod credentials; no token Secrets |
 | `events` | get, list, watch | In-memory, last 500, server-generated |
+
+A ServiceAccount is only an identity: q8s stores no token Secret for it and
+runs no token controller. See
+[ServiceAccounts in pods](rbac.md#serviceaccounts-in-pods).
+
+A `restartPolicy: Never` pod whose container exits quickly reaches
+`Succeeded`. q8s compares the unit's `ExecMainStartTimestamp` with the pod's
+creation time, so a unit that ran for this pod is not mistaken for one that
+has not started yet.
 
 ## apps/v1
 
 | Resource | kubectl verbs | Notes |
 |---|---|---|
-| `deployments` | get, list, create, patch, delete, scale | Indexed `.container` units; scale, rollout restart, set env |
+| `deployments` | get, list, create, patch, delete, scale | Indexed `.container` units, plus a `.pod` unit per instance for a multi-container pod; scale, rollout restart, set env |
 | `daemonsets` | get, list | Empty stub |
 | `statefulsets` | get, list | Empty stub |
 | `replicasets` | get, list | Empty stub |
@@ -54,6 +64,32 @@ and answers 405; delete the CronJob itself instead. Runs that started before
 the CronJob was created (an earlier CronJob with the same name) are not
 shown. Runs are never part of a
 watch response.
+
+## rbac.authorization.k8s.io/v1
+
+| Resource | kubectl verbs | Notes |
+|---|---|---|
+| `roles` | get, list, create, update, patch, delete | Namespaced; rules need verbs and resources (`nonResourceURLs` only in a ClusterRole) |
+| `rolebindings` | get, list, create, update, patch, delete | Namespaced; `roleRef` is immutable; a RoleBinding may point at a Role or a ClusterRole |
+| `clusterroles` | get, list, create, update, patch, delete | `cluster-admin`, `admin`, `edit` and `view` are built-in and read-only |
+| `clusterrolebindings` | get, list, create, update, patch, delete | `roleRef` must be a ClusterRole and is immutable |
+
+Writes to these objects are administrator-only. Deleting a namespace deletes
+its Roles and RoleBindings. See [RBAC and user identities](rbac.md).
+
+## authorization.k8s.io/v1
+
+| Resource | kubectl verbs | Notes |
+|---|---|---|
+| `selfsubjectaccessreviews` | create | `kubectl auth can-i` |
+| `selfsubjectrulesreviews` | create | `kubectl auth can-i --list` |
+| `subjectaccessreviews` | create | Administrators only |
+
+## authentication.k8s.io/v1
+
+| Resource | kubectl verbs | Notes |
+|---|---|---|
+| `selfsubjectreviews` | create | `kubectl auth whoami` |
 
 ## networking.k8s.io/v1
 
@@ -147,8 +183,9 @@ IngressRouteTCP objects.
 
 | Subresource | kubectl command | Notes |
 |---|---|---|
-| `log` | `kubectl logs [-f] [--tail N] [--timestamps]` | Streams `podman logs` |
+| `log` | `kubectl logs [-f] [--tail N] [--timestamps]` | Live containers stream `podman logs`; a finished or removed container is read from the journal (the pod's unit and `CONTAINER_NAME`), limited to lines since the pod was created |
 | `exec` | `kubectl exec [-it] pod -- cmd` | WebSocket v5.channel.k8s.io |
+| `attach` | `kubectl attach pod` | WebSocket attach to the container's main process |
 
 ## Features
 
@@ -166,3 +203,8 @@ IngressRouteTCP objects.
 - **StartLimitBurst=5**: systemd gives up after 5 failures within 60s
 - **Delete cascade**: deployment delete removes owned pods, stops units, removes quadlets
 - **Deployment restore**: on restart, deployment recreated from container labels if missing
+- **command and args**: `command` replaces the image ENTRYPOINT (`Entrypoint=`) and `args` replaces CMD (`Exec=`), as in Kubernetes
+- **Pod labels**: keys under `io.kubernetes.`, `io.podman.`, `io.containers.`, `PODMAN_` or `q8s.io/`, and `app.kubernetes.io/managed-by`, are rejected with 422
+- **ConfigMap and Secret size**: the values of `data` plus `binaryData`, or `data` plus `stringData`, are limited to 1048576 bytes on create, update and patch
+- **creationTimestamp**: set on create for every stored kind and preserved on update; a ConfigMap, Secret, PVC or Service loaded from an older store without one gets the store file's modification time
+- **ServiceAccount credentials**: see [ServiceAccounts in pods](rbac.md#serviceaccounts-in-pods)

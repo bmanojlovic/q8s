@@ -29,6 +29,9 @@ kubectl config set-context q8s --cluster=q8s --user=q8s
 kubectl config use-context q8s
 ```
 
+This is the administrator kubeconfig. For additional users, certificates and
+revocation, see [RBAC and user identities](rbac.md#user-kubeconfigs).
+
 ## Rootless vs rootful
 
 | | Rootless | Rootful |
@@ -74,7 +77,13 @@ q8s enable     # enable and start socket on boot
 q8s disable    # disable socket
 q8s status     # show socket/service state
 q8s doctor     # read-only host capability report
-q8s kubeconfig # print kubeconfig to stdout (uses persisted server URL)
+q8s kubeconfig # print the administrator kubeconfig (uses persisted server URL)
+q8s kubeconfig --user alice --group dev --days 90  # issue a user kubeconfig
+q8s kubeconfig --name demo --server https://192.0.2.10:6443  # override cluster name and URL
+q8s kubeconfig --revoke alice       # add a user to revoked.json
+q8s kubeconfig --revoke-serial HEX  # add a certificate serial to revoked.json
+q8s kubeconfig --revoked            # list revoked users and serials
+q8s credential # exec credential plugin used inside pods
 ```
 
 ## Persistent configuration
@@ -83,6 +92,7 @@ q8s kubeconfig # print kubeconfig to stdout (uses persisted server URL)
 
 ```json
 {
+  "name": "myhost",
   "port": 6443,
   "serverURL": "https://myhost:6443",
   "extraSANIPs": ["10.0.0.5"],
@@ -90,6 +100,8 @@ q8s kubeconfig # print kubeconfig to stdout (uses persisted server URL)
 }
 ```
 
+- **Name** is the cluster and context name used by `q8s kubeconfig`; it defaults
+  to the hostname and can be overridden with `--name`
 - **Port** and **serverURL** are used by `q8s kubeconfig` and `q8s status`
 - **SANs** survive cert regeneration — no need to re-pass `--san-ip`/`--san-dns`
 - Port can be overridden per-invocation with `Q8S_PORT` env var
@@ -100,7 +112,7 @@ q8s kubeconfig # print kubeconfig to stdout (uses persisted server URL)
 
 ## Pod-to-Quadlet mapping
 
-A Pod spec translates to a `.container` file:
+A single-container Pod spec translates to a `.container` file; a multi-container pod gets a `.pod` file and one `.container` member file per container:
 
 ```ini
 [Container]
@@ -127,6 +139,27 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 ```
+
+### command and args
+
+`command` and `args` keep the Kubernetes meaning:
+
+| Pod field | Quadlet key | Effect |
+|---|---|---|
+| `command` | `Entrypoint=` (JSON array) | replaces the image ENTRYPOINT |
+| `args` | `Exec=` | replaces the image CMD |
+
+With `command` and no `args`, the image CMD is dropped, as podman does when
+the entrypoint is overridden. With only `args`, the image ENTRYPOINT stays.
+With neither, the image defaults are unchanged. A container that sets
+`command` renders differently from v0.8.x and restarts once on upgrade.
+
+Pod labels become `Label=` lines after the labels q8s sets. A label key under
+`io.kubernetes.`, `io.podman.`, `io.containers.`, `PODMAN_` or `q8s.io/`, or
+the key `app.kubernetes.io/managed-by`, is rejected with 422.
+
+A pod with `serviceAccountName` also gets two read-only workload mounts and
+`KUBECONFIG`; see [ServiceAccounts in pods](rbac.md#serviceaccounts-in-pods).
 
 ## Storage classes
 

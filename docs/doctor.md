@@ -53,6 +53,8 @@ q8s doctor: rootful, podman 5.8.2, kernel 6.12.0-160100.8-default
        gain: the q8s API certificate is trusted until 2027-08-01
 [ok]   traefik-dir   /etc/q8s/traefik is writable
        gain: Ingress changes can be written immediately
+[ok]   disk          /etc/q8s: 42.1 GiB free, need 100.0 MiB
+       gain: q8s can persist changes
 
 summary
   isolation     host uids (weak)
@@ -197,6 +199,20 @@ created on the first Ingress, so a missing directory is only informational
 (`no Ingress written yet`). If it exists but is not writable, Ingress changes
 cannot be written and the check fails.
 
+### `disk`
+
+Reports free space on the data directory and on the Quadlet directory when it
+is a different filesystem, with the threshold q8s requires:
+`min(100 MiB, 5% of the filesystem size)`. It uses `DiskFree` from the API
+server's write guard, so the report and the guard cannot disagree. The guard
+also checks the systemd, ConfigMap and Traefik directories; the doctor check
+covers the two that hold persistent state.
+
+No path to check, or `statfs` unavailable, is informational. Free space below
+the threshold is a warn: `POST`, `PUT` and `PATCH` answer 507 and the node
+reports `DiskPressure`, while running containers keep running. The fix names
+the low paths. Otherwise the check is ok.
+
 ## Summary
 
 The five summary lines are always present and are derived from the checks:
@@ -216,4 +232,5 @@ optional `gain`, `loss`, and `fix` fields. The ids are stable and safe to match
 in scripts:
 
 `podman`, `kernel`, `userns`, `idmap`, `linger` (rootless only), `cgroups`,
-`network`, `firewall-reload` (rootful only), `certificates`, `traefik-dir`.
+`network`, `firewall-reload` (rootful only), `certificates`, `traefik-dir`,
+`disk`.

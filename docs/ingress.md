@@ -297,10 +297,11 @@ usually needs: Traefik then sends the upstream's own Host header instead of
 the Ingress host. When the annotation is absent the key is omitted from the
 generated file, so Traefik's default (send the request Host) applies.
 
-`serversscheme` and `serverstransport` must already exist in Traefik's
-dynamic configuration; q8s only references a transport, it never generates
-one. An invalid value is rejected with HTTP 422 on Service create, update or
-patch, and an invalid value found in the store is ignored when rendering.
+`serverstransport` must name a transport that already exists in Traefik's
+dynamic configuration; q8s only references it, it never generates one. An
+invalid value of any of the three annotations is rejected with HTTP 422 on
+Service create or patch, and an invalid value found in the store is ignored
+when rendering.
 
 **In-pod DNS is not provided for ExternalName.** q8s pods resolve names
 through podman's aardvark-dns, which has no static-record feature, so a pod
