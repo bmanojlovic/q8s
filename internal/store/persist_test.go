@@ -336,6 +336,49 @@ func TestSnapshotThrottleSkipsRecentSnapshot(t *testing.T) {
 	}
 }
 
+// TestSnapshotTailWritesLastBurstState: a save that skips its snapshot arms a
+// timer, so the final state of a burst is still recoverable when no mutation
+// follows.
+func TestSnapshotTailWritesLastBurstState(t *testing.T) {
+	restore := store.SetSnapshotIntervalForTest(100 * time.Millisecond)
+	t.Cleanup(restore)
+
+	st, file := newFileStore(t)
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("burst-%d", i)
+		if _, err := st.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil {
+			t.Fatalf("CreateNamespace %s: %v", name, err)
+		}
+	}
+	finalRV := st.ResourceVersion()
+	if rvs := snapshotRVs(t, file); len(rvs) == 1 && rvs[0] == finalRV {
+		t.Fatal("burst finished with only its first snapshot; test needs the throttle to skip a later save")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rvs := snapshotRVs(t, file)
+		if len(rvs) > 0 && rvs[len(rvs)-1] == finalRV {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no tail snapshot at rv %d, snapshots %v", finalRV, rvs)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	loaded, err := store.Load(file)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("burst-%d", i)
+		if _, err := loaded.GetNamespace(name); err != nil {
+			t.Fatalf("namespace %q missing from the tail snapshot: %v", name, err)
+		}
+	}
+}
+
 // TestLoadRemembersNewestSnapshotTime: on startup the throttle starts from
 // the newest snapshot's mtime, so a restart does not immediately rewrite a
 // snapshot that is still fresh.

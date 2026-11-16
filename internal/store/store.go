@@ -60,12 +60,21 @@ type Store struct {
 	// to dataFile (or loaded from it). A failed write restores the in-memory
 	// maps from it so memory never gets ahead of disk.
 	lastGood []byte
+	// lastGoodRV is the resourceVersion inside lastGood. Only touched under
+	// s.mu.
+	lastGoodRV int
 	// writeHook, when set, runs before every store file write. It is a test
 	// seam for injecting a failed write; it runs under saveMu.
 	writeHook func([]byte) error
 	// lastSnapshot is when the newest gzip snapshot was written. Only
 	// touched under saveMu.
-	lastSnapshot        time.Time
+	lastSnapshot time.Time
+	// lastSnapshotRV is the resourceVersion of the newest gzip snapshot. Only
+	// touched under saveMu.
+	lastSnapshotRV int
+	// snapshotTimer is the one pending tail snapshot armed by a save that
+	// skipped its snapshot. Only touched under saveMu.
+	snapshotTimer       *time.Timer
 	pods                map[types.NamespacedName]*corev1.Pod
 	services            map[types.NamespacedName]*corev1.Service
 	pvcs                map[types.NamespacedName]*corev1.PersistentVolumeClaim
@@ -100,12 +109,6 @@ type Store struct {
 	eventsMu sync.Mutex
 	events   []*corev1.Event
 	eventSeq int
-
-	// deleting marks resources whose store entry is gone but whose units and
-	// containers are still being torn down. Reconcile skips them so a
-	// container that is still visible to podman is not imported back.
-	deletingMu sync.Mutex
-	deleting   map[string]struct{}
 }
 
 // maxEvents caps the in-memory event feed; oldest events are dropped once
@@ -272,8 +275,10 @@ const snapshotRetain = 20
 // snapshotInterval is how old the newest snapshot must be before persist
 // writes another one. store.json is still written on every persist; the
 // snapshots are recovery points, so a burst of status updates must not fill
-// the retain window with a few seconds of history. Tests set it to 0 to write
-// a snapshot on every persist.
+// the retain window with a few seconds of history. A persist that skips its
+// snapshot arms one tail timer for the rest of the interval, so the last
+// state of the burst is still snapshotted. Tests set it to 0 to write a
+// snapshot on every persist.
 var snapshotInterval = 60 * time.Second
 
 // Load reads the store from dataFile if it exists; otherwise returns a fresh Store.
@@ -285,7 +290,7 @@ var snapshotInterval = 60 * time.Second
 func Load(dataFile string) (*Store, error) {
 	s := newEmpty()
 	s.dataFile = dataFile
-	s.lastSnapshot = s.newestSnapshotModTime()
+	s.lastSnapshot, s.lastSnapshotRV = s.newestSnapshotState()
 
 	data, err := os.ReadFile(dataFile)
 	if os.IsNotExist(err) {
@@ -319,6 +324,7 @@ func Load(dataFile string) (*Store, error) {
 	s.mu.Lock()
 	s.installSnapshotLocked(&snap)
 	s.lastGood = append([]byte(nil), data...)
+	s.lastGoodRV = snap.ResourceVer
 	s.mu.Unlock()
 	return s, nil
 }
@@ -329,6 +335,7 @@ func (s *Store) adoptSnapshot(file string, snap *snapshot, raw []byte, readErr e
 	s.mu.Lock()
 	s.installSnapshotLocked(snap)
 	s.lastGood = append([]byte(nil), raw...)
+	s.lastGoodRV = snap.ResourceVer
 	s.mu.Unlock()
 
 	fmt.Printf("store: store.json unreadable (%v), recovered from snapshot %s (rv %d)\n", readErr, file, snap.ResourceVer)
@@ -464,12 +471,14 @@ func (s *Store) installSnapshotLocked(snap *snapshot) {
 func (s *Store) setLastGoodFromState() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data, err := json.Marshal(s.snapshot())
+	snap := s.snapshot()
+	data, err := json.Marshal(snap)
 	if err != nil {
 		fmt.Printf("store: marshal error: %v\n", err)
 		return
 	}
 	s.lastGood = data
+	s.lastGoodRV = snap.ResourceVer
 }
 
 // snapshotsDir is the directory holding the gzip snapshots next to store.json.
@@ -666,14 +675,25 @@ func (s *Store) persistLocked() error {
 
 	s.mu.Lock()
 	s.lastGood = append([]byte(nil), data...)
+	s.lastGoodRV = snap.ResourceVer
 	s.mu.Unlock()
 
 	written := time.Since(start)
 	gz := 0
+	snapshotWritten := false
 	if s.snapshotDue() {
 		if gz = s.writeSnapshot(snap.ResourceVer, data); gz > 0 {
 			s.lastSnapshot = time.Now()
+			s.lastSnapshotRV = snap.ResourceVer
+			snapshotWritten = true
+			if s.snapshotTimer != nil {
+				s.snapshotTimer.Stop()
+				s.snapshotTimer = nil
+			}
 		}
+	}
+	if !snapshotWritten {
+		s.armSnapshotTailLocked()
 	}
 	if gz > 0 {
 		fmt.Printf("store: saved rv %d (%d KB, %d ms, snapshot %d KB)\n",
@@ -694,19 +714,66 @@ func (s *Store) snapshotDue() bool {
 	return time.Since(s.lastSnapshot) >= snapshotInterval
 }
 
-// newestSnapshotModTime returns the modification time of the newest snapshot
-// file, or the zero time when there is none. Load uses it so a restart does
-// not immediately rewrite a snapshot that is still fresh.
-func (s *Store) newestSnapshotModTime() time.Time {
+// newestSnapshotState returns the modification time and resourceVersion of
+// the newest snapshot file. Load uses them so a restart neither immediately
+// rewrites a snapshot that is still fresh nor takes a tail snapshot of state
+// that is already covered.
+func (s *Store) newestSnapshotState() (time.Time, int) {
 	files := s.listSnapshotFiles()
 	if len(files) == 0 {
-		return time.Time{}
+		return time.Time{}, 0
 	}
 	info, err := os.Stat(files[0].path)
 	if err != nil {
-		return time.Time{}
+		return time.Time{}, files[0].rv
 	}
-	return info.ModTime()
+	return info.ModTime(), files[0].rv
+}
+
+// armSnapshotTailLocked schedules the one tail snapshot a throttled save
+// needs. Without it the last writes of a burst would never reach a snapshot if
+// no mutation follows. The caller holds saveMu.
+func (s *Store) armSnapshotTailLocked() {
+	if snapshotInterval <= 0 || s.snapshotTimer != nil {
+		return
+	}
+	delay := snapshotInterval
+	if !s.lastSnapshot.IsZero() {
+		delay = snapshotInterval - time.Since(s.lastSnapshot)
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	s.snapshotTimer = time.AfterFunc(delay, s.writeTailSnapshot)
+}
+
+// writeTailSnapshot writes the snapshot a throttled save postponed. It takes
+// saveMu, so it either runs before the next mutation or sees that mutation's
+// newer lastGood, and skips when a regular save already snapshotted that
+// resourceVersion.
+func (s *Store) writeTailSnapshot() {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
+	s.snapshotTimer = nil
+	if s.dataFile == "" {
+		return
+	}
+	s.mu.RLock()
+	rv := s.lastGoodRV
+	data := append([]byte(nil), s.lastGood...)
+	s.mu.RUnlock()
+	if len(data) == 0 || rv <= s.lastSnapshotRV {
+		return
+	}
+	gz := s.writeSnapshot(rv, data)
+	if gz == 0 {
+		return
+	}
+	s.lastSnapshot = time.Now()
+	s.lastSnapshotRV = rv
+	fmt.Printf("store: saved rv %d (%d KB, snapshot tail %d KB)\n",
+		rv, len(data)/1024, gz/1024)
 }
 
 // writeStoreFile writes data to dataFile atomically. Every failing step is
@@ -1009,28 +1076,11 @@ func (s *Store) DeleteNamespace(name string) error {
 }
 
 // PurgeNamespace removes all resources belonging to a namespace from the store
-// in a single lock acquisition. Called by the namespace delete handler after
-// stopping systemd units so the store and disk stay consistent.
+// in a single mutation. Called by the namespace delete handler after stopping
+// systemd units so the store and disk stay consistent.
 func (s *Store) PurgeNamespace(name string) {
 	_ = s.mutate(func() (bool, error) {
 		s.purgeNamespaceLocked(name)
-		s.resourceVer++
-		return true, nil
-	})
-}
-
-// DeleteNamespaceWithResources removes a namespace and every resource in it
-// in a single mutation, so a failed write cannot leave the namespace without
-// its contents (or its contents without the namespace). The handler does the
-// disk cleanup only after this succeeds. An unknown namespace is an error.
-func (s *Store) DeleteNamespaceWithResources(name string) error {
-	return s.mutate(func() (bool, error) {
-		key := types.NamespacedName{Name: name}
-		if _, ok := s.namespaces[key]; !ok {
-			return false, fmt.Errorf("namespace %q not found", name)
-		}
-		s.purgeNamespaceLocked(name)
-		delete(s.namespaces, key)
 		s.incRV()
 		return true, nil
 	})

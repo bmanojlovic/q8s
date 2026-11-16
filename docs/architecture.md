@@ -97,15 +97,19 @@ store: saved rv 42 (128 KB, 3 ms, snapshot 12 KB)
 Mutations are serialized with their save: no other change can happen between
 a mutation and its write. A failed write (full disk, I/O error) answers 500
 `InternalError` and rolls the in-memory state back to the last state that
-reached disk. Deletes remove the object from the store first and only then
-stop its units, so a delete whose save fails leaves the workload running. The
+reached disk. Deletes stop the units and remove their files first, then
+delete from the store. If that final save fails, the object is rolled back
+and the workload is restored through the same generators a create uses, so
+it is running again instead of surviving in the store with no units. The
 resourceVersion keeps moving forward, so a version already handed to a client
-is never reused, and the handler stops before it writes any unit file.
+is never reused.
 
 A successful save also keeps a gzip copy in `{dataDir}/snapshots` as
 `store.<rv>.json.gz` when the newest snapshot is at least a minute old (the
 log line then says `no snapshot`); the newest 20 are kept, so they reach back
-at least 20 minutes. A snapshot failure is logged but
+at least 20 minutes. When a save skips its snapshot, one timer is armed for
+the rest of the interval and then snapshots the last state that reached disk,
+so the end of a burst is not lost. A snapshot failure is logged but
 does not fail the save. If `store.json` is missing or does not parse while
 snapshots exist, startup loads the newest readable snapshot, renames the
 broken file to `store.json.corrupt-<unix time>` and rewrites `store.json`.

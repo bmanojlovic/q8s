@@ -79,6 +79,9 @@ type Server struct {
 	// the order of unit stops relative to quadlet file removal; nil uses
 	// config.Manager.
 	stopUnitHook func(name string)
+	// startUnitHook, when set, replaces systemd starts. Tests use it to check
+	// that a restored workload was started again; nil uses config.Manager.
+	startUnitHook func(name string)
 	// disk caches the short-lived disk pressure check for write requests.
 	disk diskPressureCache
 }
@@ -115,7 +118,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Manager != nil {
 		s.network.ops = podmanNetworkOps{manager: cfg.Manager}
 	}
-	s.handler = auth.Handler(s.diskGuardMiddleware(s.authorizeMiddleware(s.applyMiddleware(s.mux))))
+	s.handler = auth.Handler(s.authorizeMiddleware(s.diskGuardMiddleware(s.applyMiddleware(s.mux))))
 
 	s.setupRoutes()
 
@@ -204,14 +207,8 @@ func isUncleanAPIPath(path, rawPath string) bool {
 	if strings.Contains(lowerRaw, "%2f") || strings.Contains(lowerRaw, "%2e") {
 		return true
 	}
-	trimmed := strings.TrimPrefix(path, "/")
-	trimmed = strings.TrimSuffix(trimmed, "/")
-	for _, part := range strings.Split(trimmed, "/") {
-		if part == "" || part == "." || part == ".." {
-			return true
-		}
-	}
-	return false
+	_, ok := splitResourcePath(path)
+	return !ok
 }
 
 // diskGuardMiddleware refuses writes while a filesystem q8s uses is low on

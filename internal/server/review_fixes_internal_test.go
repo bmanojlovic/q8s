@@ -331,9 +331,10 @@ func TestBuiltinRoleAggregationChain(t *testing.T) {
 	})
 }
 
-// TestDiskGuardRunsAfterAuthentication pins that 401 wins over the 507 disk
-// guard, and that only administrators see filesystem paths in the message.
-func TestDiskGuardRunsAfterAuthentication(t *testing.T) {
+// TestDiskGuardRunsAfterAuthorization pins that 401 wins over 403, 403 wins
+// over the 507 disk guard, and that only administrators see filesystem paths
+// in the message.
+func TestDiskGuardRunsAfterAuthorization(t *testing.T) {
 	setStatfs(t, statfsResult(1<<20, 10<<30))
 	ca := newTestCA(t)
 	serverCert := ca.issue(t, "server", nil)
@@ -363,7 +364,36 @@ func TestDiskGuardRunsAfterAuthentication(t *testing.T) {
 		}
 	})
 
-	t.Run("non-admin message has no paths", func(t *testing.T) {
+	t.Run("unauthorized request is 403 before the disk guard", func(t *testing.T) {
+		aliceCert := ca.issue(t, "alice", nil)
+		req := httptest.NewRequest(http.MethodPost, writePath, strings.NewReader(body))
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{aliceCert.Leaf}}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	if _, err := st.CreateRole(&rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: "configmap-writer", Namespace: "default"},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"configmaps"},
+			Verbs:     []string{"create"},
+		}},
+	}); err != nil {
+		t.Fatalf("CreateRole: %v", err)
+	}
+	if _, err := st.CreateRoleBinding(&rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "alice-configmap-writer", Namespace: "default"},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "configmap-writer"},
+		Subjects:   []rbacv1.Subject{{Kind: "User", Name: "alice"}},
+	}); err != nil {
+		t.Fatalf("CreateRoleBinding: %v", err)
+	}
+
+	t.Run("authorized non-admin gets 507 without paths", func(t *testing.T) {
 		aliceCert := ca.issue(t, "alice", nil)
 		req := httptest.NewRequest(http.MethodPost, writePath, strings.NewReader(body))
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{aliceCert.Leaf}}

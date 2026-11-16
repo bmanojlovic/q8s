@@ -896,17 +896,6 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) map[string][]pod
 			continue
 		}
 
-		// A delete removes the store entry before it stops the container, so
-		// podman can still report a container whose Pod or Deployment is
-		// already gone. Do not import it back or restore its owning
-		// Deployment while that cleanup is in flight.
-		if st.IsDeleting("Pod", ns, name) {
-			continue
-		}
-		if depName := c.PodDeployment(); depName != "" && st.IsDeleting("Deployment", ns, depName) {
-			continue
-		}
-
 		// Ensure the owning deployment exists regardless of whether the pod
 		// is already in the store — handles service restart after a deployment
 		// was deleted from the store but the container kept running.
