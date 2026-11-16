@@ -1090,7 +1090,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		if err := s.deletePodByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{
@@ -1428,7 +1428,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			return
 		}
 		if err := s.deleteServiceByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -1552,7 +1552,7 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		if err := s.deletePVCByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -1726,7 +1726,7 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			return
 		}
 		if err := s.deleteConfigMapByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -1873,7 +1873,7 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			return
 		}
 		if err := s.deleteSecretByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -2353,7 +2353,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			return
 		}
 		if err := s.deleteDeploymentByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -2558,61 +2558,86 @@ func (s *Server) handleNamespaceCreate(w http.ResponseWriter, r *http.Request) {
 	encode(w, created, http.StatusCreated)
 }
 
-func (s *Server) purgeNamespaceResources(ns string) {
+// namespaceCleanupActions captures the units and files a namespace delete has
+// to remove. It runs before the store delete because afterwards the objects
+// are gone; the actions themselves run only after the store delete succeeded.
+func (s *Server) namespaceCleanupActions(ns string) []func() {
+	var actions []func()
 	for _, pod := range s.config.Store.Pods(ns) {
-		s.stopPodUnit(pod)
-		s.removePodSockets(ns, pod.Name)
-		s.removePodQuadlet(pod)
+		pod := pod
+		actions = append(actions, func() {
+			s.stopPodUnit(pod)
+			s.removePodSockets(ns, pod.Name)
+			s.removePodQuadlet(pod)
+		})
 	}
 	for _, dep := range s.config.Store.Deployments(ns) {
-		s.stopDeploymentUnits(dep)
-		s.removeDeploymentQuadlets(dep)
+		dep := dep
+		actions = append(actions, func() {
+			s.stopDeploymentUnits(dep)
+			s.removeDeploymentQuadlets(dep)
+		})
 	}
 	for _, job := range s.config.Store.Jobs(ns) {
-		s.stopJobUnit(job)
-		s.removeJobQuadlet(job)
+		job := job
+		actions = append(actions, func() {
+			s.stopJobUnit(job)
+			s.removeJobQuadlet(job)
+		})
 	}
 	for _, cj := range s.config.Store.CronJobs(ns) {
-		s.removeCronJobQuadlets(cj)
+		cj := cj
+		actions = append(actions, func() { s.removeCronJobQuadlets(cj) })
 	}
 	for _, cm := range s.config.Store.ConfigMaps(ns) {
-		s.removeConfigMapFiles(cm)
+		cm := cm
+		actions = append(actions, func() { s.removeConfigMapFiles(cm) })
 	}
 	for _, sec := range s.config.Store.Secrets(ns) {
-		s.removeSecretFiles(sec)
+		sec := sec
+		actions = append(actions, func() { s.removeSecretFiles(sec) })
 	}
 	// PVCs: drop the .volume quadlet files. The podman volumes themselves
-	// are deliberately kept — data is never deleted automatically.
+	// are deliberately kept: data is never deleted automatically.
 	for _, pvc := range s.config.Store.PVCs(ns) {
-		s.removePVCVolume(pvc)
+		pvc := pvc
+		actions = append(actions, func() { s.removePVCVolume(pvc) })
 	}
-	// Ingresses: drop the Traefik dynamic configs, or the hostnames keep
-	// routing to backends in a namespace that no longer exists.
+	// Ingresses, Middlewares and TCP routes: drop the Traefik dynamic
+	// configs, or the hostnames keep routing to a namespace that no longer
+	// exists.
 	for _, ing := range s.config.Store.Ingresses(ns) {
-		s.removeTraefikConfig(ing.Namespace, ing.Name)
+		ing := ing
+		actions = append(actions, func() { s.removeTraefikConfig(ing.Namespace, ing.Name) })
 	}
-	// Middlewares and TCP routes live in the same directory and would
-	// otherwise keep Traefik config pointing at a deleted namespace.
 	for _, mw := range s.config.Store.Middlewares(ns) {
-		s.removeTraefikConfigFile(middlewareFilename(mw.Namespace, mw.Name))
+		mw := mw
+		actions = append(actions, func() {
+			s.removeTraefikConfigFile(middlewareFilename(mw.Namespace, mw.Name))
+		})
 	}
 	for _, irt := range s.config.Store.IngressRouteTCPs(ns) {
-		s.removeTraefikConfigFile(tcpFilename(irt.Namespace, irt.Name))
+		irt := irt
+		actions = append(actions, func() {
+			s.removeTraefikConfigFile(tcpFilename(irt.Namespace, irt.Name))
+		})
 	}
 	// Services: drop legacy per-port socket files (see
 	// removeLegacyServiceSockets) along with them.
 	for _, svc := range s.config.Store.Services(ns) {
-		s.removeLegacyServiceSockets(svc)
+		svc := svc
+		actions = append(actions, func() { s.removeLegacyServiceSockets(svc) })
 	}
 	// Secret-derived EnvironmentFiles live in {secretDir}/{ns}/_env/.
-	// The per-secret loop above removed the per-secret dirs; removing the
-	// namespace parent now also clears _env in one step.
+	// Removing the namespace parent also clears _env in one step.
 	if secretDir := s.secretBaseDir(); secretDir != "" {
-		if err := os.RemoveAll(filepath.Join(secretDir, ns)); err != nil {
-			fmt.Printf("remove secret tree %s/%s: %v\n", secretDir, ns, err)
-		}
+		actions = append(actions, func() {
+			if err := os.RemoveAll(filepath.Join(secretDir, ns)); err != nil {
+				fmt.Printf("remove secret tree %s/%s: %v\n", secretDir, ns, err)
+			}
+		})
 	}
-	s.config.Store.PurgeNamespace(ns)
+	return actions
 }
 
 // removeLegacyServiceSockets deletes per-port .socket files that very old
@@ -2670,10 +2695,16 @@ func (s *Server) handleNamespaceDelete(w http.ResponseWriter, r *http.Request, n
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 		return
 	}
-	s.purgeNamespaceResources(name)
-	if err := s.config.Store.DeleteNamespace(name); err != nil {
+	// Capture the cleanup actions before the store delete: afterwards the
+	// objects are gone, but their units and files must only be touched once
+	// the store write has succeeded.
+	cleanup := s.namespaceCleanupActions(name)
+	if err := s.config.Store.DeleteNamespaceWithResources(name); err != nil {
 		s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 		return
+	}
+	for _, action := range cleanup {
+		action()
 	}
 	// Disconnect and re-render before the network unit disappears: podman
 	// refuses to remove a network while containers are still joined to it.
@@ -2929,7 +2960,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		if err := s.deleteJobByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -3139,7 +3170,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			return
 		}
 		if err := s.deleteCronJobByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -3327,7 +3358,7 @@ func (s *Server) handleIngresses(w http.ResponseWriter, r *http.Request, ns, nam
 			return
 		}
 		if err := s.deleteIngressByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -4757,11 +4788,17 @@ func (s *Server) stopDeploymentUnits(dep *appsv1.Deployment) {
 	}
 }
 
-func (s *Server) deleteDeploymentPods(dep *appsv1.Deployment) {
+func (s *Server) deleteDeploymentPods(dep *appsv1.Deployment) error {
 	for i := int32(0); i < deploymentReplicas(dep); i++ {
 		podName := fmt.Sprintf("%s-%d", dep.Name, i)
-		s.config.Store.DeletePod(dep.Namespace, podName)
+		if _, err := s.config.Store.GetPod(dep.Namespace, podName); err != nil {
+			continue
+		}
+		if err := s.config.Store.DeletePod(dep.Namespace, podName); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (s *Server) removeDeploymentQuadlets(dep *appsv1.Deployment) {
@@ -5523,12 +5560,19 @@ func (s *Server) deletePodByName(ns, name string) error {
 	if err != nil {
 		return err
 	}
-	s.stopPodUnit(pod)
-	s.removePodSockets(ns, name)
-	s.removePodQuadlet(pod)
+	// Store first: if the write fails, the pod is rolled back in memory and
+	// on disk, so its unit and quadlet files must still be there. Removing
+	// them first left a live container with no store entry, and the handler
+	// answered 404 for a pod that was still running. The marker keeps the
+	// reconcile loop from importing the container back while it is stopped.
+	s.config.Store.MarkDeleting("Pod", ns, name)
+	defer s.config.Store.ClearDeleting("Pod", ns, name)
 	if err := s.config.Store.DeletePod(ns, name); err != nil {
 		return err
 	}
+	s.stopPodUnit(pod)
+	s.removePodSockets(ns, name)
+	s.removePodQuadlet(pod)
 	s.regenerateIngressConfigs(ns)
 	return nil
 }
@@ -5583,12 +5627,19 @@ func (s *Server) deleteDeploymentByName(ns, name string) error {
 	if err != nil {
 		return err
 	}
-	s.stopDeploymentUnits(dep)
-	s.removeDeploymentQuadlets(dep)
-	s.deleteDeploymentPods(dep)
+	// Reconcile recreates a Deployment from its containers' labels when the
+	// store entry is missing. Keep it from doing that until the instances
+	// have been stopped and removed.
+	s.config.Store.MarkDeleting("Deployment", ns, name)
+	defer s.config.Store.ClearDeleting("Deployment", ns, name)
 	if err := s.config.Store.DeleteDeployment(ns, name); err != nil {
 		return err
 	}
+	if err := s.deleteDeploymentPods(dep); err != nil {
+		return err
+	}
+	s.stopDeploymentUnits(dep)
+	s.removeDeploymentQuadlets(dep)
 	s.regenerateIngressConfigs(dep.Namespace)
 	return nil
 }
@@ -5598,9 +5649,12 @@ func (s *Server) deleteJobByName(ns, name string) error {
 	if err != nil {
 		return err
 	}
+	if err := s.config.Store.DeleteJob(ns, name); err != nil {
+		return err
+	}
 	s.stopJobUnit(job)
 	s.removeJobQuadlet(job)
-	return s.config.Store.DeleteJob(ns, name)
+	return nil
 }
 
 func (s *Server) deleteCronJobByName(ns, name string) error {
@@ -5608,8 +5662,11 @@ func (s *Server) deleteCronJobByName(ns, name string) error {
 	if err != nil {
 		return err
 	}
+	if err := s.config.Store.DeleteCronJob(ns, name); err != nil {
+		return err
+	}
 	s.removeCronJobQuadlets(cj)
-	return s.config.Store.DeleteCronJob(ns, name)
+	return nil
 }
 
 func (s *Server) deleteIngressByName(ns, name string) error {

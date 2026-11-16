@@ -165,7 +165,7 @@ func (s *Server) handleMiddlewares(w http.ResponseWriter, r *http.Request, ns, n
 			return
 		}
 		if err := s.deleteMiddlewareByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -308,7 +308,7 @@ func (s *Server) handleIngressRouteTCPs(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		if err := s.deleteIngressRouteTCPByName(ns, name); err != nil {
-			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)

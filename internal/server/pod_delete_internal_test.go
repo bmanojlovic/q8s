@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -241,5 +242,57 @@ func TestStalePodUnitRemovesPodmanPod(t *testing.T) {
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Errorf("kept container unit was removed: %v", err)
+	}
+}
+
+// TestDeletePodPersistFailureLeavesUnitsAndQuadlet is the delete-ordering
+// regression: when the store write fails, the delete must answer with the
+// persist error before touching the unit or the quadlet file. The pod is
+// rolled back, so it is still running and still in the store.
+func TestDeletePodPersistFailureLeavesUnitsAndQuadlet(t *testing.T) {
+	dataDir := t.TempDir()
+	file := filepath.Join(dataDir, "store.json")
+	st, err := store.Load(file)
+	if err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+	dir := t.TempDir()
+	srv := &Server{config: Config{Store: st, QuadletDir: dir}}
+	if _, err := st.CreatePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "solo", Namespace: "default"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	podPath := writeOwnedUnit(t, dir, "default-solo.container", "default", "solo")
+
+	var stops []string
+	srv.stopUnitHook = func(name string) { stops = append(stops, name) }
+	calls := recordPodmanCalls(t)
+
+	// Every following store write fails (root ignores permissions but not a
+	// regular file where a directory is expected).
+	if err := os.RemoveAll(dataDir); err != nil {
+		t.Fatalf("remove data dir: %v", err)
+	}
+	if err := os.WriteFile(dataDir, []byte("not a directory"), 0600); err != nil {
+		t.Fatalf("replace data dir with file: %v", err)
+	}
+
+	err = srv.deletePodByName("default", "solo")
+	if !errors.Is(err, store.ErrPersist) {
+		t.Fatalf("deletePodByName error = %v, want one wrapping ErrPersist", err)
+	}
+	if len(stops) != 0 {
+		t.Fatalf("units were stopped despite failed persist: %v", stops)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("podman was called despite failed persist: %v", *calls)
+	}
+	if _, err := os.Stat(podPath); err != nil {
+		t.Fatalf("quadlet file was removed despite failed persist: %v", err)
+	}
+	if _, err := st.GetPod("default", "solo"); err != nil {
+		t.Fatalf("pod was not rolled back after failed persist: %v", err)
 	}
 }

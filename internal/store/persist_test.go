@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,6 +26,14 @@ func newFileStore(t *testing.T) (*store.Store, string) {
 		t.Fatalf("Load: %v", err)
 	}
 	return st, file
+}
+
+// everyPersistSnapshots disables the snapshot throttle for tests that count
+// snapshots or recover from a particular one.
+func everyPersistSnapshots(t *testing.T) {
+	t.Helper()
+	restore := store.SetSnapshotIntervalForTest(0)
+	t.Cleanup(restore)
 }
 
 // snapshotRVs returns the resourceVersions of the gzip snapshots next to
@@ -121,6 +130,7 @@ func TestPersistFailureRollsBackCreateUpdateDelete(t *testing.T) {
 }
 
 func TestPersistCreatesSnapshotsAndKeepsNewest20(t *testing.T) {
+	everyPersistSnapshots(t)
 	st, file := newFileStore(t)
 
 	for i := 0; i < 25; i++ {
@@ -143,6 +153,7 @@ func TestPersistCreatesSnapshotsAndKeepsNewest20(t *testing.T) {
 }
 
 func TestLoadRecoversNewestSnapshot(t *testing.T) {
+	everyPersistSnapshots(t)
 	st, file := newFileStore(t)
 	if _, err := st.CreatePod(makePod("default", "one", "nginx:1")); err != nil {
 		t.Fatalf("CreatePod one: %v", err)
@@ -190,6 +201,7 @@ func TestLoadRecoversNewestSnapshot(t *testing.T) {
 }
 
 func TestLoadSkipsCorruptNewestSnapshot(t *testing.T) {
+	everyPersistSnapshots(t)
 	st, file := newFileStore(t)
 	if _, err := st.CreatePod(makePod("default", "one", "nginx:1")); err != nil {
 		t.Fatalf("CreatePod one: %v", err)
@@ -227,6 +239,7 @@ func TestLoadSkipsCorruptNewestSnapshot(t *testing.T) {
 }
 
 func TestLoadRecoversWhenStoreFileMissing(t *testing.T) {
+	everyPersistSnapshots(t)
 	st, file := newFileStore(t)
 	if _, err := st.CreatePod(makePod("default", "kept", "nginx:1")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -255,6 +268,7 @@ func TestLoadRecoversWhenStoreFileMissing(t *testing.T) {
 // gets a new resourceVersion and a snapshot of its own, and the snapshot of
 // the state before the delete is kept.
 func TestDeleteAdvancesResourceVersion(t *testing.T) {
+	everyPersistSnapshots(t)
 	st, file := newFileStore(t)
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"}}
 	if _, err := st.CreateConfigMap(cm); err != nil {
@@ -271,5 +285,164 @@ func TestDeleteAdvancesResourceVersion(t *testing.T) {
 	rvs := snapshotRVs(t, file)
 	if len(rvs) < 2 || rvs[0] == rvs[1] {
 		t.Fatalf("expected distinct snapshots for create and delete, got %v", rvs)
+	}
+}
+
+// TestSnapshotThrottleSkipsRecentSnapshot: store.json is written on every
+// persist, but a second snapshot within snapshotInterval is skipped so a burst
+// of status updates cannot fill the retain window.
+func TestSnapshotThrottleSkipsRecentSnapshot(t *testing.T) {
+	restore := store.SetSnapshotIntervalForTest(time.Hour)
+	t.Cleanup(restore)
+
+	st, file := newFileStore(t)
+	if _, err := st.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "first"}}); err != nil {
+		t.Fatalf("CreateNamespace first: %v", err)
+	}
+	firstRV := st.ResourceVersion()
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("later-%d", i)
+		if _, err := st.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}); err != nil {
+			t.Fatalf("CreateNamespace %s: %v", name, err)
+		}
+	}
+
+	rvs := snapshotRVs(t, file)
+	if len(rvs) != 1 || rvs[0] != firstRV {
+		t.Fatalf("snapshots = %v, want only the first save at rv %d", rvs, firstRV)
+	}
+
+	// store.json still has every change despite the skipped snapshots.
+	loaded, err := store.Load(file)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("later-%d", i)
+		if _, err := loaded.GetNamespace(name); err != nil {
+			t.Fatalf("namespace %q missing from store.json: %v", name, err)
+		}
+	}
+
+	// With the interval elapsed (0 means always write), the next persist
+	// snapshots the current state.
+	store.SetSnapshotIntervalForTest(0)
+	if _, err := st.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "after"}}); err != nil {
+		t.Fatalf("CreateNamespace after: %v", err)
+	}
+	rvs = snapshotRVs(t, file)
+	if len(rvs) != 2 || rvs[1] != st.ResourceVersion() {
+		t.Fatalf("snapshots = %v, want first and a new snapshot at rv %d", rvs, st.ResourceVersion())
+	}
+}
+
+// TestLoadRemembersNewestSnapshotTime: on startup the throttle starts from
+// the newest snapshot's mtime, so a restart does not immediately rewrite a
+// snapshot that is still fresh.
+func TestLoadRemembersNewestSnapshotTime(t *testing.T) {
+	everyPersistSnapshots(t)
+
+	st, file := newFileStore(t)
+	if _, err := st.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "before"}}); err != nil {
+		t.Fatalf("CreateNamespace before: %v", err)
+	}
+	before := snapshotRVs(t, file)
+
+	restore := store.SetSnapshotIntervalForTest(time.Hour)
+	t.Cleanup(restore)
+
+	loaded, err := store.Load(file)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := loaded.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "after"}}); err != nil {
+		t.Fatalf("CreateNamespace after: %v", err)
+	}
+
+	after := snapshotRVs(t, file)
+	if len(after) != len(before) {
+		t.Fatalf("snapshots after restart = %v, want unchanged %v", after, before)
+	}
+	for i := range before {
+		if after[i] != before[i] {
+			t.Fatalf("snapshots after restart = %v, want unchanged %v", after, before)
+		}
+	}
+
+	loaded2, err := store.Load(file)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if _, err := loaded2.GetNamespace("after"); err != nil {
+		t.Fatalf("namespace after missing from store.json: %v", err)
+	}
+}
+
+// TestFailedPersistDoesNotDiscardOtherWritersChange is the regression for the
+// rollback race: a failed write must roll back only its own mutation, never
+// another writer's change that was already saved successfully. Before the fix
+// a mutation released mu before persisting, so B could change the maps while
+// A was writing; A's rollback then removed B's object and B's later persist
+// wrote the rolled-back state, while B still returned nil.
+func TestFailedPersistDoesNotDiscardOtherWritersChange(t *testing.T) {
+	everyPersistSnapshots(t)
+
+	st, file := newFileStore(t)
+	started := make(chan struct{})
+	sawOtherWriter := make(chan struct{})
+	calls := 0
+
+	restore := store.SetWriteHookForTest(st, func([]byte) error {
+		calls++
+		if calls > 1 {
+			return nil
+		}
+		// A is first into persist. Let B reach the store, then give it time
+		// to mutate before failing A's write. With mutation and persist
+		// serialised B is still waiting for saveMu here, which is the point.
+		close(started)
+		<-sawOtherWriter
+		time.Sleep(50 * time.Millisecond)
+		return errors.New("injected write failure")
+	})
+	defer restore()
+
+	failed := make(chan error, 1)
+	go func() {
+		_, err := st.CreatePod(makePod("default", "failing", "nginx:1"))
+		failed <- err
+	}()
+	<-started
+
+	succeeded := make(chan error, 1)
+	go func() {
+		close(sawOtherWriter)
+		_, err := st.CreatePod(makePod("default", "survivor", "nginx:2"))
+		succeeded <- err
+	}()
+
+	if err := <-failed; !errors.Is(err, store.ErrPersist) {
+		t.Fatalf("failing create error = %v, want one wrapping ErrPersist", err)
+	}
+	if err := <-succeeded; err != nil {
+		t.Fatalf("surviving create error = %v", err)
+	}
+
+	if _, err := st.GetPod("default", "survivor"); err != nil {
+		t.Fatalf("surviving pod missing from memory after returning nil: %v", err)
+	}
+	if _, err := st.GetPod("default", "failing"); err == nil {
+		t.Fatal("pod from the failed write is still in memory")
+	}
+
+	loaded, err := store.Load(file)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, err := loaded.GetPod("default", "survivor"); err != nil {
+		t.Fatalf("surviving pod missing from disk after returning nil: %v", err)
+	}
+	if _, err := loaded.GetPod("default", "failing"); err == nil {
+		t.Fatal("pod from the failed write is on disk")
 	}
 }

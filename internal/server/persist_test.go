@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/server"
 	"q8s/internal/store"
 )
@@ -78,5 +80,75 @@ func TestCreatePersistFailureAnswersInternalError(t *testing.T) {
 	}
 	if _, err := st.GetPod("default", "blocked"); err == nil {
 		t.Fatal("pod stayed in the store after the failed persist")
+	}
+}
+
+// TestDeletePersistFailureAnswersInternalError: a DELETE whose store write
+// fails must answer 500 InternalError and must not touch the unit or quadlet
+// file. The store rolls the object back, so it is still running and listed.
+func TestDeletePersistFailureAnswersInternalError(t *testing.T) {
+	dataDir := t.TempDir()
+	file := filepath.Join(dataDir, "store.json")
+	st, err := store.Load(file)
+	if err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+
+	quadletDir := t.TempDir()
+	certPEM, keyPEM := genTestCert(t)
+	srv, err := server.New(server.Config{
+		Store:      st,
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		QuadletDir: quadletDir,
+		ConfigDir:  filepath.Join(t.TempDir(), "configmaps"),
+	})
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	if _, err := st.CreatePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "blocked", Namespace: "default"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	quadlet := filepath.Join(quadletDir, "default-blocked.container")
+	if err := os.WriteFile(quadlet, []byte("[Container]\nImage=nginx\n"), 0644); err != nil {
+		t.Fatalf("write quadlet: %v", err)
+	}
+
+	if os.Geteuid() == 0 {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Fatalf("remove data dir: %v", err)
+		}
+		if err := os.WriteFile(dataDir, []byte("not a directory"), 0600); err != nil {
+			t.Fatalf("replace data dir with file: %v", err)
+		}
+	} else {
+		if err := os.Chmod(dataDir, 0500); err != nil {
+			t.Fatalf("make data dir read-only: %v", err)
+		}
+		t.Cleanup(func() { os.Chmod(dataDir, 0700) })
+	}
+
+	resp := do(t, "DELETE", ts.URL+"/api/v1/namespaces/default/pods/blocked", nil)
+	body := decodeBody(t, resp)
+	if resp.StatusCode != 500 {
+		t.Fatalf("status = %d, want 500: %v", resp.StatusCode, body)
+	}
+	if body["reason"] != "InternalError" {
+		t.Fatalf("reason = %v, want InternalError", body["reason"])
+	}
+	if code, ok := body["code"].(float64); !ok || int(code) != 500 {
+		t.Fatalf("code = %v, want 500", body["code"])
+	}
+	if _, err := os.Stat(quadlet); err != nil {
+		t.Fatalf("quadlet file was touched by a failed delete: %v", err)
+	}
+	if _, err := st.GetPod("default", "blocked"); err != nil {
+		t.Fatalf("pod was not rolled back after failed delete: %v", err)
 	}
 }

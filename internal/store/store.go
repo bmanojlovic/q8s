@@ -58,7 +58,13 @@ type Store struct {
 	// lastGood is the JSON of the state that was last successfully written
 	// to dataFile (or loaded from it). A failed write restores the in-memory
 	// maps from it so memory never gets ahead of disk.
-	lastGood            []byte
+	lastGood []byte
+	// writeHook, when set, runs before every store file write. It is a test
+	// seam for injecting a failed write; it runs under saveMu.
+	writeHook func([]byte) error
+	// lastSnapshot is when the newest gzip snapshot was written. Only
+	// touched under saveMu.
+	lastSnapshot        time.Time
 	pods                map[types.NamespacedName]*corev1.Pod
 	services            map[types.NamespacedName]*corev1.Service
 	pvcs                map[types.NamespacedName]*corev1.PersistentVolumeClaim
@@ -93,6 +99,12 @@ type Store struct {
 	eventsMu sync.Mutex
 	events   []*corev1.Event
 	eventSeq int
+
+	// deleting marks resources whose store entry is gone but whose units and
+	// containers are still being torn down. Reconcile skips them so a
+	// container that is still visible to podman is not imported back.
+	deletingMu sync.Mutex
+	deleting   map[string]struct{}
 }
 
 // maxEvents caps the in-memory event feed; oldest events are dropped once
@@ -248,6 +260,13 @@ var ErrPersist = errors.New("store: could not persist change")
 // snapshotRetain is how many gzip snapshots are kept next to store.json.
 const snapshotRetain = 20
 
+// snapshotInterval is how old the newest snapshot must be before persist
+// writes another one. store.json is still written on every persist; the
+// snapshots are recovery points, so a burst of status updates must not fill
+// the retain window with a few seconds of history. Tests set it to 0 to write
+// a snapshot on every persist.
+var snapshotInterval = 60 * time.Second
+
 // Load reads the store from dataFile if it exists; otherwise returns a fresh Store.
 // The returned store will persist changes back to dataFile on every mutation.
 //
@@ -257,6 +276,7 @@ const snapshotRetain = 20
 func Load(dataFile string) (*Store, error) {
 	s := newEmpty()
 	s.dataFile = dataFile
+	s.lastSnapshot = s.newestSnapshotModTime()
 
 	data, err := os.ReadFile(dataFile)
 	if os.IsNotExist(err) {
@@ -571,23 +591,53 @@ func (s *Store) pruneSnapshots() {
 	}
 }
 
-// persist writes the store to disk atomically (temp file + fsync + rename)
-// and keeps a gzip snapshot of every successful write.
+// mutate runs one mutation with saveMu held, and keeps holding it through the
+// persist that covers the change. This is what stops another writer from
+// changing the maps between this mutation and its save: without it a failed
+// write's rollback to lastGood could discard that other writer's change even
+// though its own save succeeded.
 //
-// saveMu is acquired first so that concurrent saves always write the latest
-// state: the winner of saveMu captures a fresh snapshot under mu.RLock,
-// so a stale snapshot can never overwrite a newer one. Callers must not hold
-// s.mu. On a write failure the in-memory maps are rolled back to lastGood
-// before the error is returned.
+// fn runs with saveMu and s.mu held and reports whether it changed anything.
+// When it did, persistLocked writes the store while saveMu is still held and
+// rolls the maps back to lastGood on failure. Lock order is always saveMu and
+// then mu. fn must not lock saveMu or call another mutating method.
+func (s *Store) mutate(fn func() (bool, error)) error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+
+	s.mu.Lock()
+	changed, err := fn()
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	return s.persistLocked()
+}
+
+// persist acquires saveMu and writes the store. Only startup paths that are
+// not themselves mutations use this; mutating methods go through mutate.
 func (s *Store) persist() error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	return s.persistLocked()
+}
+
+// persistLocked writes the store to disk atomically (temp file + fsync +
+// rename) and, at most once per snapshotInterval, keeps a gzip snapshot of
+// the state. The caller must hold saveMu and must not hold s.mu.
+//
+// Holding saveMu makes each write cover the latest state: no mutation can
+// slip in between this snapshot and the write. On a write failure the
+// in-memory maps are rolled back to lastGood before the error is returned.
+func (s *Store) persistLocked() error {
 	s.notifyChanged()
 
 	if s.dataFile == "" {
 		return nil
 	}
-
-	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
 
 	start := time.Now()
 	s.mu.RLock()
@@ -610,7 +660,13 @@ func (s *Store) persist() error {
 	s.mu.Unlock()
 
 	written := time.Since(start)
-	if gz := s.writeSnapshot(snap.ResourceVer, data); gz > 0 {
+	gz := 0
+	if s.snapshotDue() {
+		if gz = s.writeSnapshot(snap.ResourceVer, data); gz > 0 {
+			s.lastSnapshot = time.Now()
+		}
+	}
+	if gz > 0 {
 		fmt.Printf("store: saved rv %d (%d KB, %d ms, snapshot %d KB)\n",
 			snap.ResourceVer, len(data)/1024, written.Milliseconds(), gz/1024)
 	} else {
@@ -620,9 +676,38 @@ func (s *Store) persist() error {
 	return nil
 }
 
+// snapshotDue reports whether the newest snapshot is old enough to be
+// replaced. The caller holds saveMu.
+func (s *Store) snapshotDue() bool {
+	if snapshotInterval <= 0 || s.lastSnapshot.IsZero() {
+		return true
+	}
+	return time.Since(s.lastSnapshot) >= snapshotInterval
+}
+
+// newestSnapshotModTime returns the modification time of the newest snapshot
+// file, or the zero time when there is none. Load uses it so a restart does
+// not immediately rewrite a snapshot that is still fresh.
+func (s *Store) newestSnapshotModTime() time.Time {
+	files := s.listSnapshotFiles()
+	if len(files) == 0 {
+		return time.Time{}
+	}
+	info, err := os.Stat(files[0].path)
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
 // writeStoreFile writes data to dataFile atomically. Every failing step is
 // part of the returned error: the caller rolls memory back when it fails.
 func (s *Store) writeStoreFile(data []byte) error {
+	if s.writeHook != nil {
+		if err := s.writeHook(data); err != nil {
+			return fmt.Errorf("test write hook: %w", err)
+		}
+	}
 	dir := filepath.Dir(s.dataFile)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
@@ -841,23 +926,25 @@ func (s *Store) Namespaces() []*corev1.Namespace {
 
 // CreateNamespace creates a namespace.
 func (s *Store) CreateNamespace(ns *corev1.Namespace) (*corev1.Namespace, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Name: ns.Name}
-	if _, ok := s.namespaces[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("namespace %q already exists", ns.Name)
-	}
-	ns.ResourceVersion = s.incRV()
-	ns.UID = types.UID(fmt.Sprintf("q8s-ns-%s", ns.Name))
-	if ns.CreationTimestamp.IsZero() {
-		ns.CreationTimestamp = metav1.Now()
-	}
-	s.namespaces[key] = ns
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.Namespace
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Name: ns.Name}
+		if _, ok := s.namespaces[key]; ok {
+			return false, fmt.Errorf("namespace %q already exists", ns.Name)
+		}
+		ns.ResourceVersion = s.incRV()
+		ns.UID = types.UID(fmt.Sprintf("q8s-ns-%s", ns.Name))
+		if ns.CreationTimestamp.IsZero() {
+			ns.CreationTimestamp = metav1.Now()
+		}
+		s.namespaces[key] = ns
+		out = ns.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return ns.DeepCopy(), nil
+	return out, nil
 }
 
 // GetNamespace gets a namespace.
@@ -876,49 +963,73 @@ func (s *Store) GetNamespace(name string) (*corev1.Namespace, error) {
 // timestamp. Only metadata changes (labels/annotations) are meaningful; the
 // namespace network is already in place.
 func (s *Store) UpdateNamespace(ns *corev1.Namespace) (*corev1.Namespace, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Name: ns.Name}
-	existing, ok := s.namespaces[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("namespace %q not found", ns.Name)
-	}
-	ns.UID = existing.UID
-	ns.ResourceVersion = s.incRV()
-	if ns.CreationTimestamp.IsZero() {
-		ns.CreationTimestamp = existing.CreationTimestamp
-	}
-	s.namespaces[key] = ns
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.Namespace
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Name: ns.Name}
+		existing, ok := s.namespaces[key]
+		if !ok {
+			return false, fmt.Errorf("namespace %q not found", ns.Name)
+		}
+		ns.UID = existing.UID
+		ns.ResourceVersion = s.incRV()
+		if ns.CreationTimestamp.IsZero() {
+			ns.CreationTimestamp = existing.CreationTimestamp
+		}
+		s.namespaces[key] = ns
+		out = ns.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return ns.DeepCopy(), nil
+	return out, nil
 }
 
 // DeleteNamespace deletes a namespace.
 func (s *Store) DeleteNamespace(name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Name: name}
-	if _, ok := s.namespaces[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("namespace %q not found", name)
-	}
-	delete(s.namespaces, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Name: name}
+		if _, ok := s.namespaces[key]; !ok {
+			return false, fmt.Errorf("namespace %q not found", name)
+		}
+		delete(s.namespaces, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // PurgeNamespace removes all resources belonging to a namespace from the store
 // in a single lock acquisition. Called by the namespace delete handler after
 // stopping systemd units so the store and disk stay consistent.
 func (s *Store) PurgeNamespace(name string) {
-	s.mu.Lock()
+	_ = s.mutate(func() (bool, error) {
+		s.purgeNamespaceLocked(name)
+		s.resourceVer++
+		return true, nil
+	})
+}
+
+// DeleteNamespaceWithResources removes a namespace and every resource in it
+// in a single mutation, so a failed write cannot leave the namespace without
+// its contents (or its contents without the namespace). The handler does the
+// disk cleanup only after this succeeds. An unknown namespace is an error.
+func (s *Store) DeleteNamespaceWithResources(name string) error {
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Name: name}
+		if _, ok := s.namespaces[key]; !ok {
+			return false, fmt.Errorf("namespace %q not found", name)
+		}
+		s.purgeNamespaceLocked(name)
+		delete(s.namespaces, key)
+		s.incRV()
+		return true, nil
+	})
+}
+
+// purgeNamespaceLocked removes every resource in a namespace. The caller
+// holds s.mu and is responsible for bumping the resourceVersion.
+func (s *Store) purgeNamespaceLocked(name string) {
 	for key := range s.pods {
 		if key.Namespace == name {
 			delete(s.pods, key)
@@ -997,9 +1108,6 @@ func (s *Store) PurgeNamespace(name string) {
 			delete(s.roleBindings, key)
 		}
 	}
-	s.resourceVer++
-	s.mu.Unlock()
-	s.persist()
 }
 
 // --- Pods ---
@@ -1030,29 +1138,31 @@ func (s *Store) Pods(ns string) []*corev1.Pod {
 
 // CreatePod creates a pod.
 func (s *Store) CreatePod(pod *corev1.Pod) (*corev1.Pod, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
-	if _, ok := s.pods[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("pod %q already exists in namespace %q", pod.Name, pod.Namespace)
-	}
-	pod.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
-	pod.ResourceVersion = s.incRV()
-	pod.UID = types.UID(fmt.Sprintf("q8s-pod-%s-%s", pod.Namespace, pod.Name))
-	if pod.Labels == nil {
-		pod.Labels = make(map[string]string)
-	}
-	if pod.CreationTimestamp.IsZero() {
-		pod.CreationTimestamp = metav1.Now()
-	}
-	s.pods[key] = pod
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.Pod
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+		if _, ok := s.pods[key]; ok {
+			return false, fmt.Errorf("pod %q already exists in namespace %q", pod.Name, pod.Namespace)
+		}
+		pod.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
+		pod.ResourceVersion = s.incRV()
+		pod.UID = types.UID(fmt.Sprintf("q8s-pod-%s-%s", pod.Namespace, pod.Name))
+		if pod.Labels == nil {
+			pod.Labels = make(map[string]string)
+		}
+		if pod.CreationTimestamp.IsZero() {
+			pod.CreationTimestamp = metav1.Now()
+		}
+		s.pods[key] = pod
+		out = pod.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	s.recordEvent("Pod", pod.Namespace, pod.Name, pod.UID, corev1.EventTypeNormal, "Created",
 		fmt.Sprintf("Created pod %s/%s", pod.Namespace, pod.Name))
-	return pod.DeepCopy(), nil
+	return out, nil
 }
 
 // GetPod gets a pod by namespace and name.
@@ -1069,43 +1179,47 @@ func (s *Store) GetPod(ns, name string) (*corev1.Pod, error) {
 
 // DeletePod deletes a pod.
 func (s *Store) DeletePod(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	pod, ok := s.pods[key]
-	if !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("pod %q not found in namespace %q", name, ns)
-	}
-	delete(s.pods, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.forgetRunStarts(key)
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var uid types.UID
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		pod, ok := s.pods[key]
+		if !ok {
+			return false, fmt.Errorf("pod %q not found in namespace %q", name, ns)
+		}
+		uid = pod.UID
+		delete(s.pods, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		s.forgetRunStarts(key)
+		return true, nil
+	})
+	if err != nil {
 		return err
 	}
-	s.recordEvent("Pod", ns, name, pod.UID, corev1.EventTypeNormal, "Deleted",
+	s.recordEvent("Pod", ns, name, uid, corev1.EventTypeNormal, "Deleted",
 		fmt.Sprintf("Deleted pod %s/%s", ns, name))
 	return nil
 }
 
 // UpdatePod replaces a pod in-place, preserving UID.
 func (s *Store) UpdatePod(pod *corev1.Pod) (*corev1.Pod, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
-	existing, ok := s.pods[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("pod %q not found in namespace %q", pod.Name, pod.Namespace)
-	}
-	pod.UID = existing.UID
-	pod.ResourceVersion = s.incRV()
-	s.pods[key] = pod
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.Pod
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+		existing, ok := s.pods[key]
+		if !ok {
+			return false, fmt.Errorf("pod %q not found in namespace %q", pod.Name, pod.Namespace)
+		}
+		pod.UID = existing.UID
+		pod.ResourceVersion = s.incRV()
+		s.pods[key] = pod
+		out = pod.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return pod.DeepCopy(), nil
+	return out, nil
 }
 
 // SyncPodTemplate replaces the spec and the template-derived metadata
@@ -1119,30 +1233,30 @@ func (s *Store) UpdatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 // when the template change actually restarts the unit. Returns false if the
 // pod is missing.
 func (s *Store) SyncPodTemplate(pod *corev1.Pod) bool {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
-	existing, ok := s.pods[key]
-	if !ok {
-		s.mu.Unlock()
-		return false
-	}
-	if reflect.DeepEqual(existing.Spec, pod.Spec) &&
-		reflect.DeepEqual(existing.Labels, pod.Labels) &&
-		reflect.DeepEqual(existing.Annotations, pod.Annotations) &&
-		reflect.DeepEqual(existing.OwnerReferences, pod.OwnerReferences) {
-		s.mu.Unlock()
-		return true
-	}
-	updated := existing.DeepCopy()
-	updated.Spec = *pod.Spec.DeepCopy()
-	updated.Labels = copyStringMap(pod.Labels)
-	updated.Annotations = copyStringMap(pod.Annotations)
-	updated.OwnerReferences = append([]metav1.OwnerReference(nil), pod.OwnerReferences...)
-	updated.ResourceVersion = s.incRV()
-	s.pods[key] = updated
-	s.mu.Unlock()
-	s.persist()
-	return true
+	found := false
+	_ = s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+		existing, ok := s.pods[key]
+		if !ok {
+			return false, nil
+		}
+		found = true
+		if reflect.DeepEqual(existing.Spec, pod.Spec) &&
+			reflect.DeepEqual(existing.Labels, pod.Labels) &&
+			reflect.DeepEqual(existing.Annotations, pod.Annotations) &&
+			reflect.DeepEqual(existing.OwnerReferences, pod.OwnerReferences) {
+			return false, nil
+		}
+		updated := existing.DeepCopy()
+		updated.Spec = *pod.Spec.DeepCopy()
+		updated.Labels = copyStringMap(pod.Labels)
+		updated.Annotations = copyStringMap(pod.Annotations)
+		updated.OwnerReferences = append([]metav1.OwnerReference(nil), pod.OwnerReferences...)
+		updated.ResourceVersion = s.incRV()
+		s.pods[key] = updated
+		return true, nil
+	})
+	return found
 }
 
 func copyStringMap(m map[string]string) map[string]string {
@@ -1174,64 +1288,63 @@ func (s *Store) UpdatePodPhase(ns, name string, phase corev1.PodPhase, health st
 // container has not been seen, the pod phase decides whether it is still
 // being created or crash-looping.
 func (s *Store) UpdatePodPhaseState(ns, name string, phase corev1.PodPhase, obs ContainerSyncState) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	pod, ok := s.pods[key]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-	if previousContainer(pod, obs) {
-		phase = corev1.PodPending
-		obs = ContainerSyncState{}
-	}
-	phaseChanged := pod.Status.Phase != phase
-	changed := phaseChanged
-	if phaseChanged {
-		pod.Status.Phase = phase
-	}
-	running := phase == corev1.PodRunning
-	if len(pod.Status.ContainerStatuses) == 0 && len(pod.Spec.Containers) > 0 {
-		pod.Status.ContainerStatuses = make([]corev1.ContainerStatus, len(pod.Spec.Containers))
-		for i, c := range pod.Spec.Containers {
-			pod.Status.ContainerStatuses[i] = corev1.ContainerStatus{
-				Name:  c.Name,
-				Image: c.Image,
-			}
+	phaseChanged := false
+	var uid types.UID
+	_ = s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		pod, ok := s.pods[key]
+		if !ok {
+			return false, nil
 		}
-		changed = true
-	}
-	for i := range pod.Status.ContainerStatuses {
-		cs := &pod.Status.ContainerStatuses[i]
-		if applyContainerObservation(cs, obs, phase) {
-			changed = true
+		if previousContainer(pod, obs) {
+			phase = corev1.PodPending
+			obs = ContainerSyncState{}
 		}
-		s.noteRunStart(pod, cs)
-		// A health check exists when health is non-empty: Ready then needs
-		// Podman to report it healthy, not just running.
-		ready := running && !isCrashLooping(cs) && (obs.Health == "" || obs.Health == "healthy")
-		if cs.Ready != ready {
-			cs.Ready = ready
-			changed = true
-		}
-	}
-	if syncPodStartTime(pod) {
-		changed = true
-	}
-	if syncPodConditions(pod) {
-		changed = true
-	}
-	if changed {
-		pod.ResourceVersion = s.incRV()
-	}
-	uid := pod.UID
-	s.mu.Unlock()
-	if changed {
-		s.persist()
+		phaseChanged = pod.Status.Phase != phase
+		changed := phaseChanged
 		if phaseChanged {
-			if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
-				s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
+			pod.Status.Phase = phase
+		}
+		running := phase == corev1.PodRunning
+		if len(pod.Status.ContainerStatuses) == 0 && len(pod.Spec.Containers) > 0 {
+			pod.Status.ContainerStatuses = make([]corev1.ContainerStatus, len(pod.Spec.Containers))
+			for i, c := range pod.Spec.Containers {
+				pod.Status.ContainerStatuses[i] = corev1.ContainerStatus{
+					Name:  c.Name,
+					Image: c.Image,
+				}
 			}
+			changed = true
+		}
+		for i := range pod.Status.ContainerStatuses {
+			cs := &pod.Status.ContainerStatuses[i]
+			if applyContainerObservation(cs, obs, phase) {
+				changed = true
+			}
+			s.noteRunStart(pod, cs)
+			// A health check exists when health is non-empty: Ready then needs
+			// Podman to report it healthy, not just running.
+			ready := running && !isCrashLooping(cs) && (obs.Health == "" || obs.Health == "healthy")
+			if cs.Ready != ready {
+				cs.Ready = ready
+				changed = true
+			}
+		}
+		if syncPodStartTime(pod) {
+			changed = true
+		}
+		if syncPodConditions(pod) {
+			changed = true
+		}
+		if changed {
+			pod.ResourceVersion = s.incRV()
+		}
+		uid = pod.UID
+		return changed, nil
+	})
+	if phaseChanged {
+		if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
+			s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
 		}
 	}
 }
@@ -1402,78 +1515,77 @@ func syncPodStartTime(pod *corev1.Pod) bool {
 // follows the same rules as UpdatePodPhase: running, not crash-looping, and
 // healthy (or no health check).
 func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase, states map[string]ContainerSyncState) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	pod, ok := s.pods[key]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-	phaseChanged := pod.Status.Phase != phase
-	changed := phaseChanged
-	if phaseChanged {
-		pod.Status.Phase = phase
-	}
-
-	old := make(map[string]corev1.ContainerStatus, len(pod.Status.ContainerStatuses))
-	for _, cs := range pod.Status.ContainerStatuses {
-		old[cs.Name] = cs
-	}
-	statuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
-	for _, c := range pod.Spec.Containers {
-		cs, ok := old[c.Name]
+	phaseChanged := false
+	var uid types.UID
+	_ = s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		pod, ok := s.pods[key]
 		if !ok {
-			cs = corev1.ContainerStatus{Name: c.Name, Image: c.Image}
-			changed = true
+			return false, nil
 		}
-		if cs.Image == "" {
-			cs.Image = c.Image
-		}
-		obs := states[c.Name]
-		if previousContainer(pod, obs) {
-			obs = ContainerSyncState{Phase: corev1.PodPending}
-		}
-		if applyContainerObservation(&cs, obs, phase) {
-			changed = true
-		}
-		s.noteRunStart(pod, &cs)
-		ready := obs.Phase == corev1.PodRunning && !isCrashLooping(&cs) &&
-			(obs.Health == "" || obs.Health == "healthy")
-		if cs.Ready != ready {
-			cs.Ready = ready
-			changed = true
-		}
-		statuses = append(statuses, cs)
-	}
-	if len(statuses) != len(pod.Status.ContainerStatuses) {
-		changed = true
-	} else {
-		for i := range statuses {
-			if statuses[i].Name != pod.Status.ContainerStatuses[i].Name {
-				changed = true
-				break
-			}
-		}
-	}
-	pod.Status.ContainerStatuses = statuses
-
-	if syncPodStartTime(pod) {
-		changed = true
-	}
-	if syncPodConditions(pod) {
-		changed = true
-	}
-	if changed {
-		pod.ResourceVersion = s.incRV()
-	}
-	uid := pod.UID
-	s.mu.Unlock()
-	if changed {
-		s.persist()
+		phaseChanged = pod.Status.Phase != phase
+		changed := phaseChanged
 		if phaseChanged {
-			if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
-				s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
+			pod.Status.Phase = phase
+		}
+
+		old := make(map[string]corev1.ContainerStatus, len(pod.Status.ContainerStatuses))
+		for _, cs := range pod.Status.ContainerStatuses {
+			old[cs.Name] = cs
+		}
+		statuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
+		for _, c := range pod.Spec.Containers {
+			cs, ok := old[c.Name]
+			if !ok {
+				cs = corev1.ContainerStatus{Name: c.Name, Image: c.Image}
+				changed = true
 			}
+			if cs.Image == "" {
+				cs.Image = c.Image
+			}
+			obs := states[c.Name]
+			if previousContainer(pod, obs) {
+				obs = ContainerSyncState{Phase: corev1.PodPending}
+			}
+			if applyContainerObservation(&cs, obs, phase) {
+				changed = true
+			}
+			s.noteRunStart(pod, &cs)
+			ready := obs.Phase == corev1.PodRunning && !isCrashLooping(&cs) &&
+				(obs.Health == "" || obs.Health == "healthy")
+			if cs.Ready != ready {
+				cs.Ready = ready
+				changed = true
+			}
+			statuses = append(statuses, cs)
+		}
+		if len(statuses) != len(pod.Status.ContainerStatuses) {
+			changed = true
+		} else {
+			for i := range statuses {
+				if statuses[i].Name != pod.Status.ContainerStatuses[i].Name {
+					changed = true
+					break
+				}
+			}
+		}
+		pod.Status.ContainerStatuses = statuses
+
+		if syncPodStartTime(pod) {
+			changed = true
+		}
+		if syncPodConditions(pod) {
+			changed = true
+		}
+		if changed {
+			pod.ResourceVersion = s.incRV()
+		}
+		uid = pod.UID
+		return changed, nil
+	})
+	if phaseChanged {
+		if evType, reason, msg, ok := podPhaseEvent(ns, name, phase); ok {
+			s.recordEvent("Pod", ns, name, uid, evType, reason, msg)
 		}
 	}
 }
@@ -1485,90 +1597,87 @@ func (s *Store) UpdatePodContainerPhases(ns, name string, phase corev1.PodPhase,
 // loop's Podman-fallback path (no matching unit) has no equivalent signal
 // and doesn't call this.
 func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCode int32, hasExited bool) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	pod, ok := s.pods[key]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-	if len(pod.Status.ContainerStatuses) == 0 && len(pod.Spec.Containers) > 0 {
-		pod.Status.ContainerStatuses = make([]corev1.ContainerStatus, len(pod.Spec.Containers))
-		for i, c := range pod.Spec.Containers {
-			pod.Status.ContainerStatuses[i] = corev1.ContainerStatus{Name: c.Name, Image: c.Image}
+	_ = s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		pod, ok := s.pods[key]
+		if !ok {
+			return false, nil
 		}
-	}
-	reason := "Completed"
-	if exitCode != 0 {
-		reason = "Error"
-	}
-	changed := false
-	for i := range pod.Status.ContainerStatuses {
-		cs := &pod.Status.ContainerStatuses[i]
-		if cs.RestartCount != restartCount {
-			cs.RestartCount = restartCount
-			changed = true
-		}
-		// hasExited means the unit is in systemd's auto-restart window: the
-		// container exited and systemd still reports that run's exit
-		// status. That is the only moment the exit code is known (the
-		// restart counter goes up only when the next run starts, and by
-		// then the status reads 0), so the last state is recorded here,
-		// once per ended run.
-		if hasExited {
-			startedAt := s.endedRunStart(pod, cs)
-			if cs.State.Terminated != nil && !cs.State.Terminated.StartedAt.IsZero() {
-				startedAt = cs.State.Terminated.StartedAt
+		if len(pod.Status.ContainerStatuses) == 0 && len(pod.Spec.Containers) > 0 {
+			pod.Status.ContainerStatuses = make([]corev1.ContainerStatus, len(pod.Spec.Containers))
+			for i, c := range pod.Spec.Containers {
+				pod.Status.ContainerStatuses[i] = corev1.ContainerStatus{Name: c.Name, Image: c.Image}
 			}
-			existing := cs.LastTerminationState.Terminated
-			if existing == nil || !existing.StartedAt.Equal(&startedAt) || existing.ExitCode != exitCode {
-				finishedAt := metav1.Now()
-				if cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero() {
-					finishedAt = cs.State.Terminated.FinishedAt
-				}
-				cs.LastTerminationState = corev1.ContainerState{
-					Terminated: &corev1.ContainerStateTerminated{
-						ExitCode:   exitCode,
-						Reason:     reason,
-						StartedAt:  startedAt,
-						FinishedAt: finishedAt,
-					},
-				}
+		}
+		reason := "Completed"
+		if exitCode != 0 {
+			reason = "Error"
+		}
+		changed := false
+		for i := range pod.Status.ContainerStatuses {
+			cs := &pod.Status.ContainerStatuses[i]
+			if cs.RestartCount != restartCount {
+				cs.RestartCount = restartCount
 				changed = true
 			}
-		}
+			// hasExited means the unit is in systemd's auto-restart window: the
+			// container exited and systemd still reports that run's exit
+			// status. That is the only moment the exit code is known (the
+			// restart counter goes up only when the next run starts, and by
+			// then the status reads 0), so the last state is recorded here,
+			// once per ended run.
+			if hasExited {
+				startedAt := s.endedRunStart(pod, cs)
+				if cs.State.Terminated != nil && !cs.State.Terminated.StartedAt.IsZero() {
+					startedAt = cs.State.Terminated.StartedAt
+				}
+				existing := cs.LastTerminationState.Terminated
+				if existing == nil || !existing.StartedAt.Equal(&startedAt) || existing.ExitCode != exitCode {
+					finishedAt := metav1.Now()
+					if cs.State.Terminated != nil && !cs.State.Terminated.FinishedAt.IsZero() {
+						finishedAt = cs.State.Terminated.FinishedAt
+					}
+					cs.LastTerminationState = corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode:   exitCode,
+							Reason:     reason,
+							StartedAt:  startedAt,
+							FinishedAt: finishedAt,
+						},
+					}
+					changed = true
+				}
+			}
 
-		// Mark not ready when crash-looping
-		if restartCount > 0 && exitCode != 0 && cs.Ready {
-			cs.Ready = false
-			changed = true
-		}
-	}
-	// The phase pass ran before this one and may have written the waiting
-	// reason from the previous restart count; refresh it now that the new
-	// restart and exit code are known.
-	for i := range pod.Status.ContainerStatuses {
-		cs := &pod.Status.ContainerStatuses[i]
-		if cs.State.Waiting != nil {
-			if w := waitingState(cs); w.Waiting.Reason != cs.State.Waiting.Reason {
-				cs.State = w
+			// Mark not ready when crash-looping
+			if restartCount > 0 && exitCode != 0 && cs.Ready {
+				cs.Ready = false
 				changed = true
 			}
 		}
-	}
-	if syncPodStartTime(pod) {
-		changed = true
-	}
-	if syncPodConditions(pod) {
-		changed = true
-	}
-	if changed {
-		pod.ResourceVersion = s.incRV()
-	}
-	s.mu.Unlock()
-	if changed {
-		s.persist()
-	}
+		// The phase pass ran before this one and may have written the waiting
+		// reason from the previous restart count; refresh it now that the new
+		// restart and exit code are known.
+		for i := range pod.Status.ContainerStatuses {
+			cs := &pod.Status.ContainerStatuses[i]
+			if cs.State.Waiting != nil {
+				if w := waitingState(cs); w.Waiting.Reason != cs.State.Waiting.Reason {
+					cs.State = w
+					changed = true
+				}
+			}
+		}
+		if syncPodStartTime(pod) {
+			changed = true
+		}
+		if syncPodConditions(pod) {
+			changed = true
+		}
+		if changed {
+			pod.ResourceVersion = s.incRV()
+		}
+		return changed, nil
+	})
 }
 
 // syncPodConditions derives the pod conditions from the container statuses:
@@ -1697,18 +1806,17 @@ func (s *Store) endedRunStart(pod *corev1.Pod, cs *corev1.ContainerStatus) metav
 // ignored (previousContainer), so the pod is not Ready and kubectl rollout
 // status keeps waiting.
 func (s *Store) ResetPodForRestart(ns, name string) {
-	s.mu.Lock()
-	pod, ok := s.pods[types.NamespacedName{Namespace: ns, Name: name}]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-	pod.CreationTimestamp = metav1.Now()
-	pod.Status = corev1.PodStatus{Phase: corev1.PodPending}
-	syncPodConditions(pod)
-	pod.ResourceVersion = s.incRV()
-	s.mu.Unlock()
-	s.persist()
+	_ = s.mutate(func() (bool, error) {
+		pod, ok := s.pods[types.NamespacedName{Namespace: ns, Name: name}]
+		if !ok {
+			return false, nil
+		}
+		pod.CreationTimestamp = metav1.Now()
+		pod.Status = corev1.PodStatus{Phase: corev1.PodPending}
+		syncPodConditions(pod)
+		pod.ResourceVersion = s.incRV()
+		return true, nil
+	})
 }
 
 // previousContainer reports whether an observed container started before the
@@ -1748,27 +1856,29 @@ func (s *Store) Services(ns string) []*corev1.Service {
 
 // CreateService creates a service.
 func (s *Store) CreateService(svc *corev1.Service) (*corev1.Service, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
-	if _, ok := s.services[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("service %q already exists in namespace %q", svc.Name, svc.Namespace)
-	}
-	svc.ResourceVersion = s.incRV()
-	svc.UID = types.UID(fmt.Sprintf("q8s-svc-%s-%s", svc.Namespace, svc.Name))
-	if svc.Labels == nil {
-		svc.Labels = make(map[string]string)
-	}
-	if svc.CreationTimestamp.IsZero() {
-		svc.CreationTimestamp = metav1.Now()
-	}
-	defaultServiceFields(svc)
-	s.services[key] = svc
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.Service
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
+		if _, ok := s.services[key]; ok {
+			return false, fmt.Errorf("service %q already exists in namespace %q", svc.Name, svc.Namespace)
+		}
+		svc.ResourceVersion = s.incRV()
+		svc.UID = types.UID(fmt.Sprintf("q8s-svc-%s-%s", svc.Namespace, svc.Name))
+		if svc.Labels == nil {
+			svc.Labels = make(map[string]string)
+		}
+		if svc.CreationTimestamp.IsZero() {
+			svc.CreationTimestamp = metav1.Now()
+		}
+		defaultServiceFields(svc)
+		s.services[key] = svc
+		out = svc.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return svc.DeepCopy(), nil
+	return out, nil
 }
 
 // defaultServiceFields fills in the standard fields a real Kubernetes API
@@ -1816,46 +1926,44 @@ func (s *Store) GetService(ns, name string) (*corev1.Service, error) {
 
 // DeleteService deletes a service.
 func (s *Store) DeleteService(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.services[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("service %q not found in namespace %q", name, ns)
-	}
-	delete(s.services, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.services[key]; !ok {
+			return false, fmt.Errorf("service %q not found in namespace %q", name, ns)
+		}
+		delete(s.services, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateService replaces a service in-place, preserving UID.
 func (s *Store) UpdateService(svc *corev1.Service) (*corev1.Service, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
-	existing, ok := s.services[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("service %q not found in namespace %q", svc.Name, svc.Namespace)
-	}
-	svc.UID = existing.UID
-	svc.ResourceVersion = s.incRV()
-	// Preserve the original creation time across updates (a full-object PUT
-	// or the post-create NodePort re-store would otherwise blank it), then
-	// re-default clusterIP/protocol so an update can't strip them either.
-	if svc.CreationTimestamp.IsZero() {
-		svc.CreationTimestamp = existing.CreationTimestamp
-	}
-	defaultServiceFields(svc)
-	s.services[key] = svc
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.Service
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}
+		existing, ok := s.services[key]
+		if !ok {
+			return false, fmt.Errorf("service %q not found in namespace %q", svc.Name, svc.Namespace)
+		}
+		svc.UID = existing.UID
+		svc.ResourceVersion = s.incRV()
+		// Preserve the original creation time across updates (a full-object PUT
+		// or the post-create NodePort re-store would otherwise blank it), then
+		// re-default clusterIP/protocol so an update can't strip them either.
+		if svc.CreationTimestamp.IsZero() {
+			svc.CreationTimestamp = existing.CreationTimestamp
+		}
+		defaultServiceFields(svc)
+		s.services[key] = svc
+		out = svc.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return svc.DeepCopy(), nil
+	return out, nil
 }
 
 // --- PVCs ---
@@ -1886,37 +1994,39 @@ func (s *Store) PVCs(ns string) []*corev1.PersistentVolumeClaim {
 
 // CreatePVC creates a PVC.
 func (s *Store) CreatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}
-	if _, ok := s.pvcs[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("PVC %q already exists in namespace %q", pvc.Name, pvc.Namespace)
-	}
-	pvc.ResourceVersion = s.incRV()
-	pvc.UID = types.UID(fmt.Sprintf("q8s-pvc-%s-%s", pvc.Namespace, pvc.Name))
-	if pvc.CreationTimestamp.IsZero() {
-		pvc.CreationTimestamp = metav1.Now()
-	}
-	if pvc.Labels == nil {
-		pvc.Labels = make(map[string]string)
-	}
-	// Default the storage class the way k8s's DefaultStorageClass admission
-	// plugin would: "standard" carries the is-default-class annotation, so a
-	// claim without an explicit class lands on it.
-	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
-		class := quadlet.StorageClassStandard
-		pvc.Spec.StorageClassName = &class
-	}
-	// Immediate binding: there is no asynchronous provisioner — the quadlet
-	// volume file is the provisioned volume — so the claim is bound as soon
-	// as it exists. hostpath claims have no named volume to point at.
-	pvc.Status.Phase = corev1.ClaimBound
-	if *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath {
-		pvc.Spec.VolumeName = quadlet.PVCVolumeName(pvc.Namespace, pvc.Name)
-	}
-	s.pvcs[key] = pvc
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.PersistentVolumeClaim
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}
+		if _, ok := s.pvcs[key]; ok {
+			return false, fmt.Errorf("PVC %q already exists in namespace %q", pvc.Name, pvc.Namespace)
+		}
+		pvc.ResourceVersion = s.incRV()
+		pvc.UID = types.UID(fmt.Sprintf("q8s-pvc-%s-%s", pvc.Namespace, pvc.Name))
+		if pvc.CreationTimestamp.IsZero() {
+			pvc.CreationTimestamp = metav1.Now()
+		}
+		if pvc.Labels == nil {
+			pvc.Labels = make(map[string]string)
+		}
+		// Default the storage class the way k8s's DefaultStorageClass admission
+		// plugin would: "standard" carries the is-default-class annotation, so a
+		// claim without an explicit class lands on it.
+		if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
+			class := quadlet.StorageClassStandard
+			pvc.Spec.StorageClassName = &class
+		}
+		// Immediate binding: there is no asynchronous provisioner — the quadlet
+		// volume file is the provisioned volume — so the claim is bound as soon
+		// as it exists. hostpath claims have no named volume to point at.
+		pvc.Status.Phase = corev1.ClaimBound
+		if *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath {
+			pvc.Spec.VolumeName = quadlet.PVCVolumeName(pvc.Namespace, pvc.Name)
+		}
+		s.pvcs[key] = pvc
+		out = pvc.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	msg := "Bound (hostpath backing)"
@@ -1925,7 +2035,7 @@ func (s *Store) CreatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.Persistent
 	}
 	s.recordEvent("PersistentVolumeClaim", pvc.Namespace, pvc.Name, pvc.UID,
 		corev1.EventTypeNormal, "ProvisioningSucceeded", msg)
-	return pvc.DeepCopy(), nil
+	return out, nil
 }
 
 // GetPVC gets a PVC by namespace and name.
@@ -1942,42 +2052,40 @@ func (s *Store) GetPVC(ns, name string) (*corev1.PersistentVolumeClaim, error) {
 
 // DeletePVC deletes a PVC.
 func (s *Store) DeletePVC(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.pvcs[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("PVC %q not found in namespace %q", name, ns)
-	}
-	delete(s.pvcs, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.pvcs[key]; !ok {
+			return false, fmt.Errorf("PVC %q not found in namespace %q", name, ns)
+		}
+		delete(s.pvcs, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdatePVC replaces a PVC in-place, preserving UID.
 func (s *Store) UpdatePVC(pvc *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}
-	existing, ok := s.pvcs[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("PVC %q not found in namespace %q", pvc.Name, pvc.Namespace)
-	}
-	pvc.UID = existing.UID
-	if pvc.CreationTimestamp.IsZero() {
-		pvc.CreationTimestamp = existing.CreationTimestamp
-	}
-	pvc.ResourceVersion = s.incRV()
-	s.pvcs[key] = pvc
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.PersistentVolumeClaim
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: pvc.Namespace, Name: pvc.Name}
+		existing, ok := s.pvcs[key]
+		if !ok {
+			return false, fmt.Errorf("PVC %q not found in namespace %q", pvc.Name, pvc.Namespace)
+		}
+		pvc.UID = existing.UID
+		if pvc.CreationTimestamp.IsZero() {
+			pvc.CreationTimestamp = existing.CreationTimestamp
+		}
+		pvc.ResourceVersion = s.incRV()
+		s.pvcs[key] = pvc
+		out = pvc.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return pvc.DeepCopy(), nil
+	return out, nil
 }
 
 // --- ConfigMaps ---
@@ -2008,48 +2116,52 @@ func (s *Store) ConfigMaps(ns string) []*corev1.ConfigMap {
 
 // CreateConfigMap creates a configmap.
 func (s *Store) CreateConfigMap(cm *corev1.ConfigMap) (*corev1.ConfigMap, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}
-	if _, ok := s.configmaps[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("configmap %q already exists in namespace %q", cm.Name, cm.Namespace)
-	}
-	cm.ResourceVersion = s.incRV()
-	cm.UID = types.UID(fmt.Sprintf("q8s-cm-%s-%s", cm.Namespace, cm.Name))
-	if cm.Labels == nil {
-		cm.Labels = make(map[string]string)
-	}
-	if cm.CreationTimestamp.IsZero() {
-		cm.CreationTimestamp = metav1.Now()
-	}
-	s.configmaps[key] = cm
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.ConfigMap
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}
+		if _, ok := s.configmaps[key]; ok {
+			return false, fmt.Errorf("configmap %q already exists in namespace %q", cm.Name, cm.Namespace)
+		}
+		cm.ResourceVersion = s.incRV()
+		cm.UID = types.UID(fmt.Sprintf("q8s-cm-%s-%s", cm.Namespace, cm.Name))
+		if cm.Labels == nil {
+			cm.Labels = make(map[string]string)
+		}
+		if cm.CreationTimestamp.IsZero() {
+			cm.CreationTimestamp = metav1.Now()
+		}
+		s.configmaps[key] = cm
+		out = cm.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return cm.DeepCopy(), nil
+	return out, nil
 }
 
 // UpdateConfigMap replaces a configmap's data in-place.
 func (s *Store) UpdateConfigMap(cm *corev1.ConfigMap) (*corev1.ConfigMap, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}
-	existing, ok := s.configmaps[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("configmap %q not found in namespace %q", cm.Name, cm.Namespace)
-	}
-	cm.UID = existing.UID
-	if cm.CreationTimestamp.IsZero() {
-		cm.CreationTimestamp = existing.CreationTimestamp
-	}
-	cm.ResourceVersion = s.incRV()
-	s.configmaps[key] = cm
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.ConfigMap
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}
+		existing, ok := s.configmaps[key]
+		if !ok {
+			return false, fmt.Errorf("configmap %q not found in namespace %q", cm.Name, cm.Namespace)
+		}
+		cm.UID = existing.UID
+		if cm.CreationTimestamp.IsZero() {
+			cm.CreationTimestamp = existing.CreationTimestamp
+		}
+		cm.ResourceVersion = s.incRV()
+		s.configmaps[key] = cm
+		out = cm.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return cm.DeepCopy(), nil
+	return out, nil
 }
 
 // GetConfigMap gets a configmap.
@@ -2066,20 +2178,16 @@ func (s *Store) GetConfigMap(ns, name string) (*corev1.ConfigMap, error) {
 
 // DeleteConfigMap deletes a configmap.
 func (s *Store) DeleteConfigMap(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.configmaps[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("configmap %q not found in namespace %q", name, ns)
-	}
-	delete(s.configmaps, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.configmaps[key]; !ok {
+			return false, fmt.Errorf("configmap %q not found in namespace %q", name, ns)
+		}
+		delete(s.configmaps, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // --- Secrets ---
@@ -2110,26 +2218,28 @@ func (s *Store) Secrets(ns string) []*corev1.Secret {
 
 // CreateSecret creates a secret.
 func (s *Store) CreateSecret(sec *corev1.Secret) (*corev1.Secret, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}
-	if _, ok := s.secrets[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("secret %q already exists in namespace %q", sec.Name, sec.Namespace)
-	}
-	sec.ResourceVersion = s.incRV()
-	sec.UID = types.UID(fmt.Sprintf("q8s-secret-%s-%s", sec.Namespace, sec.Name))
-	if sec.Labels == nil {
-		sec.Labels = make(map[string]string)
-	}
-	if sec.CreationTimestamp.IsZero() {
-		sec.CreationTimestamp = metav1.Now()
-	}
-	s.secrets[key] = sec
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.Secret
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}
+		if _, ok := s.secrets[key]; ok {
+			return false, fmt.Errorf("secret %q already exists in namespace %q", sec.Name, sec.Namespace)
+		}
+		sec.ResourceVersion = s.incRV()
+		sec.UID = types.UID(fmt.Sprintf("q8s-secret-%s-%s", sec.Namespace, sec.Name))
+		if sec.Labels == nil {
+			sec.Labels = make(map[string]string)
+		}
+		if sec.CreationTimestamp.IsZero() {
+			sec.CreationTimestamp = metav1.Now()
+		}
+		s.secrets[key] = sec
+		out = sec.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return sec.DeepCopy(), nil
+	return out, nil
 }
 
 // GetSecret gets a secret.
@@ -2146,42 +2256,40 @@ func (s *Store) GetSecret(ns, name string) (*corev1.Secret, error) {
 
 // DeleteSecret deletes a secret.
 func (s *Store) DeleteSecret(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.secrets[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("secret %q not found in namespace %q", name, ns)
-	}
-	delete(s.secrets, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.secrets[key]; !ok {
+			return false, fmt.Errorf("secret %q not found in namespace %q", name, ns)
+		}
+		delete(s.secrets, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateSecret replaces a secret in-place, preserving UID.
 func (s *Store) UpdateSecret(sec *corev1.Secret) (*corev1.Secret, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}
-	existing, ok := s.secrets[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("secret %q not found in namespace %q", sec.Name, sec.Namespace)
-	}
-	sec.UID = existing.UID
-	if sec.CreationTimestamp.IsZero() {
-		sec.CreationTimestamp = existing.CreationTimestamp
-	}
-	sec.ResourceVersion = s.incRV()
-	s.secrets[key] = sec
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.Secret
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}
+		existing, ok := s.secrets[key]
+		if !ok {
+			return false, fmt.Errorf("secret %q not found in namespace %q", sec.Name, sec.Namespace)
+		}
+		sec.UID = existing.UID
+		if sec.CreationTimestamp.IsZero() {
+			sec.CreationTimestamp = existing.CreationTimestamp
+		}
+		sec.ResourceVersion = s.incRV()
+		s.secrets[key] = sec
+		out = sec.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return sec.DeepCopy(), nil
+	return out, nil
 }
 
 // --- ServiceAccounts ---
@@ -2212,26 +2320,28 @@ func (s *Store) ServiceAccounts(ns string) []*corev1.ServiceAccount {
 
 // CreateServiceAccount creates a ServiceAccount.
 func (s *Store) CreateServiceAccount(sa *corev1.ServiceAccount) (*corev1.ServiceAccount, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}
-	if _, ok := s.serviceAccounts[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("serviceaccount %q already exists in namespace %q", sa.Name, sa.Namespace)
-	}
-	sa.ResourceVersion = s.incRV()
-	sa.UID = types.UID(fmt.Sprintf("q8s-serviceaccount-%s-%s", sa.Namespace, sa.Name))
-	if sa.Labels == nil {
-		sa.Labels = make(map[string]string)
-	}
-	if sa.CreationTimestamp.IsZero() {
-		sa.CreationTimestamp = metav1.Now()
-	}
-	s.serviceAccounts[key] = sa
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.ServiceAccount
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}
+		if _, ok := s.serviceAccounts[key]; ok {
+			return false, fmt.Errorf("serviceaccount %q already exists in namespace %q", sa.Name, sa.Namespace)
+		}
+		sa.ResourceVersion = s.incRV()
+		sa.UID = types.UID(fmt.Sprintf("q8s-serviceaccount-%s-%s", sa.Namespace, sa.Name))
+		if sa.Labels == nil {
+			sa.Labels = make(map[string]string)
+		}
+		if sa.CreationTimestamp.IsZero() {
+			sa.CreationTimestamp = metav1.Now()
+		}
+		s.serviceAccounts[key] = sa
+		out = sa.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return sa.DeepCopy(), nil
+	return out, nil
 }
 
 // GetServiceAccount gets a ServiceAccount.
@@ -2247,43 +2357,41 @@ func (s *Store) GetServiceAccount(ns, name string) (*corev1.ServiceAccount, erro
 
 // DeleteServiceAccount deletes a ServiceAccount.
 func (s *Store) DeleteServiceAccount(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.serviceAccounts[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("serviceaccount %q not found in namespace %q", name, ns)
-	}
-	delete(s.serviceAccounts, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.serviceAccounts[key]; !ok {
+			return false, fmt.Errorf("serviceaccount %q not found in namespace %q", name, ns)
+		}
+		delete(s.serviceAccounts, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateServiceAccount replaces a ServiceAccount in-place, preserving UID and
 // creation timestamp.
 func (s *Store) UpdateServiceAccount(sa *corev1.ServiceAccount) (*corev1.ServiceAccount, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}
-	existing, ok := s.serviceAccounts[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("serviceaccount %q not found in namespace %q", sa.Name, sa.Namespace)
-	}
-	sa.UID = existing.UID
-	if sa.CreationTimestamp.IsZero() {
-		sa.CreationTimestamp = existing.CreationTimestamp
-	}
-	sa.ResourceVersion = s.incRV()
-	s.serviceAccounts[key] = sa
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *corev1.ServiceAccount
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: sa.Namespace, Name: sa.Name}
+		existing, ok := s.serviceAccounts[key]
+		if !ok {
+			return false, fmt.Errorf("serviceaccount %q not found in namespace %q", sa.Name, sa.Namespace)
+		}
+		sa.UID = existing.UID
+		if sa.CreationTimestamp.IsZero() {
+			sa.CreationTimestamp = existing.CreationTimestamp
+		}
+		sa.ResourceVersion = s.incRV()
+		s.serviceAccounts[key] = sa
+		out = sa.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return sa.DeepCopy(), nil
+	return out, nil
 }
 
 // --- Jobs ---
@@ -2314,28 +2422,30 @@ func (s *Store) Jobs(ns string) []*batchv1.Job {
 
 // CreateJob creates a job.
 func (s *Store) CreateJob(job *batchv1.Job) (*batchv1.Job, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: job.Namespace, Name: job.Name}
-	if _, ok := s.jobs[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("job %q already exists in namespace %q", job.Name, job.Namespace)
-	}
-	job.ResourceVersion = s.incRV()
-	job.UID = types.UID(fmt.Sprintf("q8s-job-%s-%s", job.Namespace, job.Name))
-	if job.Labels == nil {
-		job.Labels = make(map[string]string)
-	}
-	if job.CreationTimestamp.IsZero() {
-		job.CreationTimestamp = metav1.Now()
-	}
-	s.jobs[key] = job
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *batchv1.Job
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: job.Namespace, Name: job.Name}
+		if _, ok := s.jobs[key]; ok {
+			return false, fmt.Errorf("job %q already exists in namespace %q", job.Name, job.Namespace)
+		}
+		job.ResourceVersion = s.incRV()
+		job.UID = types.UID(fmt.Sprintf("q8s-job-%s-%s", job.Namespace, job.Name))
+		if job.Labels == nil {
+			job.Labels = make(map[string]string)
+		}
+		if job.CreationTimestamp.IsZero() {
+			job.CreationTimestamp = metav1.Now()
+		}
+		s.jobs[key] = job
+		out = job.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	s.recordEvent("Job", job.Namespace, job.Name, job.UID, corev1.EventTypeNormal, "Created",
 		fmt.Sprintf("Created job %s/%s", job.Namespace, job.Name))
-	return job.DeepCopy(), nil
+	return out, nil
 }
 
 // GetJob gets a job.
@@ -2352,64 +2462,69 @@ func (s *Store) GetJob(ns, name string) (*batchv1.Job, error) {
 
 // DeleteJob deletes a job.
 func (s *Store) DeleteJob(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	job, ok := s.jobs[key]
-	if !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("job %q not found in namespace %q", name, ns)
-	}
-	delete(s.jobs, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var uid types.UID
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		job, ok := s.jobs[key]
+		if !ok {
+			return false, fmt.Errorf("job %q not found in namespace %q", name, ns)
+		}
+		uid = job.UID
+		delete(s.jobs, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
+	if err != nil {
 		return err
 	}
-	s.recordEvent("Job", ns, name, job.UID, corev1.EventTypeNormal, "Deleted",
+	s.recordEvent("Job", ns, name, uid, corev1.EventTypeNormal, "Deleted",
 		fmt.Sprintf("Deleted job %s/%s", ns, name))
 	return nil
 }
 
 // UpdateJob replaces a job in-place, preserving UID.
 func (s *Store) UpdateJob(job *batchv1.Job) (*batchv1.Job, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: job.Namespace, Name: job.Name}
-	existing, ok := s.jobs[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("job %q not found in namespace %q", job.Name, job.Namespace)
-	}
-	job.UID = existing.UID
-	job.ResourceVersion = s.incRV()
-	s.jobs[key] = job
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *batchv1.Job
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: job.Namespace, Name: job.Name}
+		existing, ok := s.jobs[key]
+		if !ok {
+			return false, fmt.Errorf("job %q not found in namespace %q", job.Name, job.Namespace)
+		}
+		job.UID = existing.UID
+		job.ResourceVersion = s.incRV()
+		s.jobs[key] = job
+		out = job.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return job.DeepCopy(), nil
+	return out, nil
 }
 
 // UpdateJobStatus updates a job's active/succeeded/failed counts.
 func (s *Store) UpdateJobStatus(ns, name string, active, succeeded, failed int32) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	job, ok := s.jobs[key]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-	changed := job.Status.Active != active || job.Status.Succeeded != succeeded || job.Status.Failed != failed
+	changed := false
+	var uid types.UID
+	_ = s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		job, ok := s.jobs[key]
+		if !ok {
+			return false, nil
+		}
+		changed = job.Status.Active != active || job.Status.Succeeded != succeeded || job.Status.Failed != failed
+		if changed {
+			job.Status.Active = active
+			job.Status.Succeeded = succeeded
+			job.Status.Failed = failed
+			job.ResourceVersion = s.incRV()
+		}
+		uid = job.UID
+		return changed, nil
+	})
 	if changed {
-		job.Status.Active = active
-		job.Status.Succeeded = succeeded
-		job.Status.Failed = failed
-		job.ResourceVersion = s.incRV()
-	}
-	uid := job.UID
-	s.mu.Unlock()
-	if changed {
-		s.persist()
 		switch {
 		case failed > 0:
 			s.recordEvent("Job", ns, name, uid, corev1.EventTypeWarning, "Failed",
@@ -2452,26 +2567,28 @@ func (s *Store) CronJobs(ns string) []*batchv1.CronJob {
 
 // CreateCronJob creates a cronjob.
 func (s *Store) CreateCronJob(cj *batchv1.CronJob) (*batchv1.CronJob, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: cj.Namespace, Name: cj.Name}
-	if _, ok := s.cronjobs[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("cronjob %q already exists in namespace %q", cj.Name, cj.Namespace)
-	}
-	cj.ResourceVersion = s.incRV()
-	cj.UID = types.UID(fmt.Sprintf("q8s-cj-%s-%s", cj.Namespace, cj.Name))
-	if cj.Labels == nil {
-		cj.Labels = make(map[string]string)
-	}
-	if cj.CreationTimestamp.IsZero() {
-		cj.CreationTimestamp = metav1.Now()
-	}
-	s.cronjobs[key] = cj
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *batchv1.CronJob
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: cj.Namespace, Name: cj.Name}
+		if _, ok := s.cronjobs[key]; ok {
+			return false, fmt.Errorf("cronjob %q already exists in namespace %q", cj.Name, cj.Namespace)
+		}
+		cj.ResourceVersion = s.incRV()
+		cj.UID = types.UID(fmt.Sprintf("q8s-cj-%s-%s", cj.Namespace, cj.Name))
+		if cj.Labels == nil {
+			cj.Labels = make(map[string]string)
+		}
+		if cj.CreationTimestamp.IsZero() {
+			cj.CreationTimestamp = metav1.Now()
+		}
+		s.cronjobs[key] = cj
+		out = cj.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return cj.DeepCopy(), nil
+	return out, nil
 }
 
 // GetCronJob gets a cronjob.
@@ -2488,39 +2605,37 @@ func (s *Store) GetCronJob(ns, name string) (*batchv1.CronJob, error) {
 
 // DeleteCronJob deletes a cronjob.
 func (s *Store) DeleteCronJob(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.cronjobs[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("cronjob %q not found in namespace %q", name, ns)
-	}
-	delete(s.cronjobs, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.cronjobs[key]; !ok {
+			return false, fmt.Errorf("cronjob %q not found in namespace %q", name, ns)
+		}
+		delete(s.cronjobs, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateCronJob replaces a cronjob in-place, preserving UID.
 func (s *Store) UpdateCronJob(cj *batchv1.CronJob) (*batchv1.CronJob, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: cj.Namespace, Name: cj.Name}
-	existing, ok := s.cronjobs[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("cronjob %q not found in namespace %q", cj.Name, cj.Namespace)
-	}
-	cj.UID = existing.UID
-	cj.ResourceVersion = s.incRV()
-	s.cronjobs[key] = cj
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *batchv1.CronJob
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: cj.Namespace, Name: cj.Name}
+		existing, ok := s.cronjobs[key]
+		if !ok {
+			return false, fmt.Errorf("cronjob %q not found in namespace %q", cj.Name, cj.Namespace)
+		}
+		cj.UID = existing.UID
+		cj.ResourceVersion = s.incRV()
+		s.cronjobs[key] = cj
+		out = cj.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return cj.DeepCopy(), nil
+	return out, nil
 }
 
 // --- Ingresses ---
@@ -2551,26 +2666,28 @@ func (s *Store) Ingresses(ns string) []*networkingv1.Ingress {
 
 // CreateIngress creates an ingress.
 func (s *Store) CreateIngress(ing *networkingv1.Ingress) (*networkingv1.Ingress, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ing.Namespace, Name: ing.Name}
-	if _, ok := s.ingresses[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("ingress %q already exists in namespace %q", ing.Name, ing.Namespace)
-	}
-	ing.ResourceVersion = s.incRV()
-	ing.UID = types.UID(fmt.Sprintf("q8s-ing-%s-%s", ing.Namespace, ing.Name))
-	if ing.Labels == nil {
-		ing.Labels = make(map[string]string)
-	}
-	if ing.CreationTimestamp.IsZero() {
-		ing.CreationTimestamp = metav1.Now()
-	}
-	s.ingresses[key] = ing
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *networkingv1.Ingress
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ing.Namespace, Name: ing.Name}
+		if _, ok := s.ingresses[key]; ok {
+			return false, fmt.Errorf("ingress %q already exists in namespace %q", ing.Name, ing.Namespace)
+		}
+		ing.ResourceVersion = s.incRV()
+		ing.UID = types.UID(fmt.Sprintf("q8s-ing-%s-%s", ing.Namespace, ing.Name))
+		if ing.Labels == nil {
+			ing.Labels = make(map[string]string)
+		}
+		if ing.CreationTimestamp.IsZero() {
+			ing.CreationTimestamp = metav1.Now()
+		}
+		s.ingresses[key] = ing
+		out = ing.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return ing.DeepCopy(), nil
+	return out, nil
 }
 
 // GetIngress gets an ingress.
@@ -2587,39 +2704,37 @@ func (s *Store) GetIngress(ns, name string) (*networkingv1.Ingress, error) {
 
 // DeleteIngress deletes an ingress.
 func (s *Store) DeleteIngress(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.ingresses[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("ingress %q not found in namespace %q", name, ns)
-	}
-	delete(s.ingresses, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.ingresses[key]; !ok {
+			return false, fmt.Errorf("ingress %q not found in namespace %q", name, ns)
+		}
+		delete(s.ingresses, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateIngress replaces an ingress in-place, preserving UID.
 func (s *Store) UpdateIngress(ing *networkingv1.Ingress) (*networkingv1.Ingress, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ing.Namespace, Name: ing.Name}
-	existing, ok := s.ingresses[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("ingress %q not found in namespace %q", ing.Name, ing.Namespace)
-	}
-	ing.UID = existing.UID
-	ing.ResourceVersion = s.incRV()
-	s.ingresses[key] = ing
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *networkingv1.Ingress
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ing.Namespace, Name: ing.Name}
+		existing, ok := s.ingresses[key]
+		if !ok {
+			return false, fmt.Errorf("ingress %q not found in namespace %q", ing.Name, ing.Namespace)
+		}
+		ing.UID = existing.UID
+		ing.ResourceVersion = s.incRV()
+		s.ingresses[key] = ing
+		out = ing.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return ing.DeepCopy(), nil
+	return out, nil
 }
 
 // --- Middlewares ---
@@ -2650,26 +2765,28 @@ func (s *Store) Middlewares(ns string) []*traefik.Middleware {
 
 // CreateMiddleware creates a Middleware.
 func (s *Store) CreateMiddleware(mw *traefik.Middleware) (*traefik.Middleware, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}
-	if _, ok := s.middlewares[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("middleware %q already exists in namespace %q", mw.Name, mw.Namespace)
-	}
-	mw.ResourceVersion = s.incRV()
-	mw.UID = types.UID(fmt.Sprintf("q8s-mw-%s-%s", mw.Namespace, mw.Name))
-	if mw.Labels == nil {
-		mw.Labels = make(map[string]string)
-	}
-	if mw.CreationTimestamp.IsZero() {
-		mw.CreationTimestamp = metav1.Now()
-	}
-	s.middlewares[key] = mw
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *traefik.Middleware
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}
+		if _, ok := s.middlewares[key]; ok {
+			return false, fmt.Errorf("middleware %q already exists in namespace %q", mw.Name, mw.Namespace)
+		}
+		mw.ResourceVersion = s.incRV()
+		mw.UID = types.UID(fmt.Sprintf("q8s-mw-%s-%s", mw.Namespace, mw.Name))
+		if mw.Labels == nil {
+			mw.Labels = make(map[string]string)
+		}
+		if mw.CreationTimestamp.IsZero() {
+			mw.CreationTimestamp = metav1.Now()
+		}
+		s.middlewares[key] = mw
+		out = mw.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return mw.DeepCopy(), nil
+	return out, nil
 }
 
 // GetMiddleware gets a Middleware.
@@ -2685,42 +2802,40 @@ func (s *Store) GetMiddleware(ns, name string) (*traefik.Middleware, error) {
 
 // DeleteMiddleware deletes a Middleware.
 func (s *Store) DeleteMiddleware(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.middlewares[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("middleware %q not found in namespace %q", name, ns)
-	}
-	delete(s.middlewares, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.middlewares[key]; !ok {
+			return false, fmt.Errorf("middleware %q not found in namespace %q", name, ns)
+		}
+		delete(s.middlewares, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateMiddleware replaces a Middleware in-place, preserving UID.
 func (s *Store) UpdateMiddleware(mw *traefik.Middleware) (*traefik.Middleware, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}
-	existing, ok := s.middlewares[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("middleware %q not found in namespace %q", mw.Name, mw.Namespace)
-	}
-	mw.UID = existing.UID
-	if mw.CreationTimestamp.IsZero() {
-		mw.CreationTimestamp = existing.CreationTimestamp
-	}
-	mw.ResourceVersion = s.incRV()
-	s.middlewares[key] = mw
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *traefik.Middleware
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: mw.Namespace, Name: mw.Name}
+		existing, ok := s.middlewares[key]
+		if !ok {
+			return false, fmt.Errorf("middleware %q not found in namespace %q", mw.Name, mw.Namespace)
+		}
+		mw.UID = existing.UID
+		if mw.CreationTimestamp.IsZero() {
+			mw.CreationTimestamp = existing.CreationTimestamp
+		}
+		mw.ResourceVersion = s.incRV()
+		s.middlewares[key] = mw
+		out = mw.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return mw.DeepCopy(), nil
+	return out, nil
 }
 
 // --- IngressRouteTCPs ---
@@ -2751,26 +2866,28 @@ func (s *Store) IngressRouteTCPs(ns string) []*traefik.IngressRouteTCP {
 
 // CreateIngressRouteTCP creates an IngressRouteTCP.
 func (s *Store) CreateIngressRouteTCP(irt *traefik.IngressRouteTCP) (*traefik.IngressRouteTCP, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}
-	if _, ok := s.ingressRouteTCPs[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("ingressroutetcp %q already exists in namespace %q", irt.Name, irt.Namespace)
-	}
-	irt.ResourceVersion = s.incRV()
-	irt.UID = types.UID(fmt.Sprintf("q8s-irtcp-%s-%s", irt.Namespace, irt.Name))
-	if irt.Labels == nil {
-		irt.Labels = make(map[string]string)
-	}
-	if irt.CreationTimestamp.IsZero() {
-		irt.CreationTimestamp = metav1.Now()
-	}
-	s.ingressRouteTCPs[key] = irt
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *traefik.IngressRouteTCP
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}
+		if _, ok := s.ingressRouteTCPs[key]; ok {
+			return false, fmt.Errorf("ingressroutetcp %q already exists in namespace %q", irt.Name, irt.Namespace)
+		}
+		irt.ResourceVersion = s.incRV()
+		irt.UID = types.UID(fmt.Sprintf("q8s-irtcp-%s-%s", irt.Namespace, irt.Name))
+		if irt.Labels == nil {
+			irt.Labels = make(map[string]string)
+		}
+		if irt.CreationTimestamp.IsZero() {
+			irt.CreationTimestamp = metav1.Now()
+		}
+		s.ingressRouteTCPs[key] = irt
+		out = irt.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return irt.DeepCopy(), nil
+	return out, nil
 }
 
 // GetIngressRouteTCP gets an IngressRouteTCP.
@@ -2786,42 +2903,40 @@ func (s *Store) GetIngressRouteTCP(ns, name string) (*traefik.IngressRouteTCP, e
 
 // DeleteIngressRouteTCP deletes an IngressRouteTCP.
 func (s *Store) DeleteIngressRouteTCP(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.ingressRouteTCPs[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("ingressroutetcp %q not found in namespace %q", name, ns)
-	}
-	delete(s.ingressRouteTCPs, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.ingressRouteTCPs[key]; !ok {
+			return false, fmt.Errorf("ingressroutetcp %q not found in namespace %q", name, ns)
+		}
+		delete(s.ingressRouteTCPs, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateIngressRouteTCP replaces an IngressRouteTCP in-place, preserving UID.
 func (s *Store) UpdateIngressRouteTCP(irt *traefik.IngressRouteTCP) (*traefik.IngressRouteTCP, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}
-	existing, ok := s.ingressRouteTCPs[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("ingressroutetcp %q not found in namespace %q", irt.Name, irt.Namespace)
-	}
-	irt.UID = existing.UID
-	if irt.CreationTimestamp.IsZero() {
-		irt.CreationTimestamp = existing.CreationTimestamp
-	}
-	irt.ResourceVersion = s.incRV()
-	s.ingressRouteTCPs[key] = irt
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *traefik.IngressRouteTCP
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: irt.Namespace, Name: irt.Name}
+		existing, ok := s.ingressRouteTCPs[key]
+		if !ok {
+			return false, fmt.Errorf("ingressroutetcp %q not found in namespace %q", irt.Name, irt.Namespace)
+		}
+		irt.UID = existing.UID
+		if irt.CreationTimestamp.IsZero() {
+			irt.CreationTimestamp = existing.CreationTimestamp
+		}
+		irt.ResourceVersion = s.incRV()
+		s.ingressRouteTCPs[key] = irt
+		out = irt.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return irt.DeepCopy(), nil
+	return out, nil
 }
 
 // --- Deployments ---
@@ -2852,65 +2967,69 @@ func (s *Store) Deployments(ns string) []*appsv1.Deployment {
 
 // CreateDeployment creates a deployment.
 func (s *Store) CreateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}
-	if _, ok := s.deployments[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("deployment %q already exists in namespace %q", dep.Name, dep.Namespace)
-	}
-	dep.ResourceVersion = s.incRV()
-	dep.UID = types.UID(fmt.Sprintf("q8s-dep-%s-%s", dep.Namespace, dep.Name))
-	if dep.Labels == nil {
-		dep.Labels = make(map[string]string)
-	}
-	if dep.CreationTimestamp.IsZero() {
-		dep.CreationTimestamp = metav1.Now()
-	}
-	// A real API server stamps generation 1 on create and bumps it on every
-	// spec change (see UpdateDeployment). kubectl rollout status gates on
-	// status.observedGeneration >= metadata.generation before it looks at
-	// replicas, so this must be populated or rollout status hangs. tic-773b.
-	dep.Generation = 1
-	s.deployments[key] = dep
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *appsv1.Deployment
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}
+		if _, ok := s.deployments[key]; ok {
+			return false, fmt.Errorf("deployment %q already exists in namespace %q", dep.Name, dep.Namespace)
+		}
+		dep.ResourceVersion = s.incRV()
+		dep.UID = types.UID(fmt.Sprintf("q8s-dep-%s-%s", dep.Namespace, dep.Name))
+		if dep.Labels == nil {
+			dep.Labels = make(map[string]string)
+		}
+		if dep.CreationTimestamp.IsZero() {
+			dep.CreationTimestamp = metav1.Now()
+		}
+		// A real API server stamps generation 1 on create and bumps it on every
+		// spec change (see UpdateDeployment). kubectl rollout status gates on
+		// status.observedGeneration >= metadata.generation before it looks at
+		// replicas, so this must be populated or rollout status hangs. tic-773b.
+		dep.Generation = 1
+		s.deployments[key] = dep
+		out = dep.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	s.recordEvent("Deployment", dep.Namespace, dep.Name, dep.UID, corev1.EventTypeNormal, "Created",
 		fmt.Sprintf("Created deployment %s/%s", dep.Namespace, dep.Name))
-	return dep.DeepCopy(), nil
+	return out, nil
 }
 
 // UpdateDeployment replaces a deployment in-place, preserving UID.
 func (s *Store) UpdateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}
-	existing, ok := s.deployments[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("deployment %q not found in namespace %q", dep.Name, dep.Namespace)
-	}
-	dep.UID = existing.UID
-	dep.ResourceVersion = s.incRV()
-	// Preserve creationTimestamp across updates (a full-object PUT may omit
-	// it), and manage metadata.generation like a real API server: bump it
-	// only when the spec actually changed, carry it forward otherwise. This
-	// is what status.observedGeneration is compared against, so getting it
-	// right is what lets `kubectl rollout status` terminate. tic-773b.
-	if dep.CreationTimestamp.IsZero() {
-		dep.CreationTimestamp = existing.CreationTimestamp
-	}
-	if reflect.DeepEqual(dep.Spec, existing.Spec) {
-		dep.Generation = existing.Generation
-	} else {
-		dep.Generation = existing.Generation + 1
-	}
-	s.deployments[key] = dep
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *appsv1.Deployment
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: dep.Namespace, Name: dep.Name}
+		existing, ok := s.deployments[key]
+		if !ok {
+			return false, fmt.Errorf("deployment %q not found in namespace %q", dep.Name, dep.Namespace)
+		}
+		dep.UID = existing.UID
+		dep.ResourceVersion = s.incRV()
+		// Preserve creationTimestamp across updates (a full-object PUT may omit
+		// it), and manage metadata.generation like a real API server: bump it
+		// only when the spec actually changed, carry it forward otherwise. This
+		// is what status.observedGeneration is compared against, so getting it
+		// right is what lets `kubectl rollout status` terminate. tic-773b.
+		if dep.CreationTimestamp.IsZero() {
+			dep.CreationTimestamp = existing.CreationTimestamp
+		}
+		if reflect.DeepEqual(dep.Spec, existing.Spec) {
+			dep.Generation = existing.Generation
+		} else {
+			dep.Generation = existing.Generation + 1
+		}
+		s.deployments[key] = dep
+		out = dep.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return dep.DeepCopy(), nil
+	return out, nil
 }
 
 // GetDeployment gets a deployment.
@@ -2927,55 +3046,59 @@ func (s *Store) GetDeployment(ns, name string) (*appsv1.Deployment, error) {
 
 // DeleteDeployment deletes a deployment.
 func (s *Store) DeleteDeployment(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	dep, ok := s.deployments[key]
-	if !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("deployment %q not found in namespace %q", name, ns)
-	}
-	delete(s.deployments, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var uid types.UID
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		dep, ok := s.deployments[key]
+		if !ok {
+			return false, fmt.Errorf("deployment %q not found in namespace %q", name, ns)
+		}
+		uid = dep.UID
+		delete(s.deployments, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
+	if err != nil {
 		return err
 	}
-	s.recordEvent("Deployment", ns, name, dep.UID, corev1.EventTypeNormal, "Deleted",
+	s.recordEvent("Deployment", ns, name, uid, corev1.EventTypeNormal, "Deleted",
 		fmt.Sprintf("Deleted deployment %s/%s", ns, name))
 	return nil
 }
 
 // UpdateDeploymentStatus updates a deployment's ready/available replica counts.
 func (s *Store) UpdateDeploymentStatus(ns, name string, ready int32) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	dep, ok := s.deployments[key]
-	if !ok {
-		s.mu.Unlock()
-		return
-	}
-	desired := int32(1)
-	if dep.Spec.Replicas != nil {
-		desired = *dep.Spec.Replicas
-	}
-	// Update when the ready count changed OR when observedGeneration still
-	// lags the current generation (a spec change — e.g. rollout restart —
-	// with an unchanged replica count must still be "observed", or
-	// `kubectl rollout status` waits forever). tic-773b.
-	changed := dep.Status.ReadyReplicas != ready || dep.Status.ObservedGeneration != dep.Generation
+	changed := false
+	var uid types.UID
+	var desired int32
+	_ = s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		dep, ok := s.deployments[key]
+		if !ok {
+			return false, nil
+		}
+		desired = 1
+		if dep.Spec.Replicas != nil {
+			desired = *dep.Spec.Replicas
+		}
+		// Update when the ready count changed OR when observedGeneration still
+		// lags the current generation (a spec change — e.g. rollout restart —
+		// with an unchanged replica count must still be "observed", or
+		// `kubectl rollout status` waits forever). tic-773b.
+		changed = dep.Status.ReadyReplicas != ready || dep.Status.ObservedGeneration != dep.Generation
+		if changed {
+			dep.Status.Replicas = desired
+			dep.Status.ReadyReplicas = ready
+			dep.Status.AvailableReplicas = ready
+			dep.Status.UpdatedReplicas = desired
+			dep.Status.ObservedGeneration = dep.Generation
+			dep.ResourceVersion = s.incRV()
+		}
+		uid = dep.UID
+		return changed, nil
+	})
 	if changed {
-		dep.Status.Replicas = desired
-		dep.Status.ReadyReplicas = ready
-		dep.Status.AvailableReplicas = ready
-		dep.Status.UpdatedReplicas = desired
-		dep.Status.ObservedGeneration = dep.Generation
-		dep.ResourceVersion = s.incRV()
-	}
-	uid := dep.UID
-	s.mu.Unlock()
-	if changed {
-		s.persist()
 		s.recordEvent("Deployment", ns, name, uid, corev1.EventTypeNormal, "ScalingReplicaSet",
 			fmt.Sprintf("Deployment %s/%s: %d/%d replicas ready", ns, name, ready, desired))
 	}
@@ -3009,26 +3132,28 @@ func (s *Store) Roles(ns string) []*rbacv1.Role {
 
 // CreateRole creates a Role.
 func (s *Store) CreateRole(role *rbacv1.Role) (*rbacv1.Role, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: role.Namespace, Name: role.Name}
-	if _, ok := s.roles[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("role %q already exists in namespace %q", role.Name, role.Namespace)
-	}
-	role.ResourceVersion = s.incRV()
-	role.UID = types.UID(fmt.Sprintf("q8s-role-%s-%s", role.Namespace, role.Name))
-	if role.Labels == nil {
-		role.Labels = make(map[string]string)
-	}
-	if role.CreationTimestamp.IsZero() {
-		role.CreationTimestamp = metav1.Now()
-	}
-	s.roles[key] = role
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *rbacv1.Role
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: role.Namespace, Name: role.Name}
+		if _, ok := s.roles[key]; ok {
+			return false, fmt.Errorf("role %q already exists in namespace %q", role.Name, role.Namespace)
+		}
+		role.ResourceVersion = s.incRV()
+		role.UID = types.UID(fmt.Sprintf("q8s-role-%s-%s", role.Namespace, role.Name))
+		if role.Labels == nil {
+			role.Labels = make(map[string]string)
+		}
+		if role.CreationTimestamp.IsZero() {
+			role.CreationTimestamp = metav1.Now()
+		}
+		s.roles[key] = role
+		out = role.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return role.DeepCopy(), nil
+	return out, nil
 }
 
 // GetRole gets a Role.
@@ -3044,42 +3169,40 @@ func (s *Store) GetRole(ns, name string) (*rbacv1.Role, error) {
 
 // DeleteRole deletes a Role.
 func (s *Store) DeleteRole(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.roles[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("role %q not found in namespace %q", name, ns)
-	}
-	delete(s.roles, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.roles[key]; !ok {
+			return false, fmt.Errorf("role %q not found in namespace %q", name, ns)
+		}
+		delete(s.roles, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateRole replaces a Role in-place, preserving UID and creation timestamp.
 func (s *Store) UpdateRole(role *rbacv1.Role) (*rbacv1.Role, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: role.Namespace, Name: role.Name}
-	existing, ok := s.roles[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("role %q not found in namespace %q", role.Name, role.Namespace)
-	}
-	role.UID = existing.UID
-	if role.CreationTimestamp.IsZero() {
-		role.CreationTimestamp = existing.CreationTimestamp
-	}
-	role.ResourceVersion = s.incRV()
-	s.roles[key] = role
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *rbacv1.Role
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: role.Namespace, Name: role.Name}
+		existing, ok := s.roles[key]
+		if !ok {
+			return false, fmt.Errorf("role %q not found in namespace %q", role.Name, role.Namespace)
+		}
+		role.UID = existing.UID
+		if role.CreationTimestamp.IsZero() {
+			role.CreationTimestamp = existing.CreationTimestamp
+		}
+		role.ResourceVersion = s.incRV()
+		s.roles[key] = role
+		out = role.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return role.DeepCopy(), nil
+	return out, nil
 }
 
 // --- RoleBindings ---
@@ -3110,26 +3233,28 @@ func (s *Store) RoleBindings(ns string) []*rbacv1.RoleBinding {
 
 // CreateRoleBinding creates a RoleBinding.
 func (s *Store) CreateRoleBinding(rb *rbacv1.RoleBinding) (*rbacv1.RoleBinding, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}
-	if _, ok := s.roleBindings[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("rolebinding %q already exists in namespace %q", rb.Name, rb.Namespace)
-	}
-	rb.ResourceVersion = s.incRV()
-	rb.UID = types.UID(fmt.Sprintf("q8s-rb-%s-%s", rb.Namespace, rb.Name))
-	if rb.Labels == nil {
-		rb.Labels = make(map[string]string)
-	}
-	if rb.CreationTimestamp.IsZero() {
-		rb.CreationTimestamp = metav1.Now()
-	}
-	s.roleBindings[key] = rb
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *rbacv1.RoleBinding
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}
+		if _, ok := s.roleBindings[key]; ok {
+			return false, fmt.Errorf("rolebinding %q already exists in namespace %q", rb.Name, rb.Namespace)
+		}
+		rb.ResourceVersion = s.incRV()
+		rb.UID = types.UID(fmt.Sprintf("q8s-rb-%s-%s", rb.Namespace, rb.Name))
+		if rb.Labels == nil {
+			rb.Labels = make(map[string]string)
+		}
+		if rb.CreationTimestamp.IsZero() {
+			rb.CreationTimestamp = metav1.Now()
+		}
+		s.roleBindings[key] = rb
+		out = rb.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return rb.DeepCopy(), nil
+	return out, nil
 }
 
 // GetRoleBinding gets a RoleBinding.
@@ -3145,42 +3270,40 @@ func (s *Store) GetRoleBinding(ns, name string) (*rbacv1.RoleBinding, error) {
 
 // DeleteRoleBinding deletes a RoleBinding.
 func (s *Store) DeleteRoleBinding(ns, name string) error {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: ns, Name: name}
-	if _, ok := s.roleBindings[key]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("rolebinding %q not found in namespace %q", name, ns)
-	}
-	delete(s.roleBindings, key)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: ns, Name: name}
+		if _, ok := s.roleBindings[key]; !ok {
+			return false, fmt.Errorf("rolebinding %q not found in namespace %q", name, ns)
+		}
+		delete(s.roleBindings, key)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateRoleBinding replaces a RoleBinding in-place, preserving UID and creation timestamp.
 func (s *Store) UpdateRoleBinding(rb *rbacv1.RoleBinding) (*rbacv1.RoleBinding, error) {
-	s.mu.Lock()
-	key := types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}
-	existing, ok := s.roleBindings[key]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("rolebinding %q not found in namespace %q", rb.Name, rb.Namespace)
-	}
-	rb.UID = existing.UID
-	if rb.CreationTimestamp.IsZero() {
-		rb.CreationTimestamp = existing.CreationTimestamp
-	}
-	rb.ResourceVersion = s.incRV()
-	s.roleBindings[key] = rb
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *rbacv1.RoleBinding
+	err := s.mutate(func() (bool, error) {
+		key := types.NamespacedName{Namespace: rb.Namespace, Name: rb.Name}
+		existing, ok := s.roleBindings[key]
+		if !ok {
+			return false, fmt.Errorf("rolebinding %q not found in namespace %q", rb.Name, rb.Namespace)
+		}
+		rb.UID = existing.UID
+		if rb.CreationTimestamp.IsZero() {
+			rb.CreationTimestamp = existing.CreationTimestamp
+		}
+		rb.ResourceVersion = s.incRV()
+		s.roleBindings[key] = rb
+		out = rb.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return rb.DeepCopy(), nil
+	return out, nil
 }
 
 // --- ClusterRoles ---
@@ -3198,25 +3321,27 @@ func (s *Store) AllClusterRoles() []*rbacv1.ClusterRole {
 
 // CreateClusterRole creates a ClusterRole.
 func (s *Store) CreateClusterRole(cr *rbacv1.ClusterRole) (*rbacv1.ClusterRole, error) {
-	s.mu.Lock()
-	if _, ok := s.clusterRoles[cr.Name]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("clusterrole %q already exists", cr.Name)
-	}
-	cr.ResourceVersion = s.incRV()
-	cr.UID = types.UID(fmt.Sprintf("q8s-cr-%s", cr.Name))
-	if cr.Labels == nil {
-		cr.Labels = make(map[string]string)
-	}
-	if cr.CreationTimestamp.IsZero() {
-		cr.CreationTimestamp = metav1.Now()
-	}
-	s.clusterRoles[cr.Name] = cr
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *rbacv1.ClusterRole
+	err := s.mutate(func() (bool, error) {
+		if _, ok := s.clusterRoles[cr.Name]; ok {
+			return false, fmt.Errorf("clusterrole %q already exists", cr.Name)
+		}
+		cr.ResourceVersion = s.incRV()
+		cr.UID = types.UID(fmt.Sprintf("q8s-cr-%s", cr.Name))
+		if cr.Labels == nil {
+			cr.Labels = make(map[string]string)
+		}
+		if cr.CreationTimestamp.IsZero() {
+			cr.CreationTimestamp = metav1.Now()
+		}
+		s.clusterRoles[cr.Name] = cr
+		out = cr.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return cr.DeepCopy(), nil
+	return out, nil
 }
 
 // GetClusterRole gets a ClusterRole.
@@ -3232,40 +3357,38 @@ func (s *Store) GetClusterRole(name string) (*rbacv1.ClusterRole, error) {
 
 // DeleteClusterRole deletes a ClusterRole.
 func (s *Store) DeleteClusterRole(name string) error {
-	s.mu.Lock()
-	if _, ok := s.clusterRoles[name]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("clusterrole %q not found", name)
-	}
-	delete(s.clusterRoles, name)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		if _, ok := s.clusterRoles[name]; !ok {
+			return false, fmt.Errorf("clusterrole %q not found", name)
+		}
+		delete(s.clusterRoles, name)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateClusterRole replaces a ClusterRole in-place, preserving UID and creation timestamp.
 func (s *Store) UpdateClusterRole(cr *rbacv1.ClusterRole) (*rbacv1.ClusterRole, error) {
-	s.mu.Lock()
-	existing, ok := s.clusterRoles[cr.Name]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("clusterrole %q not found", cr.Name)
-	}
-	cr.UID = existing.UID
-	if cr.CreationTimestamp.IsZero() {
-		cr.CreationTimestamp = existing.CreationTimestamp
-	}
-	cr.ResourceVersion = s.incRV()
-	s.clusterRoles[cr.Name] = cr
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *rbacv1.ClusterRole
+	err := s.mutate(func() (bool, error) {
+		existing, ok := s.clusterRoles[cr.Name]
+		if !ok {
+			return false, fmt.Errorf("clusterrole %q not found", cr.Name)
+		}
+		cr.UID = existing.UID
+		if cr.CreationTimestamp.IsZero() {
+			cr.CreationTimestamp = existing.CreationTimestamp
+		}
+		cr.ResourceVersion = s.incRV()
+		s.clusterRoles[cr.Name] = cr
+		out = cr.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return cr.DeepCopy(), nil
+	return out, nil
 }
 
 // --- ClusterRoleBindings ---
@@ -3283,25 +3406,27 @@ func (s *Store) AllClusterRoleBindings() []*rbacv1.ClusterRoleBinding {
 
 // CreateClusterRoleBinding creates a ClusterRoleBinding.
 func (s *Store) CreateClusterRoleBinding(crb *rbacv1.ClusterRoleBinding) (*rbacv1.ClusterRoleBinding, error) {
-	s.mu.Lock()
-	if _, ok := s.clusterRoleBindings[crb.Name]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("clusterrolebinding %q already exists", crb.Name)
-	}
-	crb.ResourceVersion = s.incRV()
-	crb.UID = types.UID(fmt.Sprintf("q8s-crb-%s", crb.Name))
-	if crb.Labels == nil {
-		crb.Labels = make(map[string]string)
-	}
-	if crb.CreationTimestamp.IsZero() {
-		crb.CreationTimestamp = metav1.Now()
-	}
-	s.clusterRoleBindings[crb.Name] = crb
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *rbacv1.ClusterRoleBinding
+	err := s.mutate(func() (bool, error) {
+		if _, ok := s.clusterRoleBindings[crb.Name]; ok {
+			return false, fmt.Errorf("clusterrolebinding %q already exists", crb.Name)
+		}
+		crb.ResourceVersion = s.incRV()
+		crb.UID = types.UID(fmt.Sprintf("q8s-crb-%s", crb.Name))
+		if crb.Labels == nil {
+			crb.Labels = make(map[string]string)
+		}
+		if crb.CreationTimestamp.IsZero() {
+			crb.CreationTimestamp = metav1.Now()
+		}
+		s.clusterRoleBindings[crb.Name] = crb
+		out = crb.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return crb.DeepCopy(), nil
+	return out, nil
 }
 
 // GetClusterRoleBinding gets a ClusterRoleBinding.
@@ -3317,40 +3442,38 @@ func (s *Store) GetClusterRoleBinding(name string) (*rbacv1.ClusterRoleBinding, 
 
 // DeleteClusterRoleBinding deletes a ClusterRoleBinding.
 func (s *Store) DeleteClusterRoleBinding(name string) error {
-	s.mu.Lock()
-	if _, ok := s.clusterRoleBindings[name]; !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("clusterrolebinding %q not found", name)
-	}
-	delete(s.clusterRoleBindings, name)
-	// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
-	s.incRV()
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
-		return err
-	}
-	return nil
+	return s.mutate(func() (bool, error) {
+		if _, ok := s.clusterRoleBindings[name]; !ok {
+			return false, fmt.Errorf("clusterrolebinding %q not found", name)
+		}
+		delete(s.clusterRoleBindings, name)
+		// A delete is a write: it gets its own resourceVersion, as in Kubernetes.
+		s.incRV()
+		return true, nil
+	})
 }
 
 // UpdateClusterRoleBinding replaces a ClusterRoleBinding in-place, preserving UID and creation timestamp.
 func (s *Store) UpdateClusterRoleBinding(crb *rbacv1.ClusterRoleBinding) (*rbacv1.ClusterRoleBinding, error) {
-	s.mu.Lock()
-	existing, ok := s.clusterRoleBindings[crb.Name]
-	if !ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("clusterrolebinding %q not found", crb.Name)
-	}
-	crb.UID = existing.UID
-	if crb.CreationTimestamp.IsZero() {
-		crb.CreationTimestamp = existing.CreationTimestamp
-	}
-	crb.ResourceVersion = s.incRV()
-	s.clusterRoleBindings[crb.Name] = crb
-	s.mu.Unlock()
-	if err := s.persist(); err != nil {
+	var out *rbacv1.ClusterRoleBinding
+	err := s.mutate(func() (bool, error) {
+		existing, ok := s.clusterRoleBindings[crb.Name]
+		if !ok {
+			return false, fmt.Errorf("clusterrolebinding %q not found", crb.Name)
+		}
+		crb.UID = existing.UID
+		if crb.CreationTimestamp.IsZero() {
+			crb.CreationTimestamp = existing.CreationTimestamp
+		}
+		crb.ResourceVersion = s.incRV()
+		s.clusterRoleBindings[crb.Name] = crb
+		out = crb.DeepCopy()
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return crb.DeepCopy(), nil
+	return out, nil
 }
 
 // ResourceVersion returns the current resource version string.
