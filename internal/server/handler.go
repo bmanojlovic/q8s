@@ -974,6 +974,10 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 				"hostPort %d collides with nodePort of Service %s", port, svc)
 			return
 		}
+		if err := s.podHostPortConflict(&pod); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+			return
+		}
 		if pod.Labels == nil {
 			pod.Labels = make(map[string]string)
 		}
@@ -1056,6 +1060,10 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := validatePodAnnotations("pod", &patched.Spec, patched.Labels, patched.Annotations, 0); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := s.podHostPortConflict(&patched); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
 			return
 		}
 		if s.rejectHostAccess(w, r, "Pod", patched.Name, quadlet.HostAccessReasons(patched.Spec, patched.Annotations)) {
@@ -1376,6 +1384,11 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 				"nodePort %d collides with hostPort of Pod %s", port, pod)
 			return
 		}
+		if err := s.serviceHostPortConflict(created); err != nil {
+			s.config.Store.DeleteService(ns, created.Name)
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+			return
+		}
 		if err := s.reconcileNodePort(created); err != nil {
 			s.config.Store.DeleteService(ns, created.Name)
 			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
@@ -1456,6 +1469,15 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
 			s.respondStatus(w, http.StatusConflict, "Conflict",
 				"nodePort %d collides with hostPort of Pod %s", port, pod)
+			return
+		}
+		if err := s.serviceHostPortConflict(updated); err != nil {
+			// The patched object was stored above, before allocation. Put the
+			// previous Service back so a refused conflict does not persist.
+			if _, restoreErr := s.config.Store.UpdateService(svc); restoreErr != nil {
+				fmt.Printf("restore service %s/%s after conflict: %v\n", ns, name, restoreErr)
+			}
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
 			return
 		}
 		if err := s.reconcileNodePort(updated); err != nil {
@@ -2305,6 +2327,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if err := s.deploymentHostPortConflict(&dep); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+			return
+		}
 		if s.rejectHostAccess(w, r, "Deployment", dep.Name, quadlet.HostAccessReasons(dep.Spec.Template.Spec, dep.Spec.Template.Annotations)) {
 			return
 		}
@@ -2349,6 +2375,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		if err := validatePodAnnotations("deployment spec.template", &dep.Spec.Template.Spec, dep.Spec.Template.Labels, dep.Spec.Template.Annotations, deploymentReplicas(&dep)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := s.deploymentHostPortConflict(&dep); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
 			return
 		}
 		if s.rejectHostAccess(w, r, "Deployment", dep.Name, quadlet.HostAccessReasons(dep.Spec.Template.Spec, dep.Spec.Template.Annotations)) {
@@ -2439,6 +2469,10 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		if err := validatePodAnnotations("deployment spec.template", &patched.Spec.Template.Spec, patched.Spec.Template.Labels, patched.Spec.Template.Annotations, deploymentReplicas(&patched)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := s.deploymentHostPortConflict(&patched); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
 			return
 		}
 		if s.rejectHostAccess(w, r, "Deployment", patched.Name, quadlet.HostAccessReasons(patched.Spec.Template.Spec, patched.Spec.Template.Annotations)) {
@@ -2541,6 +2575,10 @@ func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, n
 		}
 		if err := validatePodAnnotations("deployment", &dep.Spec.Template.Spec, dep.Spec.Template.Labels, dep.Spec.Template.Annotations, deploymentReplicas(dep)); err != nil {
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := s.deploymentHostPortConflict(dep); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
 			return
 		}
 		updated, err := s.config.Store.UpdateDeployment(dep)
@@ -5883,8 +5921,12 @@ func (s *Server) regenerateIngressConfigs(ns string) {
 // with one Success Status. Errors on individual objects are logged and
 // skipped — a collection delete is best-effort like real k8s.
 func (s *Server) deleteCollection(w http.ResponseWriter, listFn func() []string, delFn func(name string) error) {
+	names := listFn()
+	// The store hands objects back in map order. Deleting in name order keeps
+	// cleanup (and the tests observing it) reproducible.
+	sort.Strings(names)
 	deleted := 0
-	for _, n := range listFn() {
+	for _, n := range names {
 		if err := delFn(n); err != nil {
 			fmt.Printf("deletecollection %s: %v\n", n, err)
 			continue

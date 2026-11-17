@@ -313,6 +313,13 @@ systemd then owns the sockets and passes them to Traefik, so Traefik needs no
 `hostPort` for those entrypoints. The entrypoints must still be named the
 same way in Traefik's static configuration.
 
+A socket port is exclusive on the host. q8s refuses (`409 Conflict`) a Pod,
+Deployment or Service whose socket port, `hostPort` or `nodePort` overlaps
+another object's socket port. Two claims overlap when they use the same port
+and protocol and either one listens on all addresses or both use the same
+address. The annotation is not limited to Traefik: any single-container pod or
+Deployment template with at most one replica can use it.
+
 ## Terraform
 
 `kubernetes_manifest` can create both kinds. The read-only CRD API serves
