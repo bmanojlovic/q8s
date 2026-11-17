@@ -1095,34 +1095,28 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 					}
 					return names
 				},
-				func(n string) error { return s.deletePodByNameForAPI(ns, n) })
+				func(n string) error { _, err := s.deletePodByNameForAPI(ns, n); return err })
 			return
 		}
+		// Like Kubernetes, a pod DELETE answers with the deleted Pod (its uid
+		// and a deletionTimestamp). kubectl waits for that uid to disappear;
+		// with a bare Status it would look the name up again and wait for a
+		// recreated Deployment replica with a new uid forever.
 		if dry {
-			if _, err := s.config.Store.GetPod(ns, name); err != nil {
+			pod, err := s.config.Store.GetPod(ns, name)
+			if err != nil {
 				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 				return
 			}
-			encode(w, &metav1.Status{
-				TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
-				Status:   "Success",
-				Message:  name,
-				Reason:   metav1.StatusReason(name),
-				Code:     http.StatusOK,
-			}, http.StatusOK)
+			encode(w, deletedPodResponse(pod), http.StatusOK)
 			return
 		}
-		if err := s.deletePodByNameForAPI(ns, name); err != nil {
+		pod, err := s.deletePodByNameForAPI(ns, name)
+		if err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
-		encode(w, &metav1.Status{
-			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
-			Status:   "Success",
-			Message:  name,
-			Reason:   metav1.StatusReason(name),
-			Code:     http.StatusOK,
-		}, http.StatusOK)
+		encode(w, deletedPodResponse(pod), http.StatusOK)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -5927,16 +5921,28 @@ func (s *Server) deletePodByName(ns, name string) error {
 // request: q8s has no ReplicaSet controller that would bring it back. Internal
 // deletes (Deployment delete, scale-down, namespace delete, rollout) keep
 // using deletePodByName and never recreate anything.
-func (s *Server) deletePodByNameForAPI(ns, name string) error {
+func (s *Server) deletePodByNameForAPI(ns, name string) (*corev1.Pod, error) {
 	pod, err := s.config.Store.GetPod(ns, name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.deletePodByName(ns, name); err != nil {
-		return err
+		return nil, err
 	}
 	s.recreateDeploymentReplica(pod)
-	return nil
+	return pod, nil
+}
+
+// deletedPodResponse is the body of a pod DELETE: a copy of the deleted pod
+// with deletionTimestamp set, as the Kubernetes API server returns it.
+func deletedPodResponse(pod *corev1.Pod) *corev1.Pod {
+	out := pod.DeepCopy()
+	out.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
+	if out.DeletionTimestamp == nil {
+		now := metav1.Now()
+		out.DeletionTimestamp = &now
+	}
+	return out
 }
 
 // recreateDeploymentReplica replaces a Deployment replica pod deleted through

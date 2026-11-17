@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,6 +73,16 @@ func TestAPIDeleteDeploymentReplicaRecreatesItWithFreshEmptyDir(t *testing.T) {
 	}
 	if recreated.UID == oldReplica.UID {
 		t.Fatalf("recreated replica kept the old UID %q", oldReplica.UID)
+	}
+	// tic-e589: the DELETE body is the deleted Pod with the OLD uid, so
+	// kubectl waits for that uid and not for the recreated replica.
+	var body corev1.Pod
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode delete body: %v (%s)", err, rec.Body.String())
+	}
+	if body.Kind != "Pod" || body.UID != oldReplica.UID || body.DeletionTimestamp == nil {
+		t.Fatalf("delete body = kind %q uid %q deletionTimestamp %v, want the deleted Pod with uid %q",
+			body.Kind, body.UID, body.DeletionTimestamp, oldReplica.UID)
 	}
 	if !hasCall(starts, "default-web-0.service") {
 		t.Errorf("recreated replica was not started, starts %v", starts)
