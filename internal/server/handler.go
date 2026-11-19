@@ -57,9 +57,17 @@ func encoder() *jsonser.Serializer {
 
 // podmanCommand runs one podman invocation and returns its stdout. Tests
 // replace it to record the calls (and to fake listings) without reaching a
-// real podman.
+// real podman. A failed call carries podman's stderr in the error, so callers
+// can tell an already-absent object ("network not found") from a real failure.
 var podmanCommand = func(ctx context.Context, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, "podman", args...).Output()
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+			return out, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+		}
+	}
+	return out, err
 }
 
 // readBody reads the request body, mapping MaxBytesReader overflow to a
@@ -5234,7 +5242,29 @@ func (s *Server) removeNamespaceNetwork(ns string) {
 	if s.config.QuadletDir == "" {
 		return
 	}
+	// Stop the generated unit before its file disappears. Quadlet's oneshot
+	// service keeps the podman network alive through RemainAfterExit, and a
+	// failed unit would otherwise stay loaded as "not-found active exited".
+	s.stopUnit(fmt.Sprintf("q8s-%s-network.service", ns))
 	s.reloadAfterRemove(fmt.Sprintf("%s/q8s-%s.network", s.config.QuadletDir, ns))
+	// Podman refuses to remove a network that still has containers joined.
+	// The attach-all pods were disconnected before this call; a container
+	// that is still attached makes the rm fail, which is logged and left for
+	// `q8s doctor` to report. --force would kill those containers instead.
+	name := fmt.Sprintf("q8s-%s", ns)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, err := podmanCommand(ctx, "network", "rm", name)
+	cancel()
+	if err != nil && !podmanNetworkNotFound(err) {
+		fmt.Printf("remove network %s: %v\n", name, err)
+	}
+}
+
+// podmanNetworkNotFound reports whether podman's error says the network is
+// already gone. Removing an absent network is the desired end state.
+func podmanNetworkNotFound(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "network not found") || strings.Contains(msg, "no such network")
 }
 
 // serviceNodePortConflict checks whether one of a NodePort Service's

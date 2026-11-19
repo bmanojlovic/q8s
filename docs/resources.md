@@ -7,7 +7,7 @@ Pods and Deployments accept one or more containers; multiple containers run as o
 | Resource | kubectl verbs | Notes |
 |---|---|---|
 | `nodes` | get, list | Synthetic single node with real machine stats |
-| `namespaces` | get, list, create, patch, delete | Creates a `q8s-{ns}.network` Podman network; patch updates labels and annotations |
+| `namespaces` | get, list, create, patch, delete | Creates a `q8s-{ns}.network` Podman network; delete stops `q8s-{ns}-network.service`, removes the `.network` Quadlet and runs `podman network rm q8s-{ns}`; patch updates labels and annotations |
 | `pods` | get, list, create, patch, delete | Writes a `.container` Quadlet, or `.container` units plus a `.pod` unit for a multi-container pod; patch rewrites and restarts; also lists derived CronJob runs |
 | `services` | get, list, create, patch, delete | Selector + port map: DNS aliases (NetworkAlias) and ingress backend resolution; never binds a host port |
 | `persistentvolumeclaims` | get, list, create, patch, delete | Named Podman volume; storageClass selects mount mode |
@@ -246,6 +246,7 @@ IngressRouteTCP objects.
 - **CrashLoopBackOff**: detected from restart count + non-zero exit, shown in pod status
 - **StartLimitBurst=5**: systemd gives up after 5 failures within 60s
 - **Delete cascade**: deployment delete removes owned pods, stops units, removes quadlets
+- **Namespace delete**: stops `q8s-{ns}-network.service`, removes the `q8s-{ns}.network` Quadlet and runs `podman network rm q8s-{ns}`. The `rm` has no `--force`, so a container still joined to the network makes it fail and leaves the network for `q8s doctor` to report
 - **Deployment restore**: on restart, deployment recreated from container labels if missing
 - **command and args**: `command` replaces the image ENTRYPOINT (`Entrypoint=`) and `args` replaces CMD (`Exec=`), as in Kubernetes
 - **Pod labels**: keys under `io.kubernetes.`, `io.podman.`, `io.containers.`, `PODMAN_` or `q8s.io/`, and `app.kubernetes.io/managed-by`, are rejected with 422

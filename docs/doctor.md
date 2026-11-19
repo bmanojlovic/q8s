@@ -6,6 +6,7 @@ the operator: what does this machine give my workloads, and what does it not?
 The command never writes a file, starts a container, runs `podman run`, or
 changes a setting. The only external commands it runs are `podman version`,
 `podman info`, `podman volume ls` (for the orphaned volumes check),
+`podman network ls` (for the orphaned networks check),
 `systemctl` (rootful only, for firewalld state), and (rootless only)
 `loginctl` through `install.LingerEnabled`. Everything else is a read of an
 existing file or a `statfs` call. The orphaned volumes check reads
@@ -243,6 +244,34 @@ and says `skipped: <reason>`. The podman call goes through the same Env
 command runner as the other checks, so the check is unit-tested without a
 real podman.
 
+### `networks`
+
+Reports Podman networks that carry the label
+`app.kubernetes.io/managed-by=q8s` but no longer belong to a stored
+namespace. It never deletes anything; the `fix:` lines are the
+`podman network rm <name>` commands an administrator can run.
+
+The check runs `podman network ls --filter
+label=app.kubernetes.io/managed-by=q8s --format json`, falling back to
+`--format {{.Name}}` when JSON is unavailable, so a network q8s does not own
+is never reported. It reads `<data dir>/store.json` read-only and treats
+`q8s-<namespace>` as expected for every stored namespace. Any other labeled
+network, for example `q8s-gone` after its namespace was deleted, is an
+orphan.
+
+A stale network keeps its subnet, and a namespace created later with the same
+name silently reuses it. The fix prints `podman network rm <name>` for each
+orphan and, for a `q8s-<namespace>` network, the commands that clear its
+leftover unit. Rootless uses
+`systemctl --user stop q8s-<namespace>-network.service` and
+`systemctl --user reset-failed q8s-<namespace>-network.service`; rootful uses
+the same commands without `--user`.
+
+When the store cannot be read, the check is informational and says
+`skipped: <reason>`. When podman is unavailable, it is also informational
+(`skipped: podman network ls: <reason>`). Otherwise no orphan is ok and at
+least one orphan is a warn.
+
 ## Summary
 
 The five summary lines are always present and are derived from the checks:
@@ -263,4 +292,4 @@ in scripts:
 
 `podman`, `kernel`, `userns`, `idmap`, `linger` (rootless only), `cgroups`,
 `network`, `firewall-reload` (rootful only), `certificates`, `traefik-dir`,
-`disk`, `volumes`.
+`disk`, `volumes`, `networks`.

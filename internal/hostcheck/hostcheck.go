@@ -1,8 +1,8 @@
 // Package hostcheck inspects what the local host gives q8s workloads and
 // reports it in plain words. The checks are read-only: every host access goes
 // through Env, and the only external commands they may run are podman version,
-// podman info, systemctl (rootful, for firewalld state) and (rootless) loginctl
-// via install.LingerEnabled.
+// podman info, podman volume ls, podman network ls, systemctl (rootful, for
+// firewalld state) and (rootless) loginctl via install.LingerEnabled.
 //
 // The one writer is EnsureContainersRange, which appends the subordinate id
 // range podman's --userns=auto needs. Rootful `q8s serve` calls it before
@@ -174,6 +174,7 @@ func Run(env Env) Report {
 	r.Checks = append(r.Checks, checkTraefikDir(env))
 	r.Checks = append(r.Checks, checkDiskSpace(env))
 	r.Checks = append(r.Checks, checkOrphanedVolumes(env))
+	r.Checks = append(r.Checks, checkNetworks(env))
 
 	r.Summary = buildSummary(env, r.Checks, certInfo)
 	if r.Summary == nil {
@@ -816,7 +817,11 @@ func checkDiskSpace(env Env) Check {
 }
 
 // managedByVolumeLabel is the label q8s writes on a PVC's .volume quadlet.
+// The .network quadlet carries the same label.
 const managedByVolumeLabel = "app.kubernetes.io/managed-by"
+
+// managedByNetworkFilter is the podman label filter for networks q8s owns.
+const managedByNetworkFilter = "label=" + managedByVolumeLabel + "=q8s"
 
 // podmanVolume is the subset of `podman volume ls --format json` the
 // orphaned volumes check needs.
@@ -895,6 +900,121 @@ func checkOrphanedVolumes(env Env) Check {
 	c.Status = StatusWarn
 	c.Detail = fmt.Sprintf("%d volume(s) no stored object uses: %s", len(found), strings.Join(found, ", "))
 	c.Loss = "these volumes still take disk space and nothing references them"
+	c.Fix = strings.Join(fix, "\n")
+	return c
+}
+
+// podmanNetwork is the subset of `podman network ls --format json` the
+// orphaned networks check needs when the JSON form is available.
+type podmanNetwork struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+}
+
+// parsePodmanNetworkNames accepts both `--format {{.Name}}` output and the
+// `--format json` shape, so the check is independent of the format the Env
+// command runner fakes.
+func parsePodmanNetworkNames(out []byte) []string {
+	trimmed := strings.TrimSpace(string(out))
+	if strings.HasPrefix(trimmed, "[") {
+		var networks []podmanNetwork
+		if err := json.Unmarshal(out, &networks); err == nil {
+			names := make([]string, 0, len(networks))
+			for _, network := range networks {
+				if network.Name == "" {
+					continue
+				}
+				// The command already filters on the label. Keep the check honest
+				// if a fake or a future podman drops the filter from its output.
+				if network.Labels != nil && network.Labels[managedByVolumeLabel] != "q8s" {
+					continue
+				}
+				names = append(names, network.Name)
+			}
+			return names
+		}
+	}
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// checkNetworks lists q8s-labeled Podman networks that no stored namespace
+// expects anymore. It is report only: it never removes a network, it prints
+// the `podman network rm` command an administrator can run. The label filter
+// keeps every network q8s does not own out of the report.
+func checkNetworks(env Env) Check {
+	c := Check{ID: "networks", Title: "podman networks"}
+	if env.Dirs.Data == "" {
+		c.Status = StatusInfo
+		c.Detail = "skipped: no data directory"
+		return c
+	}
+	storeFile := filepath.Join(env.Dirs.Data, "store.json")
+	data, err := env.readFile(storeFile)
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + storeFile + ": " + err.Error()
+		return c
+	}
+	st, err := store.LoadReadOnly(data)
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + storeFile + ": " + err.Error()
+		return c
+	}
+
+	// q8s creates exactly one network per namespace, q8s-<namespace>.
+	expected := make(map[string]bool)
+	for _, ns := range st.Namespaces() {
+		expected["q8s-"+ns.Name] = true
+	}
+
+	out, err := env.command("podman", "network", "ls", "--filter", managedByNetworkFilter, "--format", "json")
+	if err != nil {
+		// Some podman versions or a faked Env may only implement the name
+		// form. Both carry the same filtered list.
+		out, err = env.command("podman", "network", "ls", "--filter", managedByNetworkFilter, "--format", "{{.Name}}")
+	}
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: podman network ls: " + err.Error()
+		return c
+	}
+	names := parsePodmanNetworkNames(out)
+	sort.Strings(names)
+
+	var found, fix []string
+	for _, name := range names {
+		if expected[name] {
+			continue
+		}
+		found = append(found, name+" (no stored namespace uses it)")
+		fix = append(fix, "podman network rm "+name)
+		if strings.HasPrefix(name, "q8s-") {
+			unit := name + "-network.service"
+			if env.Rootful {
+				fix = append(fix, "systemctl stop "+unit+" && systemctl reset-failed "+unit)
+			} else {
+				fix = append(fix, "systemctl --user stop "+unit+" && systemctl --user reset-failed "+unit)
+			}
+		}
+	}
+
+	if len(found) == 0 {
+		c.Status = StatusOK
+		c.Detail = "no orphaned networks"
+		c.Gain = "no leftover podman network takes a subnet or hides a namespace's stale network"
+		return c
+	}
+	c.Status = StatusWarn
+	c.Detail = fmt.Sprintf("%d network(s) no stored namespace uses: %s", len(found), strings.Join(found, ", "))
+	c.Loss = "a stale network keeps its subnet, and a namespace created later with the same name silently reuses it"
 	c.Fix = strings.Join(fix, "\n")
 	return c
 }
