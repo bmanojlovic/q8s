@@ -155,11 +155,16 @@ claim colliding with a volume some unrelated non-q8s deployment created —
 never share one backing volume, and `podman volume ls` shows which
 namespace/claim owns each volume.
 
-Deleting a PVC removes its `.volume` quadlet file but keeps the Podman
-volume `{namespace}-{name}` and the data in it: q8s never deletes PVC
-data automatically. Remove it manually when the data is no longer needed:
-`podman volume rm {namespace}-{name}`. `q8s doctor` lists such a leftover as
-`data of deleted PVC`.
+Deleting a PVC (or its namespace) stops the generated volume unit and
+removes its `.volume` quadlet file, but keeps the Podman volume
+`{namespace}-{name}` and the data in it: q8s never deletes PVC data
+automatically. A namespace delete stops the namespace's workloads first; a
+single PVC delete leaves the volume unit running while a stored Pod,
+Deployment, Job or CronJob still mounts the claim, because the container
+unit depends on the volume unit. Remove the leftover volume manually when
+its data is no longer needed: `podman volume rm {namespace}-{name}`. `q8s
+doctor` lists such a leftover as `data of deleted PVC` and prints that
+command.
 
 The `hostpath` class requires a `q8s.io/host-path` annotation on the PVC specifying the absolute host directory. It also honours an optional `q8s.io/selinux-label` annotation: `private` (the default, `:Z`) relabels the host directory for one container, while `shared` (`:z`) lets several containers mount it without locking each other out. Any other value is rejected.
 
@@ -252,7 +257,7 @@ IngressRouteTCP objects.
 - **CrashLoopBackOff**: detected from restart count + non-zero exit, shown in pod status
 - **StartLimitBurst=5**: systemd gives up after 5 failures within 60s
 - **Delete cascade**: deployment delete removes owned pods, stops units, removes quadlets
-- **Namespace delete**: stops `q8s-{ns}-network.service`, removes the `q8s-{ns}.network` Quadlet and runs `podman network rm q8s-{ns}`. The `rm` has no `--force`, so a container still joined to the network makes it fail and leaves the network for `q8s doctor` to report
+- **Namespace delete**: stops the namespace's workload units, then stops its `{namespace}-{pvc}-volume.service` units, removes the `.volume` Quadlets and keeps the Podman volumes for `q8s doctor` to report; also stops `q8s-{ns}-network.service`, removes the `q8s-{ns}.network` Quadlet and runs `podman network rm q8s-{ns}`. The `rm` has no `--force`, so a container still joined to the network makes it fail and leaves the network for `q8s doctor` to report
 - **Deployment restore**: on restart, deployment recreated from container labels if missing
 - **command and args**: `command` replaces the image ENTRYPOINT (`Entrypoint=`) and `args` replaces CMD (`Exec=`), as in Kubernetes
 - **Pod labels**: keys under `io.kubernetes.`, `io.podman.`, `io.containers.`, `PODMAN_` or `q8s.io/`, and `app.kubernetes.io/managed-by`, are rejected with 422
