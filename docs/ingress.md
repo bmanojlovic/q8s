@@ -231,6 +231,13 @@ outside the q8s podman networks. q8s writes exactly one server URL,
 `<scheme>://<externalName>:<port>`, and Traefik performs the DNS lookup and
 dials the host itself. No controller and no DNS records are involved.
 
+Creating an ExternalName Service, or changing a Service to that type, is
+administrator-only. Traefik is attached to every namespace network, so an
+external name could otherwise resolve to another namespace's internal
+address. Reading, listing and deleting these Services stay governed by RBAC,
+and an ordinary user may still change an ExternalName Service to another
+type.
+
 ```yaml
 apiVersion: v1
 kind: Service

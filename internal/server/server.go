@@ -188,9 +188,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "invalid API path %q", r.URL.Path)
 		return
 	}
-	if _, dry := r.URL.Query()["dryRun"]; dry && r.Method != http.MethodGet && !isPodWritePath(r.URL.Path) {
-		// Only pods honor dryRun. Refusing it elsewhere is safer than the
-		// alternative of running the write for real.
+	if _, dry := r.URL.Query()["dryRun"]; dry && r.Method != http.MethodGet && !isPodWritePath(r.URL.Path) && !isServiceWritePath(r.URL.Path) {
+		// Only pods and services honor dryRun. Refusing it elsewhere is safer
+		// than the alternative of running the write for real.
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "dryRun is only supported for pods")
 		return
 	}
@@ -302,6 +302,16 @@ func isPodWritePath(path string) bool {
 		return false
 	}
 	return parts[0] == "api" && parts[1] == "v1" && parts[2] == "namespaces" && parts[4] == "pods"
+}
+
+// isServiceWritePath reports whether path addresses the core Service
+// collection or one Service, where the handlers implement dryRun.
+func isServiceWritePath(path string) bool {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 5 && len(parts) != 6 {
+		return false
+	}
+	return parts[0] == "api" && parts[1] == "v1" && parts[2] == "namespaces" && parts[4] == "services"
 }
 
 func (s *Server) setupRoutes() {

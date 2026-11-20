@@ -34,6 +34,17 @@ func pvcHostAccessReasons(pvc *corev1.PersistentVolumeClaim) []string {
 	return reasons
 }
 
+// serviceHostAccessReasons lists the fields that make a Service a host
+// access object. An ExternalName Service makes Traefik resolve a name outside
+// the pod network, and that name can resolve to an address inside another
+// namespace's network, so only an administrator may create or keep one.
+func serviceHostAccessReasons(svc *corev1.Service) []string {
+	if svc == nil || svc.Spec.Type != corev1.ServiceTypeExternalName {
+		return nil
+	}
+	return []string{"spec.type: ExternalName"}
+}
+
 // rejectHostAccess answers 403 Forbidden and reports true when a non-admin
 // caller submits an object that uses host access. Authentication being
 // disabled (no CA) means every caller is treated as an administrator, as the

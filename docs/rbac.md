@@ -73,8 +73,9 @@ well, because it reviews another user's access.
 
 Host access is administrator-only, independent of the RBAC verbs a user
 holds. A non-administrator who creates, updates or patches a Pod, Deployment,
-Job, CronJob or PersistentVolumeClaim that uses any of these fields gets 403
-Forbidden, even when the change itself leaves the host-access field untouched.
+Job, CronJob, PersistentVolumeClaim or Service that uses any of these fields
+gets 403 Forbidden, even when the change itself leaves the host-access field
+untouched.
 Scaling is not a host-access change: a non-administrator with `patch` or
 `update` on `deployments/scale` may scale a Deployment whose pod template has
 host access, including to zero, because only `spec.replicas` changes. Deletes
@@ -91,11 +92,18 @@ remain governed by RBAC.
   or, on such a claim, the `q8s.io/host-path` annotation
 - the `q8s.io/attach-all-networks: "true"` annotation on a Pod or on a pod
   template
+- a Service with `spec.type: ExternalName`
 
-These fields either disable the rootful user namespace, join a host namespace
-or join every namespace network, so they are equivalent to root on the host: a
-q8s administrator is trusted like root on the machine (or the owner of the
-account, rootless).
+Most of these fields either disable the rootful user namespace, join a host
+namespace or join every namespace network. An ExternalName Service is host
+access because Traefik is attached to every namespace network: a name outside
+the pod network can resolve to another namespace's internal address. All of
+them are equivalent to root on the host, so a q8s administrator is trusted
+like root on the machine (or the owner of the account, rootless).
+Creating an ExternalName Service, or changing a Service so it stays or
+becomes ExternalName, requires an administrator. Changing an ExternalName
+Service to another type is allowed for an ordinary user, and reading, listing
+and deleting ExternalName Services stay governed by RBAC.
 A pod of an ordinary user may still mount a hostpath PersistentVolumeClaim
 that an administrator created in its namespace; creating the claim is the
 administrator's decision to hand that directory to the namespace. The GPU device

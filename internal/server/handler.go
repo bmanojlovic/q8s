@@ -1326,6 +1326,10 @@ func (s *Server) matchingServiceAliases(ns string, labels map[string]string) []s
 }
 
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name string) {
+	dry, ok := s.dryRunWrite(w, r)
+	if !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
@@ -1367,6 +1371,19 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		if s.rejectHostAccess(w, r, "Service", svc.Name, serviceHostAccessReasons(&svc)) {
+			return
+		}
+		if dry {
+			if _, err := s.config.Store.GetService(ns, svc.Name); err == nil {
+				s.respondStatus(w, http.StatusConflict, "AlreadyExists",
+					"service %q already exists in namespace %q", svc.Name, ns)
+				return
+			}
+			s.dryRunCreated(&svc)
+			encode(w, &svc, http.StatusCreated)
+			return
+		}
 		created, err := s.config.Store.CreateService(&svc)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -1405,6 +1422,42 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		s.config.Store.UpdateService(created)
 		s.regenerateIngressConfigs(ns)
 		encode(w, created, http.StatusCreated)
+	case http.MethodPut:
+		svc, err := s.config.Store.GetService(ns, name)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		var updated corev1.Service
+		if !s.decodeOrRespond(w, r, &updated) {
+			return
+		}
+		updated.APIVersion = "v1"
+		updated.Kind = "Service"
+		if !s.objectIdentityMatchesURL(w, &updated, ns, name) {
+			return
+		}
+		if err := validateName("namespace", updated.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", updated.Name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateService(&updated); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "Service", updated.Name, serviceHostAccessReasons(&updated)) {
+			return
+		}
+		if dry {
+			s.dryRunUpdated(&updated, svc)
+			encode(w, &updated, http.StatusOK)
+			return
+		}
+		s.updateService(w, ns, name, svc, &updated)
 	case http.MethodPatch:
 		svc, err := s.config.Store.GetService(ns, name)
 		if err != nil {
@@ -1457,48 +1510,21 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
-		updated, err := s.config.Store.UpdateService(&patched)
-		if err != nil {
-			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
+		if s.rejectHostAccess(w, r, "Service", patched.Name, serviceHostAccessReasons(&patched)) {
 			return
 		}
-		// An explicit nodePort is checked before allocation so a collision
-		// is reported as such; the check is repeated after allocation to
-		// cover auto-assigned nodePorts.
-		if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
-			s.respondStatus(w, http.StatusConflict, "Conflict",
-				"nodePort %d collides with hostPort of Pod %s", port, pod)
+		if dry {
+			s.dryRunUpdated(&patched, svc)
+			encode(w, &patched, http.StatusOK)
 			return
 		}
-		if err := s.assignNodePorts(updated); err != nil {
-			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
-			return
-		}
-		if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
-			s.respondStatus(w, http.StatusConflict, "Conflict",
-				"nodePort %d collides with hostPort of Pod %s", port, pod)
-			return
-		}
-		if err := s.serviceHostPortConflict(updated); err != nil {
-			// The patched object was stored above, before allocation. Put the
-			// previous Service back so a refused conflict does not persist.
-			if _, restoreErr := s.config.Store.UpdateService(svc); restoreErr != nil {
-				fmt.Printf("restore service %s/%s after conflict: %v\n", ns, name, restoreErr)
-			}
-			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
-			return
-		}
-		if err := s.reconcileNodePort(updated); err != nil {
-			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
-			return
-		}
-		s.config.Store.UpdateService(updated)
-		// Clean up legacy per-port socket files (see removeLegacyServiceSockets).
-		s.removeLegacyServiceSockets(svc)
-		s.regenerateIngressConfigs(ns)
-		encode(w, updated, http.StatusOK)
+		s.updateService(w, ns, name, svc, &patched)
 	case http.MethodDelete:
 		if name == "" {
+			if dry {
+				s.respondDryRunDeleteCollection(w, len(s.config.Store.Services(ns)))
+				return
+			}
 			s.deleteCollection(w,
 				func() []string {
 					var names []string
@@ -1510,6 +1536,14 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 				func(n string) error { return s.deleteServiceByName(ns, n) })
 			return
 		}
+		if dry {
+			if _, err := s.config.Store.GetService(ns, name); err != nil {
+				s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+				return
+			}
+			encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
+			return
+		}
 		if err := s.deleteServiceByName(ns, name); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
@@ -1518,6 +1552,52 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// updateService stores a validated Service update and runs the same nodePort,
+// hostPort and socket bookkeeping for PUT and PATCH. previous is restored when
+// a host-port conflict is found after the new object was stored.
+func (s *Server) updateService(w http.ResponseWriter, ns, name string, previous, patched *corev1.Service) {
+	updated, err := s.config.Store.UpdateService(patched)
+	if err != nil {
+		s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
+		return
+	}
+	// An explicit nodePort is checked before allocation so a collision
+	// is reported as such; the check is repeated after allocation to
+	// cover auto-assigned nodePorts.
+	if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
+		s.respondStatus(w, http.StatusConflict, "Conflict",
+			"nodePort %d collides with hostPort of Pod %s", port, pod)
+		return
+	}
+	if err := s.assignNodePorts(updated); err != nil {
+		s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+		return
+	}
+	if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
+		s.respondStatus(w, http.StatusConflict, "Conflict",
+			"nodePort %d collides with hostPort of Pod %s", port, pod)
+		return
+	}
+	if err := s.serviceHostPortConflict(updated); err != nil {
+		// The updated object was stored above, before allocation. Put the
+		// previous Service back so a refused conflict does not persist.
+		if _, restoreErr := s.config.Store.UpdateService(previous); restoreErr != nil {
+			fmt.Printf("restore service %s/%s after conflict: %v\n", ns, name, restoreErr)
+		}
+		s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+		return
+	}
+	if err := s.reconcileNodePort(updated); err != nil {
+		s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+		return
+	}
+	s.config.Store.UpdateService(updated)
+	// Clean up legacy per-port socket files (see removeLegacyServiceSockets).
+	s.removeLegacyServiceSockets(previous)
+	s.regenerateIngressConfigs(ns)
+	encode(w, updated, http.StatusOK)
 }
 
 // --- PVCs ---

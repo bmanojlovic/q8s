@@ -57,7 +57,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request, next http.H
 			"server-side apply is not supported on subresource %q", attrs.Subresource)
 		return
 	}
-	if _, ok := r.URL.Query()["dryRun"]; ok {
+	if _, ok := r.URL.Query()["dryRun"]; ok && !(attrs.IsResourceRequest && attrs.APIGroup == "" && attrs.Resource == "services") {
 		s.respondStatus(w, http.StatusBadRequest, "BadRequest", "dryRun is not supported")
 		return
 	}
