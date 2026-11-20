@@ -393,14 +393,21 @@ func TestDeleteDeploymentPersistFailureKeepsDeploymentAndPods(t *testing.T) {
 			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx"}}}},
 		},
 	}
-	if _, err := st.CreateDeployment(dep); err != nil {
+	created, err := st.CreateDeployment(dep)
+	if err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
 	for i := 0; i < int(replicas); i++ {
 		name := fmt.Sprintf("web-%d", i)
 		if _, err := st.CreatePod(&corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx"}}},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					Kind: "Deployment", Name: created.Name, UID: created.UID,
+				}},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "web", Image: "nginx"}}},
 		}); err != nil {
 			t.Fatalf("CreatePod %s: %v", name, err)
 		}

@@ -148,13 +148,18 @@ func (s *Server) respondStatus(w http.ResponseWriter, code int, reason string, f
 }
 
 // respondStoreError maps a store mutation error to an HTTP Status. A failed
-// disk write is a server-side failure and answers 500 InternalError; any
-// other store error keeps the handler's usual create/update/delete mapping
-// (for example 409 AlreadyExists or 404 NotFound).
+// disk write is a server-side failure and answers 500 InternalError. A
+// generated-name conflict is always 409 Conflict, even on an update whose
+// handler would otherwise report a generic 500. Any other store error keeps
+// the handler's usual create/update/delete mapping (for example 409
+// AlreadyExists or 404 NotFound).
 func (s *Server) respondStoreError(w http.ResponseWriter, err error, code int, reason string) {
 	if errors.Is(err, store.ErrPersist) {
 		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "%s", err.Error())
 		return
+	}
+	if errors.Is(err, store.ErrGeneratedNameConflict) {
+		code, reason = http.StatusConflict, "Conflict"
 	}
 	s.respondStatus(w, code, reason, "%s", err.Error())
 }
@@ -2394,7 +2399,7 @@ func (s *Server) withDeploymentStatus(dep *appsv1.Deployment) *appsv1.Deployment
 	desired := deploymentReplicas(d)
 	var ready int32
 	for i := int32(0); i < desired; i++ {
-		instanceName := fmt.Sprintf("%s-%d", d.Name, i)
+		instanceName := quadlet.DeploymentInstanceName(d.Name, i)
 		pod, err := s.config.Store.GetPod(d.Namespace, instanceName)
 		if err == nil && pod.Status.Phase == corev1.PodRunning && store.PodReady(pod) {
 			ready++
@@ -4213,7 +4218,7 @@ func (s *Server) ReconcileQuadlets() {
 
 	for _, dep := range s.config.Store.AllDeployments() {
 		for i := int32(0); i < deploymentReplicas(dep); i++ {
-			instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+			instanceName := quadlet.DeploymentInstanceName(dep.Name, i)
 			f := fmt.Sprintf("%s/%s-%s.container", quadletDir, dep.Namespace, instanceName)
 			if len(dep.Spec.Template.Spec.Containers) > 1 {
 				f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, dep.Namespace, instanceName)
@@ -5192,13 +5197,10 @@ func deploymentReplicas(dep *appsv1.Deployment) int32 {
 	// scaleDeployment/handleDeploymentScale can never detect a scale-to-zero
 	// or a subsequent scale-up from zero (confirmed live 2026-08-29: PATCH
 	// {"spec":{"replicas":0}} came back reporting spec.replicas=1).
-	if dep.Spec.Replicas == nil {
-		return 1
-	}
-	if *dep.Spec.Replicas < 0 {
-		return 0
-	}
-	return *dep.Spec.Replicas
+	//
+	// The rule lives in quadlet next to the generated instance names, so the
+	// naming guard and the deployer cannot disagree about which indexes exist.
+	return quadlet.DeploymentReplicaCount(dep)
 }
 
 func (s *Server) generateDeploymentQuadlets(dep *appsv1.Deployment) {
@@ -5246,7 +5248,7 @@ func podOwnedByDeployment(pod *corev1.Pod, deployment string) bool {
 // Ingress backends address replicas by their cluster DNS name instead, so
 // replicas no longer need distinct host publishes.
 func (s *Server) materializeDeploymentInstance(dep *appsv1.Deployment, i int32) *corev1.Pod {
-	instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+	instanceName := quadlet.DeploymentInstanceName(dep.Name, i)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instanceName,
@@ -5310,7 +5312,7 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 	if s.config.QuadletDir == "" {
 		return false
 	}
-	instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+	instanceName := quadlet.DeploymentInstanceName(dep.Name, i)
 	pod := s.materializeDeploymentInstance(dep, i)
 	if claim, missing := s.firstMissingClaim(dep.Namespace, dep.Spec.Template.Spec); missing {
 		// Keep the instance visible to kubectl and carry the same
@@ -5379,14 +5381,14 @@ func (s *Server) syncInstancePod(pod *corev1.Pod) {
 
 func (s *Server) stopDeploymentUnits(dep *appsv1.Deployment) {
 	for i := int32(0); i < deploymentReplicas(dep); i++ {
-		s.stopPodByName(dep.Namespace, fmt.Sprintf("%s-%d", dep.Name, i), dep.Spec.Template.Spec.Containers)
+		s.stopPodByName(dep.Namespace, quadlet.DeploymentInstanceName(dep.Name, i), dep.Spec.Template.Spec.Containers)
 	}
 }
 
 func (s *Server) deleteDeploymentPods(dep *appsv1.Deployment) []string {
 	podNames := make([]string, 0, deploymentReplicas(dep))
 	for i := int32(0); i < deploymentReplicas(dep); i++ {
-		podNames = append(podNames, fmt.Sprintf("%s-%d", dep.Name, i))
+		podNames = append(podNames, quadlet.DeploymentInstanceName(dep.Name, i))
 	}
 	return podNames
 }
@@ -5439,7 +5441,7 @@ func (s *Server) replicaEmptyDirVolumes(dep *appsv1.Deployment, index int32) []s
 		}
 	}
 	add(quadlet.EmptyDirVolumeNamesForDeploymentReplica(dep.Namespace, dep.Name, index, &dep.Spec.Template.Spec))
-	if pod, err := s.config.Store.GetPod(dep.Namespace, fmt.Sprintf("%s-%d", dep.Name, index)); err == nil {
+	if pod, err := s.config.Store.GetPod(dep.Namespace, quadlet.DeploymentInstanceName(dep.Name, index)); err == nil {
 		add(quadlet.EmptyDirVolumeNames(pod))
 	}
 	sort.Strings(names)
@@ -5449,7 +5451,7 @@ func (s *Server) replicaEmptyDirVolumes(dep *appsv1.Deployment, index int32) []s
 func (s *Server) removeDeploymentQuadlets(dep *appsv1.Deployment) {
 	var paths []string
 	for i := int32(0); i < deploymentReplicas(dep); i++ {
-		instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+		instanceName := quadlet.DeploymentInstanceName(dep.Name, i)
 		s.removePodSockets(dep.Namespace, instanceName)
 		if s.config.QuadletDir == "" {
 			continue
@@ -5470,7 +5472,7 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 		s.generateDeploymentInstanceQuadlet(dep, i)
 	}
 	for i := newR; i < oldR; i++ {
-		instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
+		instanceName := quadlet.DeploymentInstanceName(dep.Name, i)
 		volumes := s.replicaEmptyDirVolumes(dep, i)
 		s.stopPodByName(dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)
 		s.removePodSockets(dep.Namespace, instanceName)
@@ -5824,7 +5826,7 @@ func (s *Server) resolvedJobEnv(job *batchv1.Job) (*batchv1.Job, string, error) 
 	if err != nil {
 		return nil, "", err
 	}
-	envFile, err := s.writeEnvFile(resolved.Namespace, resolved.Name+"-job", resolved.Spec.Template.Spec.Containers, secretNames)
+	envFile, err := s.writeEnvFile(resolved.Namespace, quadlet.JobEnvBaseName(resolved.Name), resolved.Spec.Template.Spec.Containers, secretNames)
 	if err != nil {
 		return nil, "", err
 	}
@@ -5838,7 +5840,7 @@ func (s *Server) resolvedCronJobEnv(cj *batchv1.CronJob) (*batchv1.CronJob, stri
 	if err != nil {
 		return nil, "", err
 	}
-	envFile, err := s.writeEnvFile(resolved.Namespace, resolved.Name+"-cron", resolved.Spec.JobTemplate.Spec.Template.Spec.Containers, secretNames)
+	envFile, err := s.writeEnvFile(resolved.Namespace, quadlet.CronJobEnvBaseName(resolved.Name), resolved.Spec.JobTemplate.Spec.Template.Spec.Containers, secretNames)
 	if err != nil {
 		return nil, "", err
 	}
@@ -5997,7 +5999,7 @@ func (s *Server) writeEnvFile(ns, name string, containers []corev1.Container, se
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", fmt.Errorf("env dir %s: %w", dir, err)
 	}
-	path := filepath.Join(dir, name+".env")
+	path := filepath.Join(dir, quadlet.EnvFileName(name))
 	if err := fsutil.WriteFileAtomic(path, []byte(lines.String()), 0600); err != nil {
 		return "", fmt.Errorf("write env file %s: %w", path, err)
 	}

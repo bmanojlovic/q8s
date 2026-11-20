@@ -2,6 +2,12 @@
 
 Pods and Deployments accept one or more containers; multiple containers run as one Podman pod. Jobs and CronJobs run exactly one container; sidecars there, and `initContainers` and `ephemeralContainers` everywhere, are rejected.
 
+A Pod, Deployment, Job or CronJob owns every Podman container, systemd unit,
+EnvironmentFile and emptyDir volume name it generates. Creating one, or
+updating one so that it adds a name, is refused with 409 Conflict when another
+workload in any namespace already generates that name. See
+[RBAC and user identities](rbac.md) for the cross-namespace rule.
+
 ## core/v1
 
 | Resource | kubectl verbs | Notes |

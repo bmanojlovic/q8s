@@ -513,11 +513,14 @@ func makeDeployment(ns, name string) *appsv1.Deployment {
 
 func TestDeleteDeploymentWithPodsRemovesDeploymentAndPods(t *testing.T) {
 	st, _ := newFileStore(t)
-	if _, err := st.CreateDeployment(makeDeployment("default", "web")); err != nil {
+	dep, err := st.CreateDeployment(makeDeployment("default", "web"))
+	if err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
 	for _, name := range []string{"web-0", "web-1"} {
-		if _, err := st.CreatePod(makePod("default", name, "img")); err != nil {
+		pod := makePod("default", name, "img")
+		pod.OwnerReferences = []metav1.OwnerReference{{Kind: "Deployment", Name: dep.Name, UID: dep.UID}}
+		if _, err := st.CreatePod(pod); err != nil {
 			t.Fatalf("CreatePod %s: %v", name, err)
 		}
 	}
@@ -543,11 +546,14 @@ func TestDeleteDeploymentWithPodsRemovesDeploymentAndPods(t *testing.T) {
 
 func TestDeleteDeploymentWithPodsPersistFailureKeepsEverything(t *testing.T) {
 	st, file := newFileStore(t)
-	if _, err := st.CreateDeployment(makeDeployment("default", "web")); err != nil {
+	dep, err := st.CreateDeployment(makeDeployment("default", "web"))
+	if err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
 	for _, name := range []string{"web-0", "web-1"} {
-		if _, err := st.CreatePod(makePod("default", name, "img")); err != nil {
+		pod := makePod("default", name, "img")
+		pod.OwnerReferences = []metav1.OwnerReference{{Kind: "Deployment", Name: dep.Name, UID: dep.UID}}
+		if _, err := st.CreatePod(pod); err != nil {
 			t.Fatalf("CreatePod %s: %v", name, err)
 		}
 	}

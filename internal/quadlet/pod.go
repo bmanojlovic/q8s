@@ -97,7 +97,7 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 		return nil, err
 	}
 	workloadMount := workloadMountArg(workload)
-	podName := fmt.Sprintf("%s-%s", pod.Namespace, name)
+	podName := podBaseName(pod.Namespace, name)
 	files := map[string][]byte{
 		podName + ".pod": withTemplateHash(podContent),
 	}
@@ -105,14 +105,14 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 		if err := validateRefName("container name", c.Name); err != nil {
 			return nil, err
 		}
-		filename := fmt.Sprintf("%s-%s.container", podName, c.Name)
+		filename := podContainerName(pod.Namespace, name, c.Name) + ".container"
 		if _, exists := files[filename]; exists {
 			return nil, fmt.Errorf("pod %s/%s has duplicate container name %q", pod.Namespace, name, c.Name)
 		}
 		content, err := renderContainer(containerRender{
 			pod:            pod,
 			container:      c,
-			containerName:  fmt.Sprintf("%s-%s", podName, c.Name),
+			containerName:  podContainerName(pod.Namespace, name, c.Name),
 			podUnit:        podName + ".pod",
 			containerLabel: c.Name,
 			podName:        name,
@@ -139,7 +139,7 @@ func renderPod(name string, pod *corev1.Pod, serviceAliases []string, networks [
 	var b strings.Builder
 
 	b.WriteString("[Pod]\n")
-	podName := fmt.Sprintf("%s-%s", pod.Namespace, name)
+	podName := podBaseName(pod.Namespace, name)
 	b.WriteString(fmt.Sprintf("PodName=%s\n", podName))
 
 	// The pod owns the user namespace, not its member containers: podman

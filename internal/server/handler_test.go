@@ -2455,11 +2455,21 @@ func TestDeploymentStatusForRollout(t *testing.T) {
 	}
 
 	// Two matching pods, both Running, as reconcilePodmanPods would import.
+	dep, err := st.GetDeployment("default", "roll")
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
 	for i := 0; i < 2; i++ {
 		name := fmt.Sprintf("roll-%d", i)
 		if _, err := st.CreatePod(&corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "nginx"}}},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					Kind: "Deployment", Name: dep.Name, UID: dep.UID,
+				}},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "nginx"}}},
 		}); err != nil {
 			t.Fatalf("CreatePod %s: %v", name, err)
 		}

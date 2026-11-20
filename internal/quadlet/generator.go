@@ -375,7 +375,7 @@ func Container(name string, pod *corev1.Pod, configDir string, serviceAliases []
 	content, err := renderContainer(containerRender{
 		pod:            pod,
 		container:      pod.Spec.Containers[0],
-		containerName:  fmt.Sprintf("%s-%s", pod.Namespace, name),
+		containerName:  podContainerName(pod.Namespace, name, ""),
 		podName:        name,
 		configDir:      configDir,
 		serviceAliases: serviceAliases,
@@ -416,7 +416,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 		return nil, err
 	}
 	writeImageAndPull(&b, spec.Containers[0])
-	b.WriteString(fmt.Sprintf("ContainerName=%s-%s-job\n", ns, name))
+	b.WriteString(fmt.Sprintf("ContainerName=%s\n", cronruns.JobContainerName(ns, name)))
 	if userNS {
 		writeUserNS(&b, job.Spec.Template.Annotations)
 	}

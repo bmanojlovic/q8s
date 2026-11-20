@@ -269,6 +269,21 @@ func (s *Store) DataDir() string {
 // when it is returned.
 var ErrPersist = errors.New("store: could not persist change")
 
+// ErrGeneratedNameConflict marks a create or update refused because one of
+// the Podman or systemd names the object would generate is already generated
+// by another workload object. The HTTP layer maps it to 409 Conflict.
+var ErrGeneratedNameConflict = errors.New("store: generated name conflict")
+
+// generatedNameConflictError carries the human-readable conflict while still
+// matching ErrGeneratedNameConflict through errors.Is.
+type generatedNameConflictError struct {
+	message string
+}
+
+func (e *generatedNameConflictError) Error() string { return e.message }
+
+func (e *generatedNameConflictError) Unwrap() error { return ErrGeneratedNameConflict }
+
 // snapshotRetain is how many gzip snapshots are kept next to store.json.
 const snapshotRetain = 20
 
@@ -1262,6 +1277,142 @@ func (s *Store) checkGeneratedNameCollisionLocked(kind, ns, name string) error {
 	return nil
 }
 
+// storedWorkloadNames is one workload object and the names it generates, as
+// seen by the generated-name guard. OwnerReferences are kept so a Deployment
+// can ignore the replica Pods it owns.
+type storedWorkloadNames struct {
+	kind           string
+	namespace      string
+	name           string
+	ownerRefs      []metav1.OwnerReference
+	generatedNames []quadlet.GeneratedName
+}
+
+// storedWorkloadNamesLocked snapshots every workload object. The caller must
+// hold s.mu.
+func (s *Store) storedWorkloadNamesLocked() []storedWorkloadNames {
+	workloads := make([]storedWorkloadNames, 0, len(s.pods)+len(s.deployments)+len(s.jobs)+len(s.cronjobs))
+	for key, pod := range s.pods {
+		workloads = append(workloads, storedWorkloadNames{
+			kind: "Pod", namespace: key.Namespace, name: key.Name,
+			ownerRefs: pod.OwnerReferences, generatedNames: quadlet.GeneratedNames(pod),
+		})
+	}
+	for key, dep := range s.deployments {
+		workloads = append(workloads, storedWorkloadNames{
+			kind: "Deployment", namespace: key.Namespace, name: key.Name,
+			generatedNames: quadlet.GeneratedNames(dep),
+		})
+	}
+	for key, job := range s.jobs {
+		workloads = append(workloads, storedWorkloadNames{
+			kind: "Job", namespace: key.Namespace, name: key.Name,
+			generatedNames: quadlet.GeneratedNames(job),
+		})
+	}
+	for key, cj := range s.cronjobs {
+		workloads = append(workloads, storedWorkloadNames{
+			kind: "CronJob", namespace: key.Namespace, name: key.Name,
+			generatedNames: quadlet.GeneratedNames(cj),
+		})
+	}
+	return workloads
+}
+
+// addedGeneratedNames returns the names in next whose collision identity was
+// not already produced by previous. An update therefore only checks names it
+// newly introduces, which lets an object that is already in a legacy
+// collision be edited or scaled down without adding another one.
+func addedGeneratedNames(previous, next []quadlet.GeneratedName) []quadlet.GeneratedName {
+	if len(previous) == 0 {
+		return next
+	}
+	old := make(map[string]bool, len(previous))
+	for _, name := range previous {
+		old[name.Key] = true
+	}
+	added := make([]quadlet.GeneratedName, 0, len(next))
+	for _, name := range next {
+		if !old[name.Key] {
+			added = append(added, name)
+		}
+	}
+	return added
+}
+
+// hasOwnerReference reports whether refs name kind/name, which is how a
+// materialized Deployment replica identifies its owner.
+func hasOwnerReference(refs []metav1.OwnerReference, kind, name string) bool {
+	for _, ref := range refs {
+		if ref.Kind == kind && ref.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// deploymentOwnerName returns the Deployment name in a Pod's
+// OwnerReferences. Only materialized Deployment instances carry one, and
+// their generated names are a subset of the Deployment's own set.
+func deploymentOwnerName(refs []metav1.OwnerReference) string {
+	for _, ref := range refs {
+		if ref.Kind == "Deployment" && ref.Name != "" {
+			return ref.Name
+		}
+	}
+	return ""
+}
+
+// deploymentOwner turns deploymentOwnerName into the owner kind/name pair
+// checkGeneratedNamesLocked expects.
+func deploymentOwner(refs []metav1.OwnerReference) (string, string) {
+	if name := deploymentOwnerName(refs); name != "" {
+		return "Deployment", name
+	}
+	return "", ""
+}
+
+// checkGeneratedNamesLocked refuses a create or update when a name it would
+// generate already belongs to another workload object in any namespace.
+// ownerKind/ownerName, when set, names the object a replica belongs to: the
+// Deployment already owns the instance names, so the instance must not
+// conflict with it.
+//
+// The caller must hold s.mu (it runs inside mutate with the mutation), which
+// keeps two concurrent creates from both passing the check.
+func (s *Store) checkGeneratedNamesLocked(kind, namespace, name string, candidates []quadlet.GeneratedName, ownerKind, ownerName string) error {
+	if len(candidates) == 0 {
+		return nil
+	}
+	workloads := s.storedWorkloadNamesLocked()
+	for _, candidate := range candidates {
+		for _, other := range workloads {
+			if other.kind == kind && other.namespace == namespace && other.name == name {
+				continue
+			}
+			if ownerKind != "" && other.kind == ownerKind && other.namespace == namespace && other.name == ownerName {
+				continue
+			}
+			// The Deployment owns these instance names, and its own set
+			// already contains them. Checking its replica Pods would make
+			// every Deployment update collide with its own instances.
+			if kind == "Deployment" && other.kind == "Pod" && other.namespace == namespace &&
+				hasOwnerReference(other.ownerRefs, "Deployment", name) {
+				continue
+			}
+			for _, generated := range other.generatedNames {
+				if generated.Key != candidate.Key {
+					continue
+				}
+				return &generatedNameConflictError{message: fmt.Sprintf(
+					`%s %q in namespace %q would share the generated name %q with %s %q in namespace %q`,
+					kind, name, namespace, candidate.Name, other.kind, other.name, other.namespace)}
+			}
+		}
+	}
+	return nil
+}
+
 // --- Pods ---
 
 // AllPods returns all pods across all namespaces.
@@ -1297,6 +1448,11 @@ func (s *Store) CreatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 			return false, fmt.Errorf("pod %q already exists in namespace %q", pod.Name, pod.Namespace)
 		}
 		if err := s.checkGeneratedNameCollisionLocked("Pod", pod.Namespace, pod.Name); err != nil {
+			return false, err
+		}
+		ownerKind, ownerName := deploymentOwner(pod.OwnerReferences)
+		if err := s.checkGeneratedNamesLocked("Pod", pod.Namespace, pod.Name,
+			quadlet.GeneratedNames(pod), ownerKind, ownerName); err != nil {
 			return false, err
 		}
 		pod.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
@@ -1364,6 +1520,12 @@ func (s *Store) UpdatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 		existing, ok := s.pods[key]
 		if !ok {
 			return false, fmt.Errorf("pod %q not found in namespace %q", pod.Name, pod.Namespace)
+		}
+		ownerKind, ownerName := deploymentOwner(pod.OwnerReferences)
+		if err := s.checkGeneratedNamesLocked("Pod", pod.Namespace, pod.Name,
+			addedGeneratedNames(quadlet.GeneratedNames(existing), quadlet.GeneratedNames(pod)),
+			ownerKind, ownerName); err != nil {
+			return false, err
 		}
 		pod.UID = existing.UID
 		pod.ResourceVersion = s.incRV()
@@ -2615,6 +2777,10 @@ func (s *Store) CreateJob(job *batchv1.Job) (*batchv1.Job, error) {
 		if err := s.checkGeneratedNameCollisionLocked("Job", job.Namespace, job.Name); err != nil {
 			return false, err
 		}
+		if err := s.checkGeneratedNamesLocked("Job", job.Namespace, job.Name,
+			quadlet.GeneratedNames(job), "", ""); err != nil {
+			return false, err
+		}
 		job.ResourceVersion = s.incRV()
 		assignUID(job)
 		if job.Labels == nil {
@@ -2678,6 +2844,11 @@ func (s *Store) UpdateJob(job *batchv1.Job) (*batchv1.Job, error) {
 		existing, ok := s.jobs[key]
 		if !ok {
 			return false, fmt.Errorf("job %q not found in namespace %q", job.Name, job.Namespace)
+		}
+		if err := s.checkGeneratedNamesLocked("Job", job.Namespace, job.Name,
+			addedGeneratedNames(quadlet.GeneratedNames(existing), quadlet.GeneratedNames(job)),
+			"", ""); err != nil {
+			return false, err
 		}
 		job.UID = existing.UID
 		job.ResourceVersion = s.incRV()
@@ -2763,6 +2934,10 @@ func (s *Store) CreateCronJob(cj *batchv1.CronJob) (*batchv1.CronJob, error) {
 		if err := s.checkGeneratedNameCollisionLocked("CronJob", cj.Namespace, cj.Name); err != nil {
 			return false, err
 		}
+		if err := s.checkGeneratedNamesLocked("CronJob", cj.Namespace, cj.Name,
+			quadlet.GeneratedNames(cj), "", ""); err != nil {
+			return false, err
+		}
 		cj.ResourceVersion = s.incRV()
 		assignUID(cj)
 		if cj.Labels == nil {
@@ -2815,6 +2990,11 @@ func (s *Store) UpdateCronJob(cj *batchv1.CronJob) (*batchv1.CronJob, error) {
 		existing, ok := s.cronjobs[key]
 		if !ok {
 			return false, fmt.Errorf("cronjob %q not found in namespace %q", cj.Name, cj.Namespace)
+		}
+		if err := s.checkGeneratedNamesLocked("CronJob", cj.Namespace, cj.Name,
+			addedGeneratedNames(quadlet.GeneratedNames(existing), quadlet.GeneratedNames(cj)),
+			"", ""); err != nil {
+			return false, err
 		}
 		cj.UID = existing.UID
 		cj.ResourceVersion = s.incRV()
@@ -3175,6 +3355,10 @@ func (s *Store) CreateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, er
 		if err := s.checkGeneratedNameCollisionLocked("Deployment", dep.Namespace, dep.Name); err != nil {
 			return false, err
 		}
+		if err := s.checkGeneratedNamesLocked("Deployment", dep.Namespace, dep.Name,
+			quadlet.GeneratedNames(dep), "", ""); err != nil {
+			return false, err
+		}
 		dep.ResourceVersion = s.incRV()
 		assignUID(dep)
 		if dep.Labels == nil {
@@ -3208,6 +3392,11 @@ func (s *Store) UpdateDeployment(dep *appsv1.Deployment) (*appsv1.Deployment, er
 		existing, ok := s.deployments[key]
 		if !ok {
 			return false, fmt.Errorf("deployment %q not found in namespace %q", dep.Name, dep.Namespace)
+		}
+		if err := s.checkGeneratedNamesLocked("Deployment", dep.Namespace, dep.Name,
+			addedGeneratedNames(quadlet.GeneratedNames(existing), quadlet.GeneratedNames(dep)),
+			"", ""); err != nil {
+			return false, err
 		}
 		dep.UID = existing.UID
 		dep.ResourceVersion = s.incRV()
