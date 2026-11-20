@@ -85,6 +85,10 @@ type Server struct {
 	startUnitHook func(name string)
 	// disk caches the short-lived disk pressure check for write requests.
 	disk diskPressureCache
+	// objLocks serializes writes to the same object; see objlock.go for the
+	// lock order. The zero value is ready to use, so tests that build a
+	// Server literal directly still get working locks.
+	objLocks objectLocks
 }
 
 // maxRequestBodyBytes caps request bodies (same order of magnitude as real

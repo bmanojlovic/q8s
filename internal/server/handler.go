@@ -911,6 +911,13 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 	if !ok {
 		return
 	}
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, r.Method == http.MethodPost)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -994,6 +1001,8 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		// inserted, so mutating fields on it afterwards would race.
 		pod.Status.Phase = corev1.PodPending
 		pod.Status.StartTime = &metav1.Time{Time: time.Now()}
+		unlock := s.lockObject("Pod", ns, pod.Name)
+		defer unlock()
 		if dry {
 			if _, err := s.config.Store.GetPod(ns, pod.Name); err == nil {
 				s.respondStatus(w, http.StatusConflict, "AlreadyExists", "pod %q already exists in namespace %q", pod.Name, ns)
@@ -1012,6 +1021,8 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 		s.regenerateIngressConfigs(ns)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
+		unlock := s.lockObject("Pod", ns, name)
+		defer unlock()
 		pod, err := s.config.Store.GetPod(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -1111,7 +1122,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 					}
 					return names
 				},
-				func(n string) error { _, err := s.deletePodByNameForAPI(ns, n); return err })
+				func(n string) error { _, err := s.deletePodForAPI(ns, n); return err })
 			return
 		}
 		// Like Kubernetes, a pod DELETE answers with the deleted Pod (its uid
@@ -1127,7 +1138,7 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 			encode(w, deletedPodResponse(pod), http.StatusOK)
 			return
 		}
-		pod, err := s.deletePodByNameForAPI(ns, name)
+		pod, err := s.deletePodForAPI(ns, name)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
@@ -1330,6 +1341,13 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 	if !ok {
 		return
 	}
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, r.Method == http.MethodPost)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
@@ -1374,6 +1392,8 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		if s.rejectHostAccess(w, r, "Service", svc.Name, serviceHostAccessReasons(&svc)) {
 			return
 		}
+		unlock := s.lockObject("Service", ns, svc.Name)
+		defer unlock()
 		if dry {
 			if _, err := s.config.Store.GetService(ns, svc.Name); err == nil {
 				s.respondStatus(w, http.StatusConflict, "AlreadyExists",
@@ -1423,6 +1443,8 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		s.regenerateIngressConfigs(ns)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPut:
+		unlock := s.lockObject("Service", ns, name)
+		defer unlock()
 		svc, err := s.config.Store.GetService(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -1459,6 +1481,8 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 		}
 		s.updateService(w, ns, name, svc, &updated)
 	case http.MethodPatch:
+		unlock := s.lockObject("Service", ns, name)
+		defer unlock()
 		svc, err := s.config.Store.GetService(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -1533,7 +1557,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 					}
 					return names
 				},
-				func(n string) error { return s.deleteServiceByName(ns, n) })
+				func(n string) error { return s.deleteObjectByName("Service", ns, n, s.deleteServiceByName) })
 			return
 		}
 		if dry {
@@ -1544,7 +1568,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 			return
 		}
-		if err := s.deleteServiceByName(ns, name); err != nil {
+		if err := s.deleteObjectByName("Service", ns, name, s.deleteServiceByName); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
@@ -1603,6 +1627,13 @@ func (s *Server) updateService(w http.ResponseWriter, ns, name string, previous,
 // --- PVCs ---
 
 func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, r.Method == http.MethodPost)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
@@ -1647,6 +1678,8 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		if s.rejectHostAccess(w, r, "PersistentVolumeClaim", pvc.Name, pvcHostAccessReasons(&pvc)) {
 			return
 		}
+		unlock := s.lockObject("PersistentVolumeClaim", ns, pvc.Name)
+		defer unlock()
 		created, err := s.config.Store.CreatePVC(&pvc)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -1655,6 +1688,8 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		s.generatePVCVolume(created)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
+		unlock := s.lockObject("PersistentVolumeClaim", ns, name)
+		defer unlock()
 		pvc, err := s.config.Store.GetPVC(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -1725,10 +1760,12 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 					}
 					return names
 				},
-				func(n string) error { return s.deletePVCByName(ns, n) })
+				func(n string) error {
+					return s.deleteObjectByName("PersistentVolumeClaim", ns, n, s.deletePVCByName)
+				})
 			return
 		}
-		if err := s.deletePVCByName(ns, name); err != nil {
+		if err := s.deleteObjectByName("PersistentVolumeClaim", ns, name, s.deletePVCByName); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
@@ -1741,6 +1778,13 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 // --- ConfigMaps ---
 
 func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, r.Method == http.MethodPost)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
@@ -1790,6 +1834,8 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 			return
 		}
+		unlock := s.lockObject("ConfigMap", ns, cm.Name)
+		defer unlock()
 		created, err := s.config.Store.CreateConfigMap(&cm)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -1798,6 +1844,8 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		s.writeConfigMapFiles(created)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPut:
+		unlock := s.lockObject("ConfigMap", ns, name)
+		defer unlock()
 		var cm corev1.ConfigMap
 		if !s.decodeOrRespond(w, r, &cm) {
 			return
@@ -1835,6 +1883,8 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 		s.writeConfigMapFiles(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
+		unlock := s.lockObject("ConfigMap", ns, name)
+		defer unlock()
 		cm, err := s.config.Store.GetConfigMap(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -1911,10 +1961,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 					}
 					return names
 				},
-				func(n string) error { return s.deleteConfigMapByName(ns, n) })
+				func(n string) error { return s.deleteObjectByName("ConfigMap", ns, n, s.deleteConfigMapByName) })
 			return
 		}
-		if err := s.deleteConfigMapByName(ns, name); err != nil {
+		if err := s.deleteObjectByName("ConfigMap", ns, name, s.deleteConfigMapByName); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
@@ -1927,6 +1977,13 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 // --- Secrets ---
 
 func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, r.Method == http.MethodPost)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
@@ -1977,6 +2034,8 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			return
 		}
 		normalizeSecret(&secret)
+		unlock := s.lockObject("Secret", ns, secret.Name)
+		defer unlock()
 		created, err := s.config.Store.CreateSecret(&secret)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -1985,6 +2044,8 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		s.writeSecretFiles(created)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
+		unlock := s.lockObject("Secret", ns, name)
+		defer unlock()
 		sec, err := s.config.Store.GetSecret(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -2066,10 +2127,10 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 					}
 					return names
 				},
-				func(n string) error { return s.deleteSecretByName(ns, n) })
+				func(n string) error { return s.deleteObjectByName("Secret", ns, n, s.deleteSecretByName) })
 			return
 		}
-		if err := s.deleteSecretByName(ns, name); err != nil {
+		if err := s.deleteObjectByName("Secret", ns, name, s.deleteSecretByName); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
@@ -2358,6 +2419,13 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		}
 		return
 	}
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, r.Method == http.MethodPost)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -2422,6 +2490,8 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		if s.rejectHostAccess(w, r, "Deployment", dep.Name, quadlet.HostAccessReasons(dep.Spec.Template.Spec, dep.Spec.Template.Annotations)) {
 			return
 		}
+		unlock := s.lockObject("Deployment", ns, dep.Name)
+		defer unlock()
 		created, err := s.config.Store.CreateDeployment(&dep)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -2436,6 +2506,8 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		// client uses PUT rather than PATCH for Deployment updates, but a
 		// real Kubernetes API server always accepts it, so implement it
 		// for spec-compliance.
+		unlock := s.lockObject("Deployment", ns, name)
+		defer unlock()
 		var dep appsv1.Deployment
 		if !s.decodeOrRespond(w, r, &dep) {
 			return
@@ -2494,6 +2566,8 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 		s.regenerateIngressConfigs(ns)
 		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
+		unlock := s.lockObject("Deployment", ns, name)
+		defer unlock()
 		dep, err := s.config.Store.GetDeployment(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -2599,7 +2673,9 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 					}
 					return names
 				},
-				func(n string) error { return s.deleteDeploymentByName(ns, n) })
+				func(n string) error {
+					return s.deleteObjectByName("Deployment", ns, n, s.deleteDeploymentByName)
+				})
 			return
 		}
 		if dry {
@@ -2610,7 +2686,7 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 			encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 			return
 		}
-		if err := s.deleteDeploymentByName(ns, name); err != nil {
+		if err := s.deleteObjectByName("Deployment", ns, name, s.deleteDeploymentByName); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
@@ -2621,6 +2697,15 @@ func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request, ns, n
 }
 
 func (s *Server) handleDeploymentScale(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, false)
+		if !ok {
+			return
+		}
+		defer release()
+		unlock := s.lockObject("Deployment", ns, name)
+		defer unlock()
+	}
 	dep, err := s.config.Store.GetDeployment(ns, name)
 	if err != nil {
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -2753,6 +2838,8 @@ func (s *Server) handleNamespaceGet(w http.ResponseWriter, r *http.Request, name
 // cluster-scoped, so an apply that finds the object must still be able to
 // update its labels and annotations.
 func (s *Server) handleNamespacePatch(w http.ResponseWriter, r *http.Request, name string) {
+	unlock := s.lockObject("Namespace", "", name)
+	defer unlock()
 	ns, err := s.config.Store.GetNamespace(name)
 	if err != nil {
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -2820,6 +2907,8 @@ func (s *Server) handleNamespaceCreate(w http.ResponseWriter, r *http.Request) {
 		s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
 		return
 	}
+	unlock := s.lockObject("Namespace", "", ns.Name)
+	defer unlock()
 	created, err := s.config.Store.CreateNamespace(&ns)
 	if err != nil {
 		s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -2945,6 +3034,12 @@ func (s *Server) sweepOrphanedSockets() bool {
 }
 
 func (s *Server) handleNamespaceDelete(w http.ResponseWriter, r *http.Request, name string) {
+	// The Namespace lock is exclusive here and shared by every namespaced
+	// write. Taking it before the existence check means a concurrent create
+	// either finishes first (and its unit files are cleaned up below) or waits
+	// and is then refused because the namespace is gone.
+	unlock := s.lockObject("Namespace", "", name)
+	defer unlock()
 	if _, err := s.config.Store.GetNamespace(name); err != nil {
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
 		return
@@ -3010,6 +3105,13 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 	if s.rejectCronRunJobWrite(w, r, ns, name) {
 		return
 	}
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, r.Method == http.MethodPost)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
@@ -3067,6 +3169,8 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			return
 		}
 		ensureJobPodIdentity(&job)
+		unlock := s.lockObject("Job", ns, job.Name)
+		defer unlock()
 		created, err := s.config.Store.CreateJob(&job)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -3076,6 +3180,8 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		encode(w, created, http.StatusCreated)
 	case http.MethodPut:
 		// Full-resource replace (kubectl replace / client-go Update()).
+		unlock := s.lockObject("Job", ns, name)
+		defer unlock()
 		var job batchv1.Job
 		if !s.decodeOrRespond(w, r, &job) {
 			return
@@ -3141,6 +3247,8 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
+		unlock := s.lockObject("Job", ns, name)
+		defer unlock()
 		job, err := s.config.Store.GetJob(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -3241,7 +3349,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 					}
 					return names
 				},
-				func(n string) error { return s.deleteJobByName(ns, n) })
+				func(n string) error { return s.deleteObjectByName("Job", ns, n, s.deleteJobByName) })
 			return
 		}
 		if dry {
@@ -3252,7 +3360,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 			return
 		}
-		if err := s.deleteJobByName(ns, name); err != nil {
+		if err := s.deleteObjectByName("Job", ns, name, s.deleteJobByName); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
@@ -3265,6 +3373,13 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 // --- CronJobs ---
 
 func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name string) {
+	if r.Method != http.MethodGet {
+		release, ok := s.beginNamespacedWrite(w, ns, r.Method == http.MethodPost)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if name == "" {
@@ -3326,6 +3441,8 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		if s.rejectHostAccess(w, r, "CronJob", cj.Name, quadlet.HostAccessReasons(cj.Spec.JobTemplate.Spec.Template.Spec, cj.Spec.JobTemplate.Spec.Template.Annotations)) {
 			return
 		}
+		unlock := s.lockObject("CronJob", ns, cj.Name)
+		defer unlock()
 		created, err := s.config.Store.CreateCronJob(&cj)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
@@ -3335,6 +3452,8 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		encode(w, created, http.StatusCreated)
 	case http.MethodPut:
 		// Full-resource replace (kubectl replace / client-go Update()).
+		unlock := s.lockObject("CronJob", ns, name)
+		defer unlock()
 		var cj batchv1.CronJob
 		if !s.decodeOrRespond(w, r, &cj) {
 			return
@@ -3393,6 +3512,8 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 		s.generateCronJobQuadlets(updated)
 		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
+		unlock := s.lockObject("CronJob", ns, name)
+		defer unlock()
 		cj, err := s.config.Store.GetCronJob(ns, name)
 		if err != nil {
 			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
@@ -3488,7 +3609,9 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 					}
 					return names
 				},
-				func(n string) error { return s.deleteCronJobByName(ns, n) })
+				func(n string) error {
+					return s.deleteObjectByName("CronJob", ns, n, s.deleteCronJobByName)
+				})
 			return
 		}
 		if dry {
@@ -3499,7 +3622,7 @@ func (s *Server) handleCronJobs(w http.ResponseWriter, r *http.Request, ns, name
 			encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 			return
 		}
-		if err := s.deleteCronJobByName(ns, name); err != nil {
+		if err := s.deleteObjectByName("CronJob", ns, name, s.deleteCronJobByName); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
 			return
 		}
@@ -6050,6 +6173,16 @@ func (s *Server) deleteCollection(w http.ResponseWriter, listFn func() []string,
 	}, http.StatusOK)
 }
 
+// deleteObjectByName takes the object's write lock and runs del, which is the
+// kind-specific delete. Single-object DELETE handlers and every
+// deleteCollection callback use it, so an item is locked exactly once per
+// request. The caller holds the shared Namespace lock.
+func (s *Server) deleteObjectByName(kind, ns, name string, del func(ns, name string) error) error {
+	unlock := s.lockObject(kind, ns, name)
+	defer unlock()
+	return del(ns, name)
+}
+
 func (s *Server) deletePodByName(ns, name string) error {
 	pod, err := s.config.Store.GetPod(ns, name)
 	if err != nil {
@@ -6066,6 +6199,31 @@ func (s *Server) deletePodByName(ns, name string) error {
 	}
 	s.regenerateIngressConfigs(ns)
 	return nil
+}
+
+// deletePodForAPI is the Pod DELETE handler's delete. It takes the Pod lock
+// and, for a Deployment replica, the Deployment lock first (see the lock order
+// in objlock.go), then runs deletePodByNameForAPI. Both locks are taken here
+// so an internal call can never re-lock an object the handler already holds.
+func (s *Server) deletePodForAPI(ns, name string) (*corev1.Pod, error) {
+	unlockPod := s.lockObject("Pod", ns, name)
+	defer unlockPod()
+
+	// Read only to decide whether a Deployment lock is needed. A Deployment
+	// instance pod names its Deployment in its OwnerReference, and the
+	// Deployment write that creates it holds that Deployment's lock, so the
+	// only way this pre-read misses is that the pod is created afterwards (in
+	// which case this DELETE answers NotFound, as for any absent object).
+	if pod, err := s.config.Store.GetPod(ns, name); err == nil {
+		if depName, _, ok := quadlet.DeploymentReplica(pod); ok {
+			unlockPod()
+			unlockDep := s.lockObject("Deployment", ns, depName)
+			defer unlockDep()
+			unlockPod = s.lockObject("Pod", ns, name)
+			defer unlockPod()
+		}
+	}
+	return s.deletePodByNameForAPI(ns, name)
 }
 
 // deletePodByNameForAPI is the Pod DELETE handler's delete. Unlike
