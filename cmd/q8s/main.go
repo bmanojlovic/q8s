@@ -778,6 +778,7 @@ func cmdServe() {
 	srv.RestoreEnvFiles()
 	ensureNamespaceNetworks(d.quadletDir, mgr, st)
 	srv.ReconcileQuadlets()
+	srv.StartPodsWaitingForClaims()
 	srv.ReconcileNetworkAttachments()
 	srv.ReconcileIngressConfigs()
 	reconcilePodmanPods(st, mgr)
@@ -785,7 +786,7 @@ func cmdServe() {
 	if mgr != nil {
 		syncCtx, stopSync := context.WithCancel(context.Background())
 		defer stopSync()
-		go syncLoop(syncCtx, st, mgr, mode, d.quadletDir, srv.RegenerateIngressConfigs)
+		go syncLoop(syncCtx, st, mgr, mode, d.quadletDir, srv.RegenerateIngressConfigs, srv.StartPodsWaitingForClaims)
 	}
 
 	daemon.SdNotify(false, daemon.SdNotifyReady)
@@ -1223,7 +1224,7 @@ func syncUnitMatcher(quadletDir string, ids *atomic.Pointer[map[string]struct{}]
 // Unit changes arrive over a dedicated D-Bus connection to systemd: no child
 // process is started and the journal is never read, so a host with a large
 // journal costs q8s nothing extra.
-func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string, backendsChanged func(ns string)) {
+func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string, backendsChanged func(ns string), startPodsWaitingForClaims func()) {
 	// Podman runs each health check as a transient systemd unit whose name
 	// carries the container ID (see healthCheckContainerID). Which containers
 	// are worth watching is recomputed after every reconcile pass, because it
@@ -1239,6 +1240,11 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 	reconcile := func() {
 		before := servablePods(st.AllPods())
 		live := reconcileOnce(st, mgr)
+		if startPodsWaitingForClaims != nil {
+			// Retry pods held back by a missing claim. The callback walks
+			// the in-memory store and does nothing when no pod is waiting.
+			startPodsWaitingForClaims()
+		}
 		after := st.AllPods()
 		ids := watchedHealthIDs(after, live, time.Now())
 		watchedHealth.Store(&ids)

@@ -4222,6 +4222,12 @@ func (s *Server) ReconcileQuadlets() {
 			// Heal instances stored by an older q8s with a stale spec
 			// (tic-d0fc) before anything below reads the store.
 			s.syncInstancePod(pod)
+			// Only hold an instance that has no unit yet: a claim deleted
+			// under a running pod must not turn it Pending on restart.
+			if claim, missingClaim := s.firstMissingClaim(dep.Namespace, dep.Spec.Template.Spec); missingClaim && missing(f) {
+				s.markPodWaitingForClaim(dep.Namespace, instanceName, claim)
+				continue
+			}
 			socketUnits, socketChanged := s.reconcilePodSockets(pod, instanceName)
 			socketUnitsToStart = append(socketUnitsToStart, socketUnits...)
 			if socketChanged {
@@ -4239,6 +4245,7 @@ func (s *Server) ReconcileQuadlets() {
 				continue
 			}
 			writePod(dep.Namespace, instanceName, files, resolved.Spec.Containers, wasMissing)
+			s.clearPodWaitingForClaim(dep.Namespace, instanceName)
 		}
 	}
 
@@ -4260,6 +4267,10 @@ func (s *Server) ReconcileQuadlets() {
 		if isDeploymentOwned(pod) {
 			continue
 		}
+		if claim, missingClaim := s.firstMissingClaim(pod.Namespace, pod.Spec); missingClaim && missing(f) {
+			s.markPodWaitingForClaim(pod.Namespace, pod.Name, claim)
+			continue
+		}
 		wasMissing := missing(f)
 		resolved, envFile, err := s.resolveEnvFrom(pod)
 		if err != nil {
@@ -4272,6 +4283,7 @@ func (s *Server) ReconcileQuadlets() {
 			continue
 		}
 		writePod(pod.Namespace, pod.Name, files, resolved.Spec.Containers, wasMissing)
+		s.clearPodWaitingForClaim(pod.Namespace, pod.Name)
 	}
 
 	for _, pvc := range s.config.Store.AllPVCs() {
@@ -4324,6 +4336,10 @@ func (s *Server) ReconcileQuadlets() {
 		// rendering (e.g. the UserNS size) reaches them; only a missing unit
 		// is started.
 		f := fmt.Sprintf("%s/%s-%s-job.container", quadletDir, job.Namespace, job.Name)
+		if claim, missingClaim := s.firstMissingClaim(job.Namespace, job.Spec.Template.Spec); missingClaim && missing(f) {
+			s.markJobWaitingForClaim(job.Namespace, job.Name, claim)
+			continue
+		}
 		jobUnit := ""
 		if missing(f) {
 			jobUnit = fmt.Sprintf("%s-%s-job.service", job.Namespace, job.Name)
@@ -4339,6 +4355,7 @@ func (s *Server) ReconcileQuadlets() {
 			continue
 		}
 		write(quadletDir, fmt.Sprintf("%s-%s-job.container", job.Namespace, job.Name), content, jobUnit)
+		s.clearJobWaitingForClaim(job.Namespace, job.Name)
 	}
 
 	timerDir := s.config.SystemdDir
@@ -4348,6 +4365,10 @@ func (s *Server) ReconcileQuadlets() {
 	for _, cj := range s.config.Store.AllCronJobs() {
 		cf := fmt.Sprintf("%s/%s-%s-cron.container", quadletDir, cj.Namespace, cj.Name)
 		tf := fmt.Sprintf("%s/%s-%s-cron.timer", timerDir, cj.Namespace, cj.Name)
+		if claim, missingClaim := s.firstMissingClaim(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec); missingClaim && missing(cf) {
+			s.markCronJobWaitingForClaim(cj.Namespace, cj.Name, claim)
+			continue
+		}
 		// Like pods, existing CronJob units are re-rendered so a q8s upgrade
 		// reaches them; the next run uses the new unit, nothing is restarted.
 		// The timer is started only when one of its files was missing.
@@ -4377,6 +4398,7 @@ func (s *Server) ReconcileQuadlets() {
 			startUnits = append(startUnits, fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name))
 		}
 		cronJobsToEnsure = append(cronJobsToEnsure, cj)
+		s.clearCronJobWaitingForClaim(cj.Namespace, cj.Name)
 	}
 
 	mgr := s.config.Manager
@@ -4497,23 +4519,8 @@ func (s *Server) podMaterializeFailed(pod *corev1.Pod, stage string, err error) 
 		corev1.EventTypeWarning, "MaterializationFailed", stage+": "+err.Error())
 }
 
-func (s *Server) generatePodQuadlet(pod *corev1.Pod) {
-	if s.config.QuadletDir == "" {
-		return
-	}
-	pod = s.applyNodePorts(pod)
-	resolved, envFile, err := s.resolveEnvFrom(pod)
-	if err != nil {
-		s.podMaterializeFailed(pod, "resolving env references", err)
-		return
-	}
-	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(pod.Namespace, &resolved.Spec))
-	if err != nil {
-		s.podMaterializeFailed(pod, "generating quadlet", err)
-		return
-	}
-	s.deployPodSockets(resolved, pod.Name)
-	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), false, false)
+func (s *Server) generatePodQuadlet(pod *corev1.Pod) bool {
+	return s.deployPodQuadlet(pod, false)
 }
 
 // applyNodePorts returns a copy of pod with any NodePort-Service-driven host
@@ -4539,23 +4546,38 @@ func (s *Server) applyNodePorts(pod *corev1.Pod) *corev1.Pod {
 	return cp
 }
 
-func (s *Server) redeployPodQuadlet(pod *corev1.Pod) {
+func (s *Server) redeployPodQuadlet(pod *corev1.Pod) bool {
+	return s.deployPodQuadlet(pod, true)
+}
+
+// deployPodQuadlet is the single render path for a standalone Pod. A pod whose
+// claim is not in the store is recorded as waiting and nothing is written:
+// rendering it would emit a Volume= line naming a .volume unit that does not
+// exist, and systemd would then refuse the service. The first missing claim
+// also becomes the PodScheduled=False marker the sync loop retries.
+func (s *Server) deployPodQuadlet(pod *corev1.Pod, restart bool) bool {
 	if s.config.QuadletDir == "" {
-		return
+		return false
+	}
+	if claim, missing := s.firstMissingClaim(pod.Namespace, pod.Spec); missing {
+		s.markPodWaitingForClaim(pod.Namespace, pod.Name, claim)
+		return false
 	}
 	pod = s.applyNodePorts(pod)
 	resolved, envFile, err := s.resolveEnvFrom(pod)
 	if err != nil {
 		s.podMaterializeFailed(pod, "resolving env references", err)
-		return
+		return false
 	}
 	files, err := podQuadletFiles(pod.Name, resolved, s.config.ConfigDir, s.matchingServiceAliases(pod.Namespace, resolved.Labels), s.podPVCMap(pod.Namespace, pod.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(pod.Namespace, &resolved.Spec))
 	if err != nil {
 		s.podMaterializeFailed(pod, "generating quadlet", err)
-		return
+		return false
 	}
 	socketChanged := s.deployPodSockets(resolved, pod.Name)
-	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), true, socketChanged)
+	s.deployPodFiles(s.config.QuadletDir, pod.Namespace, pod.Name, files, podUnitNames(pod.Namespace, pod.Name, pod.Spec.Containers), restart, restart && socketChanged)
+	s.clearPodWaitingForClaim(pod.Namespace, pod.Name)
+	return true
 }
 
 func (s *Server) stopPodUnit(pod *corev1.Pod) {
@@ -4758,24 +4780,30 @@ func (s *Server) removePVCVolume(pvc *corev1.PersistentVolumeClaim) {
 	}
 }
 
-func (s *Server) generateJobQuadlet(job *batchv1.Job) {
+func (s *Server) generateJobQuadlet(job *batchv1.Job) bool {
 	if s.config.QuadletDir == "" {
-		return
+		return false
+	}
+	if claim, missing := s.firstMissingClaim(job.Namespace, job.Spec.Template.Spec); missing {
+		s.markJobWaitingForClaim(job.Namespace, job.Name, claim)
+		return false
 	}
 	resolved, envFile, err := s.resolvedJobEnv(job)
 	if err != nil {
 		fmt.Printf("job quadlet %s: %v\n", job.Name, err)
-		return
+		return false
 	}
 	content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile, s.workloadMount(resolved.Namespace, &resolved.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("job quadlet %s: %v\n", job.Name, err)
-		return
+		return false
 	}
 	s.deployUnit(s.config.QuadletDir,
 		fmt.Sprintf("%s-%s-job.container", job.Namespace, job.Name),
 		content,
 		fmt.Sprintf("%s-%s-job.service", job.Namespace, job.Name))
+	s.clearJobWaitingForClaim(job.Namespace, job.Name)
+	return true
 }
 
 func (s *Server) stopJobUnit(job *batchv1.Job) {
@@ -4792,9 +4820,24 @@ func (s *Server) removeJobQuadlet(job *batchv1.Job) {
 }
 
 func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
+	s.deployCronJobQuadlets(cj, true)
+}
+
+// renderCronJobQuadlets writes a CronJob's container and timer without
+// starting the timer. The wait path uses it so a CronJob that was held back by
+// a missing claim is ready for its schedule, never fired immediately.
+func (s *Server) renderCronJobQuadlets(cj *batchv1.CronJob) bool {
+	return s.deployCronJobQuadlets(cj, false)
+}
+
+func (s *Server) deployCronJobQuadlets(cj *batchv1.CronJob, start bool) bool {
 	quadletDir := s.config.QuadletDir
 	if quadletDir == "" {
-		return
+		return false
+	}
+	if claim, missing := s.firstMissingClaim(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec); missing {
+		s.markCronJobWaitingForClaim(cj.Namespace, cj.Name, claim)
+		return false
 	}
 	timerDir := s.config.SystemdDir
 	if timerDir == "" {
@@ -4803,30 +4846,34 @@ func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
 	resolved, envFile, err := s.resolvedCronJobEnv(cj)
 	if err != nil {
 		fmt.Printf("cronjob container %s: %v\n", cj.Name, err)
-		return
+		return false
 	}
 	containerContent, err := quadlet.CronContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.JobTemplate.Spec.Template.Spec), envFile, s.workloadMount(resolved.Namespace, &resolved.Spec.JobTemplate.Spec.Template.Spec))
 	if err != nil {
 		fmt.Printf("cronjob container %s: %v\n", cj.Name, err)
-		return
+		return false
 	}
 	timerContent, err := quadlet.CronTimer(cj.Name, cj)
 	if err != nil {
 		fmt.Printf("cronjob timer %s: %v\n", cj.Name, err)
-		return
+		return false
 	}
 	containerFile := fmt.Sprintf("%s-%s-cron.container", cj.Namespace, cj.Name)
 	if _, err := writeQuadletFilesTracked(quadletDir, map[string][]byte{containerFile: containerContent}); err != nil {
 		fmt.Printf("write %s: %v\n", containerFile, err)
-		return
+		return false
 	}
 	timerFile := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
-	if cronJobSuspended(cj) {
+	if !start || cronJobSuspended(cj) {
 		s.deployUnit(timerDir, timerFile, timerContent, "")
 	} else {
 		s.deployUnit(timerDir, timerFile, timerContent, timerFile)
 	}
-	s.setCronTimerEnabled(cj)
+	if start {
+		s.setCronTimerEnabled(cj)
+	}
+	s.clearCronJobWaitingForClaim(cj.Namespace, cj.Name)
+	return true
 }
 
 // cronJobSuspended reports spec.suspend.
@@ -5259,27 +5306,34 @@ func (s *Server) withNodePortPublish(pod *corev1.Pod) *corev1.Pod {
 	return pod
 }
 
-func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, restart bool) {
+func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, restart bool) bool {
 	if s.config.QuadletDir == "" {
-		return
+		return false
 	}
 	instanceName := fmt.Sprintf("%s-%d", dep.Name, i)
 	pod := s.materializeDeploymentInstance(dep, i)
+	if claim, missing := s.firstMissingClaim(dep.Namespace, dep.Spec.Template.Spec); missing {
+		// Keep the instance visible to kubectl and carry the same
+		// PodScheduled=False marker a bare Pod uses.
+		s.syncInstancePod(pod)
+		s.markPodWaitingForClaim(dep.Namespace, instanceName, claim)
+		return false
+	}
 	resolved, envFile, err := s.resolveEnvFrom(pod)
 	if err != nil {
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
-		return
+		return false
 	}
 	files, err := podQuadletFiles(instanceName, resolved, s.config.ConfigDir, s.matchingServiceAliases(dep.Namespace, resolved.Labels), s.podPVCMap(dep.Namespace, dep.Spec.Template.Spec), envFile, s.networkAttachments(resolved), s.workloadMount(dep.Namespace, &resolved.Spec))
 	if err != nil {
 		fmt.Printf("deployment instance quadlet %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
-		return
+		return false
 	}
 	socketChanged := s.deployPodSockets(pod, instanceName)
 	changed, err := writeQuadletFilesTracked(s.config.QuadletDir, files)
 	if err != nil {
 		fmt.Printf("write deployment %s/%s-%d: %v\n", dep.Namespace, dep.Name, i, err)
-		return
+		return false
 	}
 	removed := s.removeStaleOwnedUnits(s.config.QuadletDir, dep.Namespace, instanceName, filenameSet(files))
 	if len(changed) > 0 {
@@ -5290,7 +5344,8 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 	// and that an existing one carries the current template (tic-d0fc).
 	s.syncInstancePod(pod)
 	if restart && len(changed) == 0 && !removed && !socketChanged {
-		return
+		s.clearPodWaitingForClaim(dep.Namespace, instanceName)
+		return true
 	}
 	// A restart for a new template replaces the pod, as a rollout does in
 	// Kubernetes: reset it before the restart so rollout status waits for
@@ -5299,6 +5354,8 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 		s.config.Store.ResetPodForRestart(dep.Namespace, instanceName)
 	}
 	s.reloadAndRun(podUnitNames(dep.Namespace, instanceName, pod.Spec.Containers), restart, removed, socketChanged, changed)
+	s.clearPodWaitingForClaim(dep.Namespace, instanceName)
+	return true
 }
 
 // unitFileChanged reports whether a container or pod unit file was rewritten,

@@ -1835,6 +1835,18 @@ func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCo
 	})
 }
 
+// isPVCWaitCondition reports whether c is the server-owned marker written
+// while a pod waits for a missing PersistentVolumeClaim. It is not derived
+// from container state, so status sync must preserve it instead of replacing
+// PodScheduled with the usual unconditional True.
+func isPVCWaitCondition(c corev1.PodCondition) bool {
+	return c.Type == corev1.PodScheduled &&
+		c.Status == corev1.ConditionFalse &&
+		c.Reason == "Unschedulable" &&
+		strings.HasPrefix(c.Message, `persistentvolumeclaim "`) &&
+		strings.HasSuffix(c.Message, `" not found`)
+}
+
 // syncPodConditions derives the pod conditions from the container statuses:
 // PodScheduled and Initialized are always true on the single node, Ready and
 // ContainersReady follow the containers' ready flags. kubectl run --attach
@@ -1860,10 +1872,21 @@ func syncPodConditions(pod *corev1.Pod) bool {
 	for _, c := range pod.Status.Conditions {
 		existing[c.Type] = c
 	}
+	waitingClaim := false
+	waitCond, hasWaitCond := existing[corev1.PodScheduled]
+	if hasWaitCond && isPVCWaitCondition(waitCond) {
+		waitingClaim = true
+	}
 	changed := len(pod.Status.Conditions) != len(order)
 	now := metav1.Now()
 	conds := make([]corev1.PodCondition, 0, len(order))
 	for _, t := range order {
+		if t == corev1.PodScheduled && waitingClaim {
+			// Keep the marker, including its message and transition time,
+			// until the wait path renders the unit and clears it.
+			conds = append(conds, waitCond)
+			continue
+		}
 		status := corev1.ConditionFalse
 		if want[t] {
 			status = corev1.ConditionTrue
