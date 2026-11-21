@@ -552,16 +552,10 @@ func (s *Server) handleCronRunPodLogs(w http.ResponseWriter, r *http.Request, po
 	s.handleJournalPodLogs(w, r, pod, unit, container, cj.CreationTimestamp.Time)
 }
 
-// runBelongsTo reports whether invocationID names one of runs. An empty id
-// never belongs: journalctl without an invocation id returns every run of the
+// ownedRun returns the run of runs with invocationID. An empty id never
+// matches: journalctl without an invocation id returns every run of the
 // unit, including those of a previous object that happened to share the unit
 // name.
-func runBelongsTo(runs []cronruns.Run, invocationID string) bool {
-	_, ok := ownedRun(runs, invocationID)
-	return ok
-}
-
-// ownedRun returns the run of runs with invocationID; see runBelongsTo.
 func ownedRun(runs []cronruns.Run, invocationID string) (cronruns.Run, bool) {
 	if invocationID == "" {
 		return cronruns.Run{}, false

@@ -19,7 +19,7 @@ func TestJobRunsDoNotLeakAcrossNamespacesAfterRecreate(t *testing.T) {
 	fake := newFakeJournal()
 	base := time.Unix(1700000000, 0).UTC()
 	installJobRun(fake, "team-prod", "db", "11111111111111111111111111111111", base, cronruns.StateSucceeded)
-	fake.logs["team-prod-db-job"] = []byte(strings.Join([]string{
+	fake.logs["team-prod_db__job"] = []byte(strings.Join([]string{
 		`{"MESSAGE":"old tenant output","__REALTIME_TIMESTAMP":"1700000000000000"}`,
 	}, "\n"))
 	ts, _ := newCronRunServer(t, fake)
@@ -90,7 +90,7 @@ func TestJobRunJustBeforeCreationTimestampStillShown(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	id := "33333333333333333333333333333333"
 	installJobRun(fake, "default", "plain", id, base, cronruns.StateSucceeded)
-	fake.logs["default-plain-job"] = []byte(`{"MESSAGE":"own output","__REALTIME_TIMESTAMP":"1700000000000000"}`)
+	fake.logs["default_plain__job"] = []byte(`{"MESSAGE":"own output","__REALTIME_TIMESTAMP":"1700000000000000"}`)
 	ts, _ := newCronRunServer(t, fake)
 
 	body := jobBody("default", "plain")
