@@ -621,7 +621,8 @@ func (s *Server) shouldStartUnits() map[string]bool {
 	for _, pod := range s.config.Store.AllPods() {
 		// A bare pod that already ran to completion (restartPolicy Never or
 		// OnFailure) must not run again because its unit name changed.
-		if !isDeploymentOwned(pod) && (pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed) {
+		if !isDeploymentOwned(pod) && pod.Spec.RestartPolicy != "" && pod.Spec.RestartPolicy != corev1.RestartPolicyAlways &&
+			(pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed) {
 			continue
 		}
 		addPod(pod.Namespace, pod.Name, &pod.Spec, pod.Annotations)
@@ -697,7 +698,8 @@ func (s *Server) EnsureWorkloadsStarted() int {
 	for _, pod := range s.config.Store.AllPods() {
 		// A bare pod that already ran to completion (restartPolicy Never or
 		// OnFailure) must not run again because its unit name changed.
-		if !isDeploymentOwned(pod) && (pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed) {
+		if !isDeploymentOwned(pod) && pod.Spec.RestartPolicy != "" && pod.Spec.RestartPolicy != corev1.RestartPolicyAlways &&
+			(pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed) {
 			continue
 		}
 		addPod(pod.Namespace, pod.Name, &pod.Spec, pod.Annotations)
@@ -731,7 +733,7 @@ func (s *Server) EnsureWorkloadsStarted() int {
 	}
 	started := len(sockets) + len(services)
 	if started > 0 {
-		fmt.Printf("names migration: started %d workload unit(s) after an interrupted upgrade\n", started)
+		fmt.Printf("names migration: ensured %d workload unit(s) are started\n", started)
 	}
 	return started
 }

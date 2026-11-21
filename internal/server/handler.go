@@ -4376,7 +4376,12 @@ func (s *Server) ReconcileQuadlets() {
 			s.markPodWaitingForClaim(pod.Namespace, pod.Name, claim, message)
 			continue
 		}
-		wasMissing := missing(f)
+		// A bare pod that already ran to completion (restartPolicy Never or
+		// OnFailure) gets its file back but is not started again: a missing
+		// file (a wiped quadlet dir, or the names migration) must not rerun it.
+		finished := pod.Spec.RestartPolicy != "" && pod.Spec.RestartPolicy != corev1.RestartPolicyAlways &&
+			(pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed)
+		wasMissing := missing(f) && !finished
 		resolved, envFile, err := s.resolveEnvFrom(pod)
 		if err != nil {
 			fmt.Printf("reconcile pod %s/%s: %v\n", pod.Namespace, pod.Name, err)

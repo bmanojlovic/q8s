@@ -21,9 +21,12 @@ func preparePVCUpdate(existing, updated *corev1.PersistentVolumeClaim) bool {
 	// A bound claim's volume name is immutable, as in Kubernetes. It names
 	// the Podman volume that holds the data and the renderer trusts it, so a
 	// client must not be able to repoint a claim at another volume.
-	if existing.Spec.VolumeName != "" {
-		updated.Spec.VolumeName = existing.Spec.VolumeName
-	}
+	// Both are always taken from the stored claim, even when empty: a hostpath
+	// claim has no volumeName, and letting an update set one (or switch the
+	// class) would let it adopt a legacy volume name another namespace owns.
+	// Kubernetes treats both fields as immutable as well.
+	updated.Spec.VolumeName = existing.Spec.VolumeName
+	updated.Spec.StorageClassName = existing.Spec.StorageClassName
 	updated.DeletionTimestamp = existing.DeletionTimestamp
 	if existing.DeletionTimestamp == nil {
 		return false

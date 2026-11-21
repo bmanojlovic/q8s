@@ -1296,7 +1296,14 @@ func expectedLegacyArtifacts(env Env, st *store.Store) legacyArtifacts {
 		if pvcUsesHostPath(claim) {
 			continue
 		}
+		// A claim bound before the new names keeps its legacy volume and
+		// .volume file for good (spec.volumeName); that file is in use, not a
+		// leftover. Only a claim bound to the new name can leave a legacy
+		// file behind.
 		base := names.LegacyHost(names.KindPVCVolume, claim.Namespace, claim.Name)
+		if claim.Spec.VolumeName == "" || claim.Spec.VolumeName == base {
+			continue
+		}
 		addFile(env.Dirs.Quadlet, base+".volume", base+"-volume.service")
 	}
 	for _, ing := range st.AllIngresses() {

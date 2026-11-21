@@ -474,3 +474,21 @@ func TestPVCUpdateKeepsBoundVolumeName(t *testing.T) {
 		t.Fatalf("volumeName = %q, want team_db", updated.Spec.VolumeName)
 	}
 }
+
+// TestPVCUpdateCannotSetVolumeNameOrClass: a hostpath claim (no volumeName)
+// cannot be switched to another class or given a volume name by an update.
+func TestPVCUpdateCannotSetVolumeNameOrClass(t *testing.T) {
+	hostpath := "hostpath"
+	existing := &corev1.PersistentVolumeClaim{Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: &hostpath}}
+	updated := existing.DeepCopy()
+	standard := "standard"
+	updated.Spec.StorageClassName = &standard
+	updated.Spec.VolumeName = "team-prod-db"
+	preparePVCUpdate(existing, updated)
+	if updated.Spec.VolumeName != "" {
+		t.Fatalf("volumeName = %q, want empty", updated.Spec.VolumeName)
+	}
+	if updated.Spec.StorageClassName == nil || *updated.Spec.StorageClassName != "hostpath" {
+		t.Fatalf("storageClassName changed to %v", updated.Spec.StorageClassName)
+	}
+}
