@@ -3023,22 +3023,29 @@ func (s *Server) handleNamespaceCreate(w http.ResponseWriter, r *http.Request) {
 // cleanupNamespaceResources stops every workload and removes every file a
 // namespace delete owns. The store delete follows after this cleanup, so a
 // failed final write leaves the objects in the store without restoring
-// anything that was stopped.
-func (s *Server) cleanupNamespaceResources(ns string) {
+// anything that was stopped. It returns the pod specs of the stopped
+// workloads, so the caller can stop volume units of claims that the namespace
+// delete removes from the store; see stopOrphanedPVCVolumeUnits.
+func (s *Server) cleanupNamespaceResources(ns string) []corev1.PodSpec {
+	var specs []corev1.PodSpec
 	for _, pod := range s.config.Store.Pods(ns) {
+		specs = append(specs, pod.Spec)
 		s.stopPodUnit(pod)
 		s.removePodSockets(ns, pod.Name)
 		s.removePodQuadlet(pod)
 	}
 	for _, dep := range s.config.Store.Deployments(ns) {
+		specs = append(specs, dep.Spec.Template.Spec)
 		s.stopDeploymentUnits(dep)
 		s.removeDeploymentQuadlets(dep)
 	}
 	for _, job := range s.config.Store.Jobs(ns) {
+		specs = append(specs, job.Spec.Template.Spec)
 		s.stopJobUnit(job)
 		s.removeJobQuadlet(job)
 	}
 	for _, cj := range s.config.Store.CronJobs(ns) {
+		specs = append(specs, cj.Spec.JobTemplate.Spec.Template.Spec)
 		s.removeCronJobQuadlets(cj)
 	}
 	for _, cm := range s.config.Store.ConfigMaps(ns) {
@@ -3084,6 +3091,7 @@ func (s *Server) cleanupNamespaceResources(ns string) {
 	// owner left once the namespace is gone. PVC volumes are deliberately
 	// kept: their data is never deleted automatically.
 	s.removeNamespaceEmptyDirVolumes(ns)
+	return specs
 }
 
 // removeLegacyServiceSockets deletes per-port .socket files that very old
@@ -3155,11 +3163,15 @@ func (s *Server) handleNamespaceDelete(w http.ResponseWriter, r *http.Request, n
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
 		return
 	}
-	s.cleanupNamespaceResources(name)
+	specs := s.cleanupNamespaceResources(name)
 	if err := s.config.Store.DeleteNamespaceWithResources(name); err != nil {
 		s.respondStoreError(w, deleteStoreError("namespace", name, err), http.StatusNotFound, "NotFound")
 		return
 	}
+	// The namespace objects are out of the store now, so the claim-user check
+	// sees no user left in it. A claim force-deleted while its pod still used
+	// it kept its volume unit running; stop it now that the last user is gone.
+	s.stopOrphanedPVCVolumeUnits(name, specs...)
 	// Disconnect and re-render before the network unit disappears: podman
 	// refuses to remove a network while containers are still joined to it.
 	s.detachNamespaceNetwork(name)
@@ -4922,6 +4934,41 @@ func (s *Server) removePVCVolumeAfterWorkloads(pvc *corev1.PersistentVolumeClaim
 	s.removePVCVolumeFile(pvc)
 }
 
+// stopOrphanedPVCVolumeUnits stops the volume unit of every claim one of the
+// stopped workloads mounts that is no longer in the store and has no user
+// left. When an update removes the protection finalizer from a Terminating
+// claim that a pod still uses, removePVCVolume keeps the volume unit running
+// because the pod's container unit Requires= it. Deleting that pod leaves the
+// claim gone from the store, so neither FinishTerminatingPVCs nor namespace
+// cleanup can find it again, and the unit would stay loaded as "not-found
+// active exited". Call this after the workload's units are stopped and its
+// store object is gone, so pvcClaimUser sees only the remaining users.
+// A claim deleted from the store no longer carries its storage class, so a
+// hostpath claim is indistinguishable here: stopping a unit that was never
+// generated is harmless.
+func (s *Server) stopOrphanedPVCVolumeUnits(ns string, specs ...corev1.PodSpec) {
+	seen := make(map[string]bool)
+	for _, spec := range specs {
+		for _, vol := range spec.Volumes {
+			if vol.PersistentVolumeClaim == nil {
+				continue
+			}
+			claim := vol.PersistentVolumeClaim.ClaimName
+			if claim == "" || seen[claim] {
+				continue
+			}
+			seen[claim] = true
+			if _, err := s.config.Store.GetPVC(ns, claim); err == nil {
+				continue
+			}
+			if _, _, used := s.pvcClaimUser(ns, claim); used {
+				continue
+			}
+			s.stopUnit(pvcVolumeUnitName(ns, claim))
+		}
+	}
+}
+
 // pvcVolumeUnitName is the systemd unit quadlet generates from a .volume file.
 func pvcVolumeUnitName(ns, name string) string {
 	return fmt.Sprintf("%s-%s-volume.service", ns, name)
@@ -5718,6 +5765,7 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 		// ingress backends (selector-driven) would keep routing to a
 		// scaled-down replica that no longer exists.
 		s.config.Store.DeletePod(dep.Namespace, instanceName)
+		s.stopOrphanedPVCVolumeUnits(dep.Namespace, dep.Spec.Template.Spec)
 		// The volume belongs to that replica's incarnation. The container is
 		// stopped and removed above, so Podman can remove it now.
 		s.removeEmptyDirVolumes(volumes)
@@ -6590,6 +6638,7 @@ func (s *Server) deletePodByName(ns, name string) error {
 	if err := s.config.Store.DeletePod(ns, name); err != nil {
 		return deleteStoreError("pod", name, err)
 	}
+	s.stopOrphanedPVCVolumeUnits(ns, pod.Spec)
 	if !podSharesWorkloadEmptyDir(pod) {
 		s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNames(pod))
 	}
@@ -6749,6 +6798,7 @@ func (s *Server) deleteDeploymentByName(ns, name string) error {
 	if err := s.config.Store.DeleteDeploymentWithPods(ns, name, podNames); err != nil {
 		return deleteStoreError("deployment", name, err)
 	}
+	s.stopOrphanedPVCVolumeUnits(ns, dep.Spec.Template.Spec)
 	s.removeEmptyDirVolumes(replicaVolumes)
 	s.regenerateIngressConfigs(dep.Namespace)
 	return nil
@@ -6764,6 +6814,7 @@ func (s *Server) deleteJobByName(ns, name string) error {
 	if err := s.config.Store.DeleteJob(ns, name); err != nil {
 		return deleteStoreError("job", name, err)
 	}
+	s.stopOrphanedPVCVolumeUnits(ns, job.Spec.Template.Spec)
 	s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNamesForSpec(job.Namespace, job.Name, &job.Spec.Template.Spec))
 	return nil
 }
@@ -6777,6 +6828,7 @@ func (s *Server) deleteCronJobByName(ns, name string) error {
 	if err := s.config.Store.DeleteCronJob(ns, name); err != nil {
 		return deleteStoreError("cronjob", name, err)
 	}
+	s.stopOrphanedPVCVolumeUnits(ns, cj.Spec.JobTemplate.Spec.Template.Spec)
 	s.removeEmptyDirVolumes(quadlet.EmptyDirVolumeNamesForSpec(cj.Namespace, cj.Name, &cj.Spec.JobTemplate.Spec.Template.Spec))
 	return nil
 }
