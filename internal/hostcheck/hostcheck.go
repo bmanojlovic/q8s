@@ -17,7 +17,9 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -68,6 +70,7 @@ type Env struct {
 	User     string // login name, for /etc/subuid lookup in rootless
 	Kernel   string // uname -r
 	ReadFile func(path string) ([]byte, error)
+	ReadDir  func(path string) ([]os.DirEntry, error)
 	Command  func(name string, args ...string) ([]byte, error) // stdout only
 	FSType   func(path string) (string, error)                 // "ext4","xfs","btrfs","tmpfs","overlay","zfs","nfs","other:0x..."
 	Writable func(path string) bool
@@ -104,6 +107,17 @@ func (e Env) readFile(path string) ([]byte, error) {
 		return nil, fmt.Errorf("no file reader")
 	}
 	return e.ReadFile(path)
+}
+
+func (e Env) readDir(path string) ([]os.DirEntry, error) {
+	if e.ReadDir == nil {
+		// Unlike the other host hooks, a directory listing has no useful
+		// fake default. Callers that only need the read-only store can leave
+		// it nil and still get the real listing, which is what `q8s doctor`
+		// uses.
+		return os.ReadDir(path)
+	}
+	return e.ReadDir(path)
 }
 
 func (e Env) command(name string, args ...string) ([]byte, error) {
@@ -175,6 +189,7 @@ func Run(env Env) Report {
 	r.Checks = append(r.Checks, checkDiskSpace(env))
 	r.Checks = append(r.Checks, checkOrphanedVolumes(env))
 	r.Checks = append(r.Checks, checkNetworks(env))
+	r.Checks = append(r.Checks, checkOrphanedEnvFiles(env))
 
 	r.Summary = buildSummary(env, r.Checks, certInfo)
 	if r.Summary == nil {
@@ -1015,6 +1030,122 @@ func checkNetworks(env Env) Check {
 	c.Status = StatusWarn
 	c.Detail = fmt.Sprintf("%d network(s) no stored namespace uses: %s", len(found), strings.Join(found, ", "))
 	c.Loss = "a stale network keeps its subnet, and a namespace created later with the same name silently reuses it"
+	c.Fix = strings.Join(fix, "\n")
+	return c
+}
+
+// expectedEnvFiles returns the EnvironmentFile names under {secretDir}/{ns}/_env
+// that the stored workloads still own. Deployment instances are listed from
+// spec.replicas as well as from any stored replica Pod, so a replica Pod that
+// has not been materialized yet does not make its env file look orphaned.
+func expectedEnvFiles(st *store.Store) map[string]bool {
+	expected := make(map[string]bool)
+	add := func(ns, base string) {
+		expected[filepath.Join(ns, quadlet.EnvFileName(base))] = true
+	}
+	for _, pod := range st.AllPods() {
+		add(pod.Namespace, pod.Name)
+	}
+	for _, dep := range st.AllDeployments() {
+		for i := int32(0); i < quadlet.DeploymentReplicaCount(dep); i++ {
+			add(dep.Namespace, quadlet.DeploymentInstanceName(dep.Name, i))
+		}
+	}
+	for _, job := range st.AllJobs() {
+		add(job.Namespace, quadlet.JobEnvBaseName(job.Name))
+	}
+	for _, cj := range st.AllCronJobs() {
+		add(cj.Namespace, quadlet.CronJobEnvBaseName(cj.Name))
+	}
+	return expected
+}
+
+// checkOrphanedEnvFiles lists Secret-derived EnvironmentFiles below
+// {secretDir}/{ns}/_env that no stored Pod, Deployment replica, Job or CronJob
+// owns anymore. It is report only: it never removes a file, it prints the `rm`
+// command an administrator can run. Deleting a workload removes its env file,
+// but a crash, an older q8s version or a failed remove can leave one behind,
+// and such a file still holds the Secret values of a workload that is gone.
+func checkOrphanedEnvFiles(env Env) Check {
+	c := Check{ID: "env-files", Title: "secret env files"}
+	if env.Dirs.Data == "" {
+		c.Status = StatusInfo
+		c.Detail = "skipped: no data directory"
+		return c
+	}
+	if env.Dirs.Secret == "" {
+		c.Status = StatusInfo
+		c.Detail = "skipped: no secrets directory"
+		return c
+	}
+	storeFile := filepath.Join(env.Dirs.Data, "store.json")
+	data, err := env.readFile(storeFile)
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + storeFile + ": " + err.Error()
+		return c
+	}
+	st, err := store.LoadReadOnly(data)
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + storeFile + ": " + err.Error()
+		return c
+	}
+
+	expected := expectedEnvFiles(st)
+	namespaces, err := env.readDir(env.Dirs.Secret)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.Status = StatusOK
+			c.Detail = "no secret directory"
+			c.Gain = "no stale Secret-derived environment file takes disk space"
+			return c
+		}
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + env.Dirs.Secret + ": " + err.Error()
+		return c
+	}
+	sort.Slice(namespaces, func(i, j int) bool { return namespaces[i].Name() < namespaces[j].Name() })
+
+	var found, fix []string
+	for _, namespace := range namespaces {
+		if !namespace.IsDir() || strings.HasPrefix(namespace.Name(), ".") {
+			continue
+		}
+		ns := namespace.Name()
+		envDir := filepath.Join(env.Dirs.Secret, ns, "_env")
+		entries, err := env.readDir(envDir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			c.Status = StatusInfo
+			c.Detail = "skipped: cannot read " + envDir + ": " + err.Error()
+			return c
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		for _, entry := range entries {
+			if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			key := filepath.Join(ns, entry.Name())
+			if expected[key] {
+				continue
+			}
+			found = append(found, key+" (no stored workload uses it)")
+			fix = append(fix, "rm "+filepath.Join(envDir, entry.Name()))
+		}
+	}
+
+	if len(found) == 0 {
+		c.Status = StatusOK
+		c.Detail = "no orphaned secret env files"
+		c.Gain = "no stale Secret-derived environment file takes disk space"
+		return c
+	}
+	c.Status = StatusWarn
+	c.Detail = fmt.Sprintf("%d env file(s) no stored workload uses: %s", len(found), strings.Join(found, ", "))
+	c.Loss = "a stale env file still holds the Secret values of a workload that no longer exists"
 	c.Fix = strings.Join(fix, "\n")
 	return c
 }

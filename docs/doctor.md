@@ -9,9 +9,9 @@ changes a setting. The only external commands it runs are `podman version`,
 `podman network ls` (for the orphaned networks check),
 `systemctl` (rootful only, for firewalld state), and (rootless only)
 `loginctl` through `install.LingerEnabled`. Everything else is a read of an
-existing file or a `statfs` call. The orphaned volumes check reads
-`<data dir>/store.json` read-only: it takes no lock and writes nothing, so it
-is safe while `q8s serve` is running.
+existing file or directory, or a `statfs` call. The orphaned volumes, networks
+and env-file checks read `<data dir>/store.json` read-only: they take no lock
+and write nothing, so they are safe while `q8s serve` is running.
 
 ```sh
 q8s doctor          # human report
@@ -292,4 +292,15 @@ in scripts:
 
 `podman`, `kernel`, `userns`, `idmap`, `linger` (rootless only), `cgroups`,
 `network`, `firewall-reload` (rootful only), `certificates`, `traefik-dir`,
-`disk`, `volumes`, `networks`.
+`disk`, `volumes`, `networks`, `env-files`.
+
+### `env-files`
+
+Reports Secret-derived EnvironmentFiles below `<secret dir>/<namespace>/_env`
+that no stored Pod, Deployment replica, Job or CronJob owns anymore. It never
+deletes anything; each `fix:` line is the `rm <path>` command an administrator
+can run. The expected names are built with the same helpers the server uses
+for pod, Job and CronJob env files, and a Deployment replica is expected for
+every index up to `spec.replicas`. A file left by a deleted workload still
+holds that workload's Secret values, so it is reported even though nothing
+reads it.

@@ -182,6 +182,17 @@ func writeQuadletFile(dir, filename string, content []byte) error {
 	return fsutil.WriteFileAtomic(filepath.Join(dir, filename), content, 0644)
 }
 
+// writeQuadletFileIfChanged writes a quadlet file only when its bytes differ
+// from what is already on disk. Timer files carry no template-hash label, so
+// the tracked writer would rewrite one on every CronJob render; comparing the
+// content keeps an unchanged timer's mtime and avoids a needless reload.
+func writeQuadletFileIfChanged(dir, filename string, content []byte) (bool, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return false, err
+	}
+	return fsutil.WriteFileAtomicIfChanged(filepath.Join(dir, filename), content, 0644)
+}
+
 func (s *Server) rv() string {
 	return fmt.Sprintf("%d", s.config.Store.ResourceVersion())
 }
@@ -1918,6 +1929,10 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			return
 		}
 		s.writeConfigMapFiles(created)
+		// Release the ConfigMap lock before refreshing CronJobs: objlock.go
+		// orders CronJob before ConfigMap, so the refresh must not run under
+		// this lock. The shared Namespace lock is still held.
+		s.unlockAndRefreshCronJobs(unlock, ns, "", created.Name)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPut:
 		unlock := s.lockObject("ConfigMap", ns, name)
@@ -1957,6 +1972,8 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			return
 		}
 		s.writeConfigMapFiles(updated)
+		// See the POST branch: unlock before the CronJob refresh.
+		s.unlockAndRefreshCronJobs(unlock, ns, "", updated.Name)
 		encode(w, updated, http.StatusOK)
 	case http.MethodPatch:
 		unlock := s.lockObject("ConfigMap", ns, name)
@@ -2026,6 +2043,8 @@ func (s *Server) handleConfigMaps(w http.ResponseWriter, r *http.Request, ns, na
 			return
 		}
 		s.writeConfigMapFiles(updated)
+		// See the POST branch: unlock before the CronJob refresh.
+		s.unlockAndRefreshCronJobs(unlock, ns, "", updated.Name)
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
 		if name == "" {
@@ -2118,6 +2137,10 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 			return
 		}
 		s.writeSecretFiles(created)
+		// Release the Secret lock before refreshing CronJobs: objlock.go
+		// orders CronJob before Secret, so the refresh must not run under
+		// this lock. The shared Namespace lock is still held.
+		s.unlockAndRefreshCronJobs(unlock, ns, created.Name, "")
 		encode(w, created, http.StatusCreated)
 	case http.MethodPatch:
 		unlock := s.lockObject("Secret", ns, name)
@@ -2192,6 +2215,8 @@ func (s *Server) handleSecrets(w http.ResponseWriter, r *http.Request, ns, name 
 		}
 		s.removeStaleSecretFiles(updated)
 		s.writeSecretFiles(updated)
+		// See the POST branch: unlock before the CronJob refresh.
+		s.unlockAndRefreshCronJobs(unlock, ns, updated.Name, "")
 		encode(w, updated, http.StatusOK)
 	case http.MethodDelete:
 		if name == "" {
@@ -4792,6 +4817,7 @@ func (s *Server) startUnit(name string) {
 }
 
 func (s *Server) removePodQuadlet(pod *corev1.Pod) {
+	s.removeEnvFile(pod.Namespace, pod.Name)
 	if s.config.QuadletDir == "" {
 		return
 	}
@@ -5006,6 +5032,7 @@ func (s *Server) stopJobUnit(job *batchv1.Job) {
 }
 
 func (s *Server) removeJobQuadlet(job *batchv1.Job) {
+	s.removeEnvFile(job.Namespace, quadlet.JobEnvBaseName(job.Name))
 	if s.config.QuadletDir == "" {
 		return
 	}
@@ -5052,12 +5079,30 @@ func (s *Server) deployCronJobQuadlets(cj *batchv1.CronJob, start bool) bool {
 		return false
 	}
 	containerFile := fmt.Sprintf("%s-%s-cron.container", cj.Namespace, cj.Name)
-	if _, err := writeQuadletFilesTracked(quadletDir, map[string][]byte{containerFile: containerContent}); err != nil {
+	containerChanged, err := writeQuadletFilesTracked(quadletDir, map[string][]byte{containerFile: containerContent})
+	if err != nil {
 		fmt.Printf("write %s: %v\n", containerFile, err)
 		return false
 	}
 	timerFile := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
-	if !start || cronJobSuspended(cj) {
+	if !start {
+		// The render-only path (a claim that appeared, or a Secret or
+		// ConfigMap refresh) must not start or enable the timer and must
+		// not reload systemd when only the env file changed.
+		timerChanged, err := writeQuadletFileIfChanged(timerDir, timerFile, timerContent)
+		if err != nil {
+			fmt.Printf("write %s: %v\n", timerFile, err)
+			return false
+		}
+		if containerChanged[containerFile] || timerChanged {
+			if mgr := s.config.Manager; mgr != nil {
+				if err := mgr.DaemonReload(); err != nil {
+					fmt.Printf("daemon-reload: %v\n", err)
+					return false
+				}
+			}
+		}
+	} else if cronJobSuspended(cj) {
 		s.deployUnit(timerDir, timerFile, timerContent, "")
 	} else {
 		s.deployUnit(timerDir, timerFile, timerContent, timerFile)
@@ -5099,6 +5144,7 @@ func (s *Server) setCronTimerEnabled(cj *batchv1.CronJob) {
 }
 
 func (s *Server) removeCronJobQuadlets(cj *batchv1.CronJob) {
+	s.removeEnvFile(cj.Namespace, quadlet.CronJobEnvBaseName(cj.Name))
 	quadletDir := s.config.QuadletDir
 	if quadletDir == "" {
 		return
@@ -5641,6 +5687,7 @@ func (s *Server) removeDeploymentQuadlets(dep *appsv1.Deployment) {
 	for i := int32(0); i < deploymentReplicas(dep); i++ {
 		instanceName := quadlet.DeploymentInstanceName(dep.Name, i)
 		s.removePodSockets(dep.Namespace, instanceName)
+		s.removeEnvFile(dep.Namespace, instanceName)
 		if s.config.QuadletDir == "" {
 			continue
 		}
@@ -5664,6 +5711,7 @@ func (s *Server) scaleDeployment(dep *appsv1.Deployment, oldR, newR int32) {
 		volumes := s.replicaEmptyDirVolumes(dep, i)
 		s.stopPodByName(dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)
 		s.removePodSockets(dep.Namespace, instanceName)
+		s.removeEnvFile(dep.Namespace, instanceName)
 		s.reloadAfterRemove(podQuadletPaths(s.config.QuadletDir, dep.Namespace, instanceName, dep.Spec.Template.Spec.Containers)...)
 		// Remove the store pod immediately too. The reconcile loop would
 		// eventually prune it once the container disappears, but until then
@@ -6035,6 +6083,79 @@ func (s *Server) resolvedCronJobEnv(cj *batchv1.CronJob) (*batchv1.CronJob, stri
 	return resolved, envFile, nil
 }
 
+// podSpecUsesEnvSource reports whether a pod template reads a Secret or
+// ConfigMap through env[].valueFrom or envFrom[]. Only spec.containers is
+// checked because resolveContainerEnv resolves those containers into the
+// rendered quadlet and EnvironmentFile.
+func podSpecUsesEnvSource(spec *corev1.PodSpec, secretName, configMapName string) bool {
+	for _, c := range spec.Containers {
+		for _, env := range c.Env {
+			if env.ValueFrom == nil {
+				continue
+			}
+			if ref := env.ValueFrom.SecretKeyRef; ref != nil && secretName != "" && ref.Name == secretName {
+				return true
+			}
+			if ref := env.ValueFrom.ConfigMapKeyRef; ref != nil && configMapName != "" && ref.Name == configMapName {
+				return true
+			}
+		}
+		for _, envFrom := range c.EnvFrom {
+			if ref := envFrom.SecretRef; ref != nil && secretName != "" && ref.Name == secretName {
+				return true
+			}
+			if ref := envFrom.ConfigMapRef; ref != nil && configMapName != "" && ref.Name == configMapName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// unlockAndRefreshCronJobs releases a Secret or ConfigMap lock and only then
+// re-renders the CronJobs that read it. The object lock must be gone first
+// because objlock.go orders CronJob before Secret and ConfigMap; the caller
+// still holds the shared Namespace lock. unlock is idempotent, so the handler's
+// deferred unlock remains a harmless second call on an error path.
+func (s *Server) unlockAndRefreshCronJobs(unlock func(), ns, secretName, configMapName string) {
+	unlock()
+	s.refreshCronJobsUsingEnvSource(ns, secretName, configMapName)
+}
+
+// refreshCronJobsUsingEnvSource re-renders every CronJob in ns whose pod
+// template reads the named Secret or ConfigMap. Kubernetes resolves a Job
+// pod's env when the pod is created, so the next timer run must see the new
+// data; the CronJob's existing EnvironmentFile and .container quadlet are
+// therefore rewritten through renderCronJobQuadlets, which never starts a run
+// and leaves the timer state alone.
+//
+// The Secret and ConfigMap handlers call this only after releasing their own
+// object lock. objlock.go orders Namespace -> Deployment -> Pod -> CronJob ->
+// Job -> Service/PVC/ConfigMap/Secret; taking a CronJob lock while still
+// holding a Secret or ConfigMap lock would invert that order. The callers keep
+// the shared Namespace lock, and the CronJob is read again under its own lock
+// because another request may have changed it in the meantime.
+func (s *Server) refreshCronJobsUsingEnvSource(ns, secretName, configMapName string) {
+	if s.config.QuadletDir == "" {
+		return
+	}
+	var names []string
+	for _, cj := range s.config.Store.CronJobs(ns) {
+		if podSpecUsesEnvSource(&cj.Spec.JobTemplate.Spec.Template.Spec, secretName, configMapName) {
+			names = append(names, cj.Name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		unlock := s.lockObject("CronJob", ns, name)
+		cj, err := s.config.Store.GetCronJob(ns, name)
+		if err == nil && podSpecUsesEnvSource(&cj.Spec.JobTemplate.Spec.Template.Spec, secretName, configMapName) {
+			s.renderCronJobQuadlets(cj)
+		}
+		unlock()
+	}
+}
+
 // resolveContainerEnv resolves Env[i].ValueFrom.{ConfigMapKeyRef,SecretKeyRef}
 // and EnvFrom references in place. The quadlet generator only ever emits
 // env.Value verbatim, so an unresolved ValueFrom silently renders as an
@@ -6192,6 +6313,34 @@ func (s *Server) writeEnvFile(ns, name string, containers []corev1.Container, se
 		return "", fmt.Errorf("write env file %s: %w", path, err)
 	}
 	return path, nil
+}
+
+// envFilePath returns the Secret-derived EnvironmentFile of the workload whose
+// generated pod-name base is base, or "" when no secrets directory is
+// configured. The caller builds base with quadlet.EnvFileName's callers:
+// pod.Name for a pod, quadlet.JobEnvBaseName and quadlet.CronJobEnvBaseName
+// for those workloads.
+func (s *Server) envFilePath(ns, base string) string {
+	secretDir := s.secretBaseDir()
+	if secretDir == "" {
+		return ""
+	}
+	return filepath.Join(secretDir, ns, "_env", quadlet.EnvFileName(base))
+}
+
+// removeEnvFile deletes a deleted workload's Secret-derived EnvironmentFile.
+// It is best effort, like the quadlet removal around it: the object is already
+// gone from the store, so a leftover file is only disk clutter, and the doctor
+// env-file check reports one that remains. Never removes a running workload's
+// file: every caller runs on a delete or scale-down path.
+func (s *Server) removeEnvFile(ns, base string) {
+	path := s.envFilePath(ns, base)
+	if path == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		fmt.Printf("remove env file %s: %v\n", path, err)
+	}
 }
 
 // backendTarget is one pod/container port a Service selector resolves to.

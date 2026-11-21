@@ -487,6 +487,7 @@ func cmdDoctor() {
 		User:     username,
 		Kernel:   kernel,
 		ReadFile: os.ReadFile,
+		ReadDir:  os.ReadDir,
 		Command: func(name string, args ...string) ([]byte, error) {
 			return exec.Command(name, args...).Output()
 		},

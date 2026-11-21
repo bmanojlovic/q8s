@@ -26,6 +26,12 @@ A ServiceAccount is only an identity: q8s stores no token Secret for it and
 runs no token controller. See
 [ServiceAccounts in pods](rbac.md#serviceaccounts-in-pods).
 
+A Secret or ConfigMap change reaches the next CronJob run: q8s re-renders the
+CronJob's EnvironmentFile and `.container` unit when a Secret or ConfigMap it
+reads through `env[].valueFrom` or `envFrom[]` changes, without starting a run
+or changing a suspended timer. Pods, Deployments and running Jobs keep their
+environment until they are recreated, as in Kubernetes.
+
 A `restartPolicy: Never` pod whose container exits quickly reaches
 `Succeeded`. q8s compares the unit's `ExecMainStartTimestamp` with the pod's
 creation time, so a unit that ran for this pod is not mistaken for one that
