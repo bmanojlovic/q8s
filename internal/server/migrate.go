@@ -737,3 +737,27 @@ func (s *Server) EnsureWorkloadsStarted() int {
 	}
 	return started
 }
+
+// FinishedWorkloadsRerunByLegacy lists the finished Jobs and finished bare
+// pods (restartPolicy Never or OnFailure) on this host. The previous release
+// starts every workload whose quadlet file is missing, so after a rollback
+// with --to-legacy it runs each of these once more. The rollback command
+// prints them so the operator can delete them first if a second run matters.
+func (s *Server) FinishedWorkloadsRerunByLegacy() []string {
+	var out []string
+	for _, job := range s.config.Store.AllJobs() {
+		if jobFinished(job) {
+			out = append(out, "Job "+job.Namespace+"/"+job.Name)
+		}
+	}
+	for _, pod := range s.config.Store.AllPods() {
+		if isDeploymentOwned(pod) || pod.Spec.RestartPolicy == "" || pod.Spec.RestartPolicy == corev1.RestartPolicyAlways {
+			continue
+		}
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			out = append(out, "Pod "+pod.Namespace+"/"+pod.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}

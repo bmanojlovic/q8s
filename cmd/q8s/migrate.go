@@ -127,6 +127,14 @@ func runMigrateNames(opts migrateNamesOptions, srv *server.Server, serveActive f
 			return fmt.Errorf("%d PVC(s) use a new-format volume", len(claims))
 		}
 		plan := srv.PlanNewNamesRollback()
+		if rerun := srv.FinishedWorkloadsRerunByLegacy(); len(rerun) > 0 {
+			fmt.Fprintln(out, "Note: the previous release starts every workload whose file is missing,")
+			fmt.Fprintln(out, "so these finished workloads will run once more after the rollback:")
+			for _, w := range rerun {
+				fmt.Fprintf(out, "  %s\n", w)
+			}
+			fmt.Fprintln(out, "Delete them first if a second run matters.")
+		}
 		if opts.dryRun {
 			fmt.Fprintln(out, "Dry run: q8s migrate-names --to-legacy would remove:")
 			plan.Print(out)

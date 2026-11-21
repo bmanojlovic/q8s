@@ -81,6 +81,11 @@ the `.volume` files of legacy claims. Afterwards it prints the next step:
 install the previous q8s binary and start it. That release writes the old
 files and starts the old units from the same store.
 
+The previous release starts every workload whose quadlet file is missing,
+so it runs finished Jobs and finished pods with `restartPolicy: Never` or
+`OnFailure` once more. `--to-legacy` lists them; delete them before the
+rollback if a second run matters.
+
 Do not start the previous release before running `--to-legacy`: the old
 release does not know the new names and can leave new-format containers and
 files behind.
