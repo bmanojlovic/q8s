@@ -779,6 +779,7 @@ func cmdServe() {
 	ensureNamespaceNetworks(d.quadletDir, mgr, st)
 	srv.ReconcileQuadlets()
 	srv.StartPodsWaitingForClaims()
+	srv.FinishTerminatingPVCs()
 	srv.ReconcileNetworkAttachments()
 	srv.ReconcileIngressConfigs()
 	reconcilePodmanPods(st, mgr)
@@ -786,7 +787,7 @@ func cmdServe() {
 	if mgr != nil {
 		syncCtx, stopSync := context.WithCancel(context.Background())
 		defer stopSync()
-		go syncLoop(syncCtx, st, mgr, mode, d.quadletDir, srv.RegenerateIngressConfigs, srv.StartPodsWaitingForClaims)
+		go syncLoop(syncCtx, st, mgr, mode, d.quadletDir, srv.RegenerateIngressConfigs, srv.StartPodsWaitingForClaims, srv.FinishTerminatingPVCs)
 	}
 
 	daemon.SdNotify(false, daemon.SdNotifyReady)
@@ -1224,7 +1225,7 @@ func syncUnitMatcher(quadletDir string, ids *atomic.Pointer[map[string]struct{}]
 // Unit changes arrive over a dedicated D-Bus connection to systemd: no child
 // process is started and the journal is never read, so a host with a large
 // journal costs q8s nothing extra.
-func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string, backendsChanged func(ns string), startPodsWaitingForClaims func()) {
+func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode systemd.Mode, quadletDir string, backendsChanged func(ns string), startPodsWaitingForClaims, finishTerminatingPVCs func()) {
 	// Podman runs each health check as a transient systemd unit whose name
 	// carries the container ID (see healthCheckContainerID). Which containers
 	// are worth watching is recomputed after every reconcile pass, because it
@@ -1244,6 +1245,11 @@ func syncLoop(ctx context.Context, st *store.Store, mgr *systemd.Manager, mode s
 			// Retry pods held back by a missing claim. The callback walks
 			// the in-memory store and does nothing when no pod is waiting.
 			startPodsWaitingForClaims()
+		}
+		if finishTerminatingPVCs != nil {
+			// Complete claims whose last user went away. The callback walks
+			// the in-memory store and does nothing when no claim is Terminating.
+			finishTerminatingPVCs()
 		}
 		after := st.AllPods()
 		ids := watchedHealthIDs(after, live, time.Now())

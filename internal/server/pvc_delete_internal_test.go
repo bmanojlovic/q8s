@@ -88,7 +88,7 @@ func TestDeleteUnusedPVCStopsVolumeUnitBeforeFileRemoval(t *testing.T) {
 	}
 }
 
-func TestDeletePVCUsedByPodKeepsVolumeUnitRunning(t *testing.T) {
+func TestDeletePVCUsedByPodMarksItTerminating(t *testing.T) {
 	srv, volumeFile := pvcDeleteServer(t, "demo", "data")
 	if _, err := srv.config.Store.CreatePod(podUsingClaim("demo", "app", "data")); err != nil {
 		t.Fatalf("CreatePod: %v", err)
@@ -104,12 +104,22 @@ func TestDeletePVCUsedByPodKeepsVolumeUnitRunning(t *testing.T) {
 	if len(stops) != 0 {
 		t.Errorf("volume unit was stopped while a pod uses the claim: %v", stops)
 	}
-	if _, err := os.Stat(volumeFile); !os.IsNotExist(err) {
-		t.Errorf("volume quadlet survived delete, stat err=%v", err)
+	if _, err := os.Stat(volumeFile); err != nil {
+		t.Errorf("volume quadlet was removed while the claim is Terminating: %v", err)
 	}
-	if !strings.Contains(logged, "leave demo-data-volume.service running") ||
-		!strings.Contains(logged, "Pod/app uses claim data") {
-		t.Errorf("no line about the left-running volume unit, output: %q", logged)
+	pvc, err := srv.config.Store.GetPVC("demo", "data")
+	if err != nil {
+		t.Fatalf("PVC was removed while a pod uses it: %v", err)
+	}
+	if pvc.DeletionTimestamp == nil {
+		t.Error("PVC has no deletionTimestamp")
+	}
+	if !pvcHasFinalizer(pvc, pvcProtectionFinalizer) {
+		t.Errorf("PVC finalizers = %v, want %q", pvc.Finalizers, pvcProtectionFinalizer)
+	}
+	if !strings.Contains(logged, "mark persistentvolumeclaim demo/data terminating") ||
+		!strings.Contains(logged, "Pod/app uses it") {
+		t.Errorf("no line about the Terminating claim, output: %q", logged)
 	}
 }
 

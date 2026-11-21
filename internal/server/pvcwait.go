@@ -28,39 +28,54 @@ func pvcWaitMessage(claim string) string {
 	return fmt.Sprintf("persistentvolumeclaim %q not found", claim)
 }
 
-// pvcWaitClaimFromMessage extracts the claim name from a pvcWaitMessage. The
-// exact shape is required so an arbitrary Unschedulable condition cannot be
-// mistaken for this server-owned marker.
-func pvcWaitClaimFromMessage(message string) (string, bool) {
-	const prefix = `persistentvolumeclaim "`
-	const suffix = `" not found`
-	if !strings.HasPrefix(message, prefix) || !strings.HasSuffix(message, suffix) {
-		return "", false
-	}
-	claim := strings.TrimSuffix(strings.TrimPrefix(message, prefix), suffix)
-	if claim == "" {
-		return "", false
-	}
-	return claim, true
+// pvcWaitDeletingMessage is the message Kubernetes uses for an unschedulable
+// pod whose claim is Terminating.
+func pvcWaitDeletingMessage(claim string) string {
+	return fmt.Sprintf("persistentvolumeclaim %q is being deleted", claim)
 }
 
-// podWaitingForClaim reports whether pod carries the in-memory marker set when
-// its unit was not rendered because a claim was missing.
-func podWaitingForClaim(pod *corev1.Pod) bool {
+// pvcWaitClaimFromMessage extracts the claim name from either wait message.
+// The exact shape is required so an arbitrary Unschedulable condition cannot
+// be mistaken for this server-owned marker.
+func pvcWaitClaimFromMessage(message string) (string, bool) {
+	const prefix = `persistentvolumeclaim "`
+	for _, suffix := range []string{`" not found`, `" is being deleted`} {
+		if !strings.HasPrefix(message, prefix) || !strings.HasSuffix(message, suffix) {
+			continue
+		}
+		claim := strings.TrimSuffix(strings.TrimPrefix(message, prefix), suffix)
+		if claim != "" {
+			return claim, true
+		}
+	}
+	return "", false
+}
+
+// pvcWaitClaimFromPod returns the claim whose wait marker pod carries.
+func pvcWaitClaimFromPod(pod *corev1.Pod) (string, bool) {
 	for _, c := range pod.Status.Conditions {
 		if c.Type != corev1.PodScheduled || c.Status != corev1.ConditionFalse || c.Reason != pvcWaitReason {
 			continue
 		}
-		if _, ok := pvcWaitClaimFromMessage(c.Message); ok {
-			return true
+		if claim, ok := pvcWaitClaimFromMessage(c.Message); ok {
+			return claim, true
 		}
 	}
-	return false
+	return "", false
 }
 
-// firstMissingClaim returns the first claim in spec that is not in the store.
-// The in-memory store is the only source: no quadlet file is read or stat'ed.
-func (s *Server) firstMissingClaim(ns string, spec corev1.PodSpec) (string, bool) {
+// podWaitingForClaim reports whether pod carries the in-memory marker set when
+// its unit was not rendered because a claim was missing or Terminating.
+func podWaitingForClaim(pod *corev1.Pod) bool {
+	_, ok := pvcWaitClaimFromPod(pod)
+	return ok
+}
+
+// firstMissingClaim returns the first claim in spec that cannot be mounted:
+// either it is not in the store or it is Terminating. The message matches the
+// reason, so the wait marker shows the same text a kubelet would. The
+// in-memory store is the only source: no quadlet file is read or stat'ed.
+func (s *Server) firstMissingClaim(ns string, spec corev1.PodSpec) (claim, message string, ok bool) {
 	seen := make(map[string]bool)
 	for _, vol := range spec.Volumes {
 		if vol.PersistentVolumeClaim == nil {
@@ -71,17 +86,21 @@ func (s *Server) firstMissingClaim(ns string, spec corev1.PodSpec) (string, bool
 			continue
 		}
 		seen[claim] = true
-		if _, err := s.config.Store.GetPVC(ns, claim); err != nil {
-			return claim, true
+		pvc, err := s.config.Store.GetPVC(ns, claim)
+		if err != nil {
+			return claim, pvcWaitMessage(claim), true
+		}
+		if pvc.DeletionTimestamp != nil {
+			return claim, pvcWaitDeletingMessage(claim), true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 // markPodWaitingForClaim records the unschedulable condition on the stored pod.
 // It is a store-only mutation so a create request can leave the pod visibly
 // waiting without touching systemd or the filesystem.
-func (s *Server) markPodWaitingForClaim(ns, name, claim string) {
+func (s *Server) markPodWaitingForClaim(ns, name, claim, message string) {
 	pod, err := s.config.Store.GetPod(ns, name)
 	if err != nil {
 		fmt.Printf("pvc wait: mark pod %s/%s: %v\n", ns, name, err)
@@ -100,7 +119,7 @@ func (s *Server) markPodWaitingForClaim(ns, name, claim string) {
 		Type:               corev1.PodScheduled,
 		Status:             corev1.ConditionFalse,
 		Reason:             pvcWaitReason,
-		Message:            pvcWaitMessage(claim),
+		Message:            message,
 		LastTransitionTime: now,
 	}
 	for i := range pod.Status.Conditions {
@@ -152,22 +171,28 @@ func (s *Server) clearPodWaitingForClaim(ns, name string) {
 	}
 }
 
-// jobWaitingForClaim reports whether job carries the same waiting marker in its
-// status conditions. Jobs have no Pod object in the store, so the condition is
-// kept on the Job until its unit is rendered.
-func jobWaitingForClaim(job *batchv1.Job) bool {
+// pvcWaitClaimFromJob returns the claim whose wait marker job carries.
+func pvcWaitClaimFromJob(job *batchv1.Job) (string, bool) {
 	for _, c := range job.Status.Conditions {
 		if string(c.Type) != string(corev1.PodScheduled) || c.Status != corev1.ConditionFalse || c.Reason != pvcWaitReason {
 			continue
 		}
-		if _, ok := pvcWaitClaimFromMessage(c.Message); ok {
-			return true
+		if claim, ok := pvcWaitClaimFromMessage(c.Message); ok {
+			return claim, true
 		}
 	}
-	return false
+	return "", false
 }
 
-func (s *Server) markJobWaitingForClaim(ns, name, claim string) {
+// jobWaitingForClaim reports whether job carries the same waiting marker in its
+// status conditions. Jobs have no Pod object in the store, so the condition is
+// kept on the Job until its unit is rendered.
+func jobWaitingForClaim(job *batchv1.Job) bool {
+	_, ok := pvcWaitClaimFromJob(job)
+	return ok
+}
+
+func (s *Server) markJobWaitingForClaim(ns, name, claim, message string) {
 	job, err := s.config.Store.GetJob(ns, name)
 	if err != nil {
 		fmt.Printf("pvc wait: mark job %s/%s: %v\n", ns, name, err)
@@ -178,7 +203,7 @@ func (s *Server) markJobWaitingForClaim(ns, name, claim string) {
 		Type:               batchv1.JobConditionType(corev1.PodScheduled),
 		Status:             corev1.ConditionFalse,
 		Reason:             pvcWaitReason,
-		Message:            pvcWaitMessage(claim),
+		Message:            message,
 		LastTransitionTime: now,
 	}
 	for i := range job.Status.Conditions {
@@ -327,8 +352,8 @@ func (s *Server) startWaitingPod(ns, name string) {
 		if err != nil || !podWaitingForClaim(pod) {
 			return
 		}
-		if claim, missing := s.firstMissingClaim(ns, pod.Spec); missing {
-			s.markPodWaitingForClaim(ns, name, claim)
+		if claim, message, missing := s.firstMissingClaim(ns, pod.Spec); missing {
+			s.markPodWaitingForClaim(ns, name, claim, message)
 			return
 		}
 		dep, err := s.config.Store.GetDeployment(ns, depName)
@@ -348,8 +373,8 @@ func (s *Server) startWaitingPod(ns, name string) {
 	if err != nil || !podWaitingForClaim(pod) {
 		return
 	}
-	if claim, missing := s.firstMissingClaim(ns, pod.Spec); missing {
-		s.markPodWaitingForClaim(ns, name, claim)
+	if claim, message, missing := s.firstMissingClaim(ns, pod.Spec); missing {
+		s.markPodWaitingForClaim(ns, name, claim, message)
 		return
 	}
 	s.generatePodQuadlet(pod)
@@ -364,8 +389,8 @@ func (s *Server) startWaitingJob(ns, name string) {
 	if err != nil || !jobWaitingForClaim(job) {
 		return
 	}
-	if claim, missing := s.firstMissingClaim(ns, job.Spec.Template.Spec); missing {
-		s.markJobWaitingForClaim(ns, name, claim)
+	if claim, message, missing := s.firstMissingClaim(ns, job.Spec.Template.Spec); missing {
+		s.markJobWaitingForClaim(ns, name, claim, message)
 		return
 	}
 	s.generateJobQuadlet(job)
@@ -380,7 +405,7 @@ func (s *Server) startWaitingCronJob(ns, name string) {
 	if err != nil || !cronJobWaitingForClaim(cj) {
 		return
 	}
-	if claim, missing := s.firstMissingClaim(ns, cj.Spec.JobTemplate.Spec.Template.Spec); missing {
+	if claim, _, missing := s.firstMissingClaim(ns, cj.Spec.JobTemplate.Spec.Template.Spec); missing {
 		s.markCronJobWaitingForClaim(ns, name, claim)
 		return
 	}

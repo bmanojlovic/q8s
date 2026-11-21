@@ -1749,7 +1749,70 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		if s.rejectHostAccess(w, r, "PersistentVolumeClaim", patched.Name, pvcHostAccessReasons(&patched)) {
 			return
 		}
+		if preparePVCUpdate(pvc, &patched) {
+			// Dropping the protection finalizer is an explicit request to
+			// finish the delete, even if a user appeared in between.
+			patched.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"}
+			patched.UID = pvc.UID
+			patched.CreationTimestamp = pvc.CreationTimestamp
+			if err := s.deletePVCAndVolume(pvc); err != nil {
+				s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
+				return
+			}
+			encode(w, &patched, http.StatusOK)
+			return
+		}
 		updated, err := s.config.Store.UpdatePVC(&patched)
+		if err != nil {
+			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
+			return
+		}
+		encode(w, updated, http.StatusOK)
+	case http.MethodPut:
+		unlock := s.lockObject("PersistentVolumeClaim", ns, name)
+		defer unlock()
+		existing, err := s.config.Store.GetPVC(ns, name)
+		if err != nil {
+			s.respondStatus(w, http.StatusNotFound, "NotFound", "%s", err.Error())
+			return
+		}
+		var pvc corev1.PersistentVolumeClaim
+		if !s.decodeOrRespond(w, r, &pvc) {
+			return
+		}
+		pvc.APIVersion = "v1"
+		pvc.Kind = "PersistentVolumeClaim"
+		if !s.objectIdentityMatchesURL(w, &pvc, ns, name) {
+			return
+		}
+		if err := validateName("namespace", pvc.Namespace); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateName("name", pvc.Name); err != nil {
+			s.respondStatus(w, http.StatusBadRequest, "Invalid", "%s", err.Error())
+			return
+		}
+		if err := validateLabels("metadata.labels", pvc.Labels); err != nil {
+			s.respondStatus(w, http.StatusUnprocessableEntity, "Invalid", "%s", err.Error())
+			return
+		}
+		if s.rejectHostAccess(w, r, "PersistentVolumeClaim", pvc.Name, pvcHostAccessReasons(&pvc)) {
+			return
+		}
+		if preparePVCUpdate(existing, &pvc) {
+			// Dropping the protection finalizer is an explicit request to
+			// finish the delete, even if a user appeared in between.
+			pvc.UID = existing.UID
+			pvc.CreationTimestamp = existing.CreationTimestamp
+			if err := s.deletePVCAndVolume(existing); err != nil {
+				s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
+				return
+			}
+			encode(w, &pvc, http.StatusOK)
+			return
+		}
+		updated, err := s.config.Store.UpdatePVC(&pvc)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 			return
@@ -1772,6 +1835,14 @@ func (s *Server) handlePVCs(w http.ResponseWriter, r *http.Request, ns, name str
 		}
 		if err := s.deleteObjectByName("PersistentVolumeClaim", ns, name, s.deletePVCByName); err != nil {
 			s.respondStoreError(w, err, http.StatusNotFound, "NotFound")
+			return
+		}
+		// A claim that is still Terminating is returned as the updated object,
+		// the way Kubernetes answers a DELETE of an object with finalizers.
+		// An immediate delete has nothing left to return, so keep the Status.
+		if pvc, err := s.config.Store.GetPVC(ns, name); err == nil && pvc.DeletionTimestamp != nil {
+			pvc.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"}
+			encode(w, pvc, http.StatusOK)
 			return
 		}
 		encode(w, &metav1.Status{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"}, Status: "Success"}, http.StatusOK)
@@ -4231,8 +4302,8 @@ func (s *Server) ReconcileQuadlets() {
 			s.syncInstancePod(pod)
 			// Only hold an instance that has no unit yet: a claim deleted
 			// under a running pod must not turn it Pending on restart.
-			if claim, missingClaim := s.firstMissingClaim(dep.Namespace, dep.Spec.Template.Spec); missingClaim && missing(f) {
-				s.markPodWaitingForClaim(dep.Namespace, instanceName, claim)
+			if claim, message, missingClaim := s.firstMissingClaim(dep.Namespace, dep.Spec.Template.Spec); missingClaim && missing(f) {
+				s.markPodWaitingForClaim(dep.Namespace, instanceName, claim, message)
 				continue
 			}
 			socketUnits, socketChanged := s.reconcilePodSockets(pod, instanceName)
@@ -4274,8 +4345,8 @@ func (s *Server) ReconcileQuadlets() {
 		if isDeploymentOwned(pod) {
 			continue
 		}
-		if claim, missingClaim := s.firstMissingClaim(pod.Namespace, pod.Spec); missingClaim && missing(f) {
-			s.markPodWaitingForClaim(pod.Namespace, pod.Name, claim)
+		if claim, message, missingClaim := s.firstMissingClaim(pod.Namespace, pod.Spec); missingClaim && missing(f) {
+			s.markPodWaitingForClaim(pod.Namespace, pod.Name, claim, message)
 			continue
 		}
 		wasMissing := missing(f)
@@ -4343,8 +4414,8 @@ func (s *Server) ReconcileQuadlets() {
 		// rendering (e.g. the UserNS size) reaches them; only a missing unit
 		// is started.
 		f := fmt.Sprintf("%s/%s-%s-job.container", quadletDir, job.Namespace, job.Name)
-		if claim, missingClaim := s.firstMissingClaim(job.Namespace, job.Spec.Template.Spec); missingClaim && missing(f) {
-			s.markJobWaitingForClaim(job.Namespace, job.Name, claim)
+		if claim, message, missingClaim := s.firstMissingClaim(job.Namespace, job.Spec.Template.Spec); missingClaim && missing(f) {
+			s.markJobWaitingForClaim(job.Namespace, job.Name, claim, message)
 			continue
 		}
 		jobUnit := ""
@@ -4372,7 +4443,7 @@ func (s *Server) ReconcileQuadlets() {
 	for _, cj := range s.config.Store.AllCronJobs() {
 		cf := fmt.Sprintf("%s/%s-%s-cron.container", quadletDir, cj.Namespace, cj.Name)
 		tf := fmt.Sprintf("%s/%s-%s-cron.timer", timerDir, cj.Namespace, cj.Name)
-		if claim, missingClaim := s.firstMissingClaim(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec); missingClaim && missing(cf) {
+		if claim, _, missingClaim := s.firstMissingClaim(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec); missingClaim && missing(cf) {
 			s.markCronJobWaitingForClaim(cj.Namespace, cj.Name, claim)
 			continue
 		}
@@ -4566,8 +4637,8 @@ func (s *Server) deployPodQuadlet(pod *corev1.Pod, restart bool) bool {
 	if s.config.QuadletDir == "" {
 		return false
 	}
-	if claim, missing := s.firstMissingClaim(pod.Namespace, pod.Spec); missing {
-		s.markPodWaitingForClaim(pod.Namespace, pod.Name, claim)
+	if claim, message, missing := s.firstMissingClaim(pod.Namespace, pod.Spec); missing {
+		s.markPodWaitingForClaim(pod.Namespace, pod.Name, claim, message)
 		return false
 	}
 	pod = s.applyNodePorts(pod)
@@ -4787,10 +4858,12 @@ func (s *Server) recordPVCEvent(pvc *corev1.PersistentVolumeClaim, eventType, re
 //
 // A container unit using Volume=<ns>-<pvc>.volume gets Requires= and After= on
 // this volume unit (generated by quadlet), so stopping it would stop every
-// running container that uses the claim. A single PVC delete therefore leaves
-// the unit running while a stored workload still mounts the claim; the file
-// removal and daemon-reload still happen, so a later restart fails visibly
-// instead of silently mounting a claim that is gone.
+// running container that uses the claim. removePVCVolume is the real delete
+// path: the claim is unused, the finish pass found no user, or an update
+// removed the protection finalizer. The claim-user check keeps the unit
+// running in that last case; the file removal and daemon-reload still happen,
+// so a later restart fails visibly instead of silently mounting a claim that
+// is gone.
 func (s *Server) removePVCVolume(pvc *corev1.PersistentVolumeClaim) {
 	if s.config.QuadletDir == "" {
 		return
@@ -4841,32 +4914,54 @@ func (s *Server) removePVCVolumeFile(pvc *corev1.PersistentVolumeClaim) {
 	s.reloadAfterRemove(filepath.Join(s.config.QuadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name)))
 }
 
-// pvcClaimUser returns the first stored workload in ns that mounts claim. The
-// API delete path uses it to keep a claim's volume unit running while a
-// container still depends on it: the generated container unit Requires= and
-// After= that volume unit, so stopping it would stop the container.
+// pvcClaimUser returns the first stored workload in ns that keeps a claim in
+// use. Users are computed from the in-memory store on every call, never
+// stored: a Deployment or CronJob template is not a user, only the Pods it
+// creates are, matching Kubernetes where only pods block PVC deletion. A Pod
+// that is finished or is itself waiting for this claim does not block, and a
+// Job blocks only until it has completed or failed.
 func (s *Server) pvcClaimUser(ns, claim string) (kind, name string, ok bool) {
 	for _, pod := range s.config.Store.Pods(ns) {
-		if podSpecUsesClaim(pod.Spec, claim) {
-			return "Pod", pod.Name, true
+		if !podSpecUsesClaim(pod.Spec, claim) {
+			continue
 		}
-	}
-	for _, dep := range s.config.Store.Deployments(ns) {
-		if podSpecUsesClaim(dep.Spec.Template.Spec, claim) {
-			return "Deployment", dep.Name, true
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
 		}
+		if waiting, ok := pvcWaitClaimFromPod(pod); ok && waiting == claim {
+			continue
+		}
+		return "Pod", pod.Name, true
 	}
 	for _, job := range s.config.Store.Jobs(ns) {
-		if podSpecUsesClaim(job.Spec.Template.Spec, claim) {
-			return "Job", job.Name, true
+		if !podSpecUsesClaim(job.Spec.Template.Spec, claim) {
+			continue
 		}
-	}
-	for _, cj := range s.config.Store.CronJobs(ns) {
-		if podSpecUsesClaim(cj.Spec.JobTemplate.Spec.Template.Spec, claim) {
-			return "CronJob", cj.Name, true
+		if jobFinished(job) {
+			continue
 		}
+		if waiting, ok := pvcWaitClaimFromJob(job); ok && waiting == claim {
+			continue
+		}
+		return "Job", job.Name, true
 	}
 	return "", "", false
+}
+
+// jobFinished reports whether job reached a terminal state. q8s has no Job
+// controller: the sync loop stores the unit result as Succeeded/Failed counts,
+// while CronJob run objects also carry the usual Complete/Failed condition.
+// Both forms must count, or a finished job would keep a claim forever.
+func jobFinished(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Status != corev1.ConditionTrue {
+			continue
+		}
+		if c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed {
+			return true
+		}
+	}
+	return job.Status.Succeeded > 0 || job.Status.Failed > 0
 }
 
 func podSpecUsesClaim(spec corev1.PodSpec, claim string) bool {
@@ -4882,8 +4977,8 @@ func (s *Server) generateJobQuadlet(job *batchv1.Job) bool {
 	if s.config.QuadletDir == "" {
 		return false
 	}
-	if claim, missing := s.firstMissingClaim(job.Namespace, job.Spec.Template.Spec); missing {
-		s.markJobWaitingForClaim(job.Namespace, job.Name, claim)
+	if claim, message, missing := s.firstMissingClaim(job.Namespace, job.Spec.Template.Spec); missing {
+		s.markJobWaitingForClaim(job.Namespace, job.Name, claim, message)
 		return false
 	}
 	resolved, envFile, err := s.resolvedJobEnv(job)
@@ -4933,7 +5028,7 @@ func (s *Server) deployCronJobQuadlets(cj *batchv1.CronJob, start bool) bool {
 	if quadletDir == "" {
 		return false
 	}
-	if claim, missing := s.firstMissingClaim(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec); missing {
+	if claim, _, missing := s.firstMissingClaim(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec); missing {
 		s.markCronJobWaitingForClaim(cj.Namespace, cj.Name, claim)
 		return false
 	}
@@ -5407,11 +5502,11 @@ func (s *Server) deployDeploymentInstance(dep *appsv1.Deployment, i int32, resta
 	}
 	instanceName := quadlet.DeploymentInstanceName(dep.Name, i)
 	pod := s.materializeDeploymentInstance(dep, i)
-	if claim, missing := s.firstMissingClaim(dep.Namespace, dep.Spec.Template.Spec); missing {
+	if claim, message, missing := s.firstMissingClaim(dep.Namespace, dep.Spec.Template.Spec); missing {
 		// Keep the instance visible to kubectl and carry the same
 		// PodScheduled=False marker a bare Pod uses.
 		s.syncInstancePod(pod)
-		s.markPodWaitingForClaim(dep.Namespace, instanceName, claim)
+		s.markPodWaitingForClaim(dep.Namespace, instanceName, claim, message)
 		return false
 	}
 	resolved, envFile, err := s.resolveEnvFrom(pod)
@@ -6441,14 +6536,31 @@ func (s *Server) deleteServiceByName(ns, name string) error {
 }
 
 func (s *Server) deletePVCByName(ns, name string) error {
-	pvc, _ := s.config.Store.GetPVC(ns, name)
-	if err := s.config.Store.DeletePVC(ns, name); err != nil {
+	pvc, err := s.config.Store.GetPVC(ns, name)
+	if err != nil {
 		return err
 	}
-	if pvc != nil {
-		s.removePVCVolume(pvc)
+	// A repeated DELETE of a Terminating claim is a no-op: the finish pass
+	// owns the real delete once the last user is gone.
+	if pvc.DeletionTimestamp != nil {
+		return nil
 	}
-	return nil
+	if kind, user, used := s.pvcClaimUser(ns, name); used {
+		// Protect the claim the way Kubernetes does: mark it Terminating and
+		// keep the finalizer, the volume unit and the .volume file. The finish
+		// pass deletes it when the last user is gone.
+		fmt.Printf("mark persistentvolumeclaim %s/%s terminating: %s/%s uses it\n",
+			ns, name, kind, user)
+		terminating := pvc.DeepCopy()
+		now := metav1.Now()
+		terminating.DeletionTimestamp = &now
+		addPVCFinalizer(terminating, pvcProtectionFinalizer)
+		if _, err := s.config.Store.UpdatePVC(terminating); err != nil {
+			return err
+		}
+		return nil
+	}
+	return s.deletePVCAndVolume(pvc)
 }
 
 func (s *Server) deleteConfigMapByName(ns, name string) error {

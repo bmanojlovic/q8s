@@ -1998,15 +1998,18 @@ func (s *Store) UpdatePodRestartInfo(ns, name string, restartCount int32, exitCo
 }
 
 // isPVCWaitCondition reports whether c is the server-owned marker written
-// while a pod waits for a missing PersistentVolumeClaim. It is not derived
-// from container state, so status sync must preserve it instead of replacing
-// PodScheduled with the usual unconditional True.
+// while a pod waits for a missing or Terminating PersistentVolumeClaim. It is
+// not derived from container state, so status sync must preserve it instead of
+// replacing PodScheduled with the usual unconditional True.
 func isPVCWaitCondition(c corev1.PodCondition) bool {
-	return c.Type == corev1.PodScheduled &&
-		c.Status == corev1.ConditionFalse &&
-		c.Reason == "Unschedulable" &&
-		strings.HasPrefix(c.Message, `persistentvolumeclaim "`) &&
-		strings.HasSuffix(c.Message, `" not found`)
+	if c.Type != corev1.PodScheduled ||
+		c.Status != corev1.ConditionFalse ||
+		c.Reason != "Unschedulable" ||
+		!strings.HasPrefix(c.Message, `persistentvolumeclaim "`) {
+		return false
+	}
+	return strings.HasSuffix(c.Message, `" not found`) ||
+		strings.HasSuffix(c.Message, `" is being deleted`)
 }
 
 // syncPodConditions derives the pod conditions from the container statuses:
