@@ -786,7 +786,7 @@ func timerStampDir() string {
 // Persistent=true, and a timer without a stamp fires at once when it starts:
 // without the stamp the first start after the rename runs the CronJob a
 // second time for a slot the old timer already ran. Rename keeps the mtime,
-// which is the stamp. An existing stamp at the target is left alone.
+// which is the stamp. When both exist the newer stamp wins.
 func (s *Server) MoveCronTimerStamps(toNew bool) {
 	s.moveCronTimerStamps(timerStampDir(), toNew)
 }
@@ -803,10 +803,16 @@ func (s *Server) moveCronTimerStamps(dir string, toNew bool) {
 		}
 		src := filepath.Join(dir, "stamp-"+from)
 		dst := filepath.Join(dir, "stamp-"+to)
-		if _, err := os.Stat(src); err != nil {
+		srcInfo, err := os.Stat(src)
+		if err != nil {
 			continue
 		}
-		if _, err := os.Stat(dst); err == nil {
+		// After an earlier upgrade and rollback both stamps can exist; the
+		// newer one holds the last trigger, so an older target is replaced.
+		if dstInfo, err := os.Stat(dst); err == nil && !srcInfo.ModTime().After(dstInfo.ModTime()) {
+			if err := os.Remove(src); err != nil {
+				fmt.Printf("names migration: remove stale timer stamp %s: %v\n", src, err)
+			}
 			continue
 		}
 		if err := os.Rename(src, dst); err != nil {

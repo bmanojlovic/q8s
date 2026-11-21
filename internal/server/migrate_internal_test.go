@@ -647,4 +647,29 @@ func TestCronTimerStampsFollowTheRename(t *testing.T) {
 	h.srv.moveCronTimerStamps(dir, false)
 	assertNoFile(t, renamed)
 	assertFile(t, legacy)
+
+	// Both stamps present (an earlier upgrade and rollback): the newer wins.
+	later := when.Add(time.Hour)
+	if err := os.WriteFile(renamed, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(renamed, later, later); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.moveCronTimerStamps(dir, false)
+	assertNoFile(t, renamed)
+	if info, err := os.Stat(legacy); err != nil || !info.ModTime().Equal(later) {
+		t.Fatalf("newer stamp did not win: %v %v", info, err)
+	}
+	if err := os.WriteFile(renamed, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(renamed, when, when); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.moveCronTimerStamps(dir, true)
+	if info, err := os.Stat(renamed); err != nil || !info.ModTime().Equal(later) {
+		t.Fatalf("older target stamp was kept: %v %v", info, err)
+	}
+	assertNoFile(t, legacy)
 }
