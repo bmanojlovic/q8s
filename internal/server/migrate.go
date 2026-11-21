@@ -529,6 +529,7 @@ func (s *Server) MigrateLegacyNames() int {
 	if err := s.ApplyNameMigrationPlan(plan); err != nil {
 		fmt.Printf("names migration: %v\n", err)
 	}
+	s.MoveCronTimerStamps(true)
 	fmt.Printf("names migration: migrated %d object(s) to the new generated names\n", len(plan.Objects))
 	return len(plan.Objects)
 }
@@ -760,4 +761,56 @@ func (s *Server) FinishedWorkloadsRerunByLegacy() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// timerStampDir is where systemd keeps the last-trigger stamps of
+// Persistent= timers: /var/lib/systemd/timers for the system manager, and
+// $XDG_DATA_HOME/systemd/timers (~/.local/share/systemd/timers) for a user
+// manager.
+func timerStampDir() string {
+	if os.Geteuid() == 0 {
+		return "/var/lib/systemd/timers"
+	}
+	if dir := os.Getenv("XDG_DATA_HOME"); dir != "" {
+		return filepath.Join(dir, "systemd", "timers")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "share", "systemd", "timers")
+}
+
+// MoveCronTimerStamps carries each CronJob timer's last-trigger stamp over to
+// its renamed timer (toNew) or back (rollback). CronJob timers use
+// Persistent=true, and a timer without a stamp fires at once when it starts:
+// without the stamp the first start after the rename runs the CronJob a
+// second time for a slot the old timer already ran. Rename keeps the mtime,
+// which is the stamp. An existing stamp at the target is left alone.
+func (s *Server) MoveCronTimerStamps(toNew bool) {
+	s.moveCronTimerStamps(timerStampDir(), toNew)
+}
+
+func (s *Server) moveCronTimerStamps(dir string, toNew bool) {
+	if dir == "" {
+		return
+	}
+	for _, cj := range s.config.Store.AllCronJobs() {
+		from := names.LegacyHost(names.KindCronJobTimer, cj.Namespace, cj.Name)
+		to := names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)
+		if !toNew {
+			from, to = to, from
+		}
+		src := filepath.Join(dir, "stamp-"+from)
+		dst := filepath.Join(dir, "stamp-"+to)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if _, err := os.Stat(dst); err == nil {
+			continue
+		}
+		if err := os.Rename(src, dst); err != nil {
+			fmt.Printf("names migration: move timer stamp %s: %v\n", src, err)
+		}
+	}
 }

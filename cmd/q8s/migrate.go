@@ -144,6 +144,7 @@ func runMigrateNames(opts migrateNamesOptions, srv *server.Server, serveActive f
 		if err := srv.ApplyNameMigrationPlan(plan); err != nil {
 			return err
 		}
+		srv.MoveCronTimerStamps(false)
 		if err := srv.RemoveNamesMigrationMarker(); err != nil {
 			return err
 		}

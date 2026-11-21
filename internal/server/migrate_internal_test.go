@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -614,4 +615,36 @@ func TestPlanNewNamesRollbackRemovesOnlyNewArtifacts(t *testing.T) {
 	if h.reloads == 0 {
 		t.Error("rollback did not daemon-reload")
 	}
+}
+
+// TestCronTimerStampsFollowTheRename: a CronJob timer uses Persistent=true,
+// and a timer without a stamp fires as soon as it starts. The stamp moves to
+// the new timer name (and back on rollback) with its mtime, so the first
+// start after the rename does not run a slot the old timer already ran.
+func TestCronTimerStampsFollowTheRename(t *testing.T) {
+	h := newNameMigrationHost(t)
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "stamp-"+names.LegacyHost(names.KindCronJobTimer, "demo", "cronactive"))
+	renamed := filepath.Join(dir, "stamp-"+names.Host(names.KindCronJobTimer, "demo", "cronactive"))
+	if err := os.WriteFile(legacy, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	when := time.Date(2026, 1, 2, 3, 4, 0, 0, time.UTC)
+	if err := os.Chtimes(legacy, when, when); err != nil {
+		t.Fatal(err)
+	}
+
+	h.srv.moveCronTimerStamps(dir, true)
+	assertNoFile(t, legacy)
+	info, err := os.Stat(renamed)
+	if err != nil {
+		t.Fatalf("stamp not moved to the new timer: %v", err)
+	}
+	if !info.ModTime().Equal(when) {
+		t.Fatalf("stamp mtime = %v, want %v", info.ModTime(), when)
+	}
+
+	h.srv.moveCronTimerStamps(dir, false)
+	assertNoFile(t, renamed)
+	assertFile(t, legacy)
 }
