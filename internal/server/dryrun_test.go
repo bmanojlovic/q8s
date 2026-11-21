@@ -43,7 +43,7 @@ func TestDryRunPodCreateDoesNotStoreOrWriteUnits(t *testing.T) {
 	resp = post(t, ts.URL+"/api/v1/namespaces/default/pods", podBody("default", "example", "nginx"))
 	assertStatus(t, resp, 201)
 	resp.Body.Close()
-	if _, err := os.Stat(filepath.Join(quadletDir, "default-example.container")); err != nil {
+	if _, err := os.Stat(filepath.Join(quadletDir, "default_example.container")); err != nil {
 		t.Fatalf("real create did not write the unit: %v", err)
 	}
 }

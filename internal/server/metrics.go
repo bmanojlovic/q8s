@@ -15,6 +15,8 @@ import (
 
 	"golang.org/x/sys/unix"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"q8s/internal/names"
 )
 
 // handleMetricsRoot serves the metrics.k8s.io API group discovery.
@@ -121,7 +123,7 @@ func (s *Server) handlePodMetrics(w http.ResponseWriter, r *http.Request) {
 		if nsFilter != "" && pod.Namespace != nsFilter {
 			continue
 		}
-		containerName := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
+		containerName := names.Host(names.KindPod, pod.Namespace, pod.Name)
 		cpu, mem := getPodStats(containerName)
 
 		var containers []map[string]interface{}

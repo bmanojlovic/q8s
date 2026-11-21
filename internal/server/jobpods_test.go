@@ -41,7 +41,7 @@ func installJobRun(fake *fakeJournal, namespace, job, id string, start time.Time
 			journalJSON(id, cronruns.MessageIDExited, start.Add(time.Second), `,"EXIT_STATUS":"7"`),
 			journalJSON(id, cronruns.MessageIDFailed, start.Add(2*time.Second), ""))
 	}
-	fake.runs[fmt.Sprintf("%s-%s-job.service", namespace, job)] = []byte(strings.Join(lines, "\n"))
+	fake.runs[fmt.Sprintf("%s_%s__job.service", namespace, job)] = []byte(strings.Join(lines, "\n"))
 }
 
 func lastJournalArgs(f *fakeJournal) []string {
@@ -184,15 +184,48 @@ func TestJobSelectorAndLabelsDefaultedAndKept(t *testing.T) {
 	}
 }
 
+// TestJobRunHistoryAndLogsFallBackToLegacyUnit: a Job that ran before the
+// naming upgrade keeps its history and its logs under the legacy unit and
+// container names.
+func TestJobRunHistoryAndLogsFallBackToLegacyUnit(t *testing.T) {
+	fake := newFakeJournal()
+	base := time.Unix(1700000000, 0).UTC()
+	lines := []string{
+		journalJSON("cccccccccccccccccccccccccccccccc", cronruns.MessageIDStarted, base, ""),
+		journalJSON("cccccccccccccccccccccccccccccccc", cronruns.MessageIDExited, base.Add(time.Second), `,"EXIT_STATUS":"0"`),
+		journalJSON("cccccccccccccccccccccccccccccccc", cronruns.MessageIDSucceeded, base.Add(2*time.Second), ""),
+	}
+	fake.runs["default-legacy-job.service"] = []byte(strings.Join(lines, "\n"))
+	fake.logs["default-legacy-job"] = []byte(`{"MESSAGE":"legacy output","__REALTIME_TIMESTAMP":"1700000000000000"}`)
+	ts, _ := newCronRunServer(t, fake)
+	createPlainJob(t, ts, "legacy", nil)
+
+	resp := get(t, ts.URL+"/api/v1/namespaces/default/pods/legacy-run")
+	assertStatus(t, resp, http.StatusOK)
+	pod := decodeBody(t, resp)
+	if phase := nested(pod, "status")["phase"]; phase != "Succeeded" {
+		t.Fatalf("legacy run phase = %v, want Succeeded", phase)
+	}
+	resp.Body.Close()
+
+	if got, want := readLogs(t, ts.URL+"/api/v1/namespaces/default/pods/legacy-run/log"), "legacy output\n"; got != want {
+		t.Fatalf("legacy logs = %q, want %q", got, want)
+	}
+	args := lastJournalArgs(fake)
+	if !containsArg(args, "default-legacy-job.service") || !containsArg(args, "CONTAINER_NAME=default-legacy-job") {
+		t.Fatalf("legacy log request used the wrong unit or container: %v", args)
+	}
+}
+
 func TestJobPodLogsUseJobUnit(t *testing.T) {
 	fake := newFakeJournal()
 	base := time.Unix(1700000000, 0).UTC()
 	installJobRun(fake, "default", "plain", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", base, cronruns.StateSucceeded)
-	fake.logs["default-plain-job"] = []byte(strings.Join([]string{
+	fake.logs["default_plain__job"] = []byte(strings.Join([]string{
 		`{"MESSAGE":"job output","__REALTIME_TIMESTAMP":"1700000000000000"}`,
 		`{"MESSAGE":"second line","__REALTIME_TIMESTAMP":"1700000001000000"}`,
 	}, "\n"))
-	fake.logs["default-other-job"] = []byte(`{"MESSAGE":"wrong unit"}`)
+	fake.logs["default_other__job"] = []byte(`{"MESSAGE":"wrong unit"}`)
 	ts, _ := newCronRunServer(t, fake)
 
 	createPlainJob(t, ts, "plain", nil)
@@ -207,10 +240,10 @@ func TestJobPodLogsUseJobUnit(t *testing.T) {
 	}
 
 	args := lastJournalArgs(fake)
-	if !containsArg(args, "default-plain-job.service") {
+	if !containsArg(args, "default_plain__job.service") {
 		t.Fatalf("journal args selected wrong unit: %v", args)
 	}
-	if !containsArg(args, "CONTAINER_NAME=default-plain-job") {
+	if !containsArg(args, "CONTAINER_NAME=default_plain__job") {
 		t.Fatalf("journal args selected wrong container: %v", args)
 	}
 	if !containsArg(args, "_SYSTEMD_INVOCATION_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee") {

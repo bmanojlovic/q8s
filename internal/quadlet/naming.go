@@ -1,14 +1,16 @@
 package quadlet
 
 import (
-	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	"q8s/internal/cronruns"
+	"q8s/internal/names"
 )
 
 // GeneratedName is one Podman container name, systemd unit name,
@@ -48,42 +50,40 @@ func DeploymentReplicaCount(dep *appsv1.Deployment) int32 {
 // DeploymentInstanceName is the name of Deployment instance i. q8s
 // materializes every replica as a Pod with this name.
 func DeploymentInstanceName(deployment string, index int32) string {
-	return fmt.Sprintf("%s-%d", deployment, index)
+	// The API Pod name stays <deployment>-<index> in both formats.
+	return names.Host(names.KindDeploymentPod, "", deployment, strconv.Itoa(int(index)))
 }
 
 // podBaseName is the base q8s joins from namespace and pod name. It is the
 // container name of a single-container pod and the file base of a .pod unit.
 func podBaseName(namespace, pod string) string {
-	return fmt.Sprintf("%s-%s", namespace, pod)
+	return names.Host(names.KindPod, namespace, pod)
 }
 
 // podContainerName is the ContainerName= value of a standalone pod or one
 // member of a multi-container pod. An empty container selects the standalone
 // shape.
 func podContainerName(namespace, pod, container string) string {
-	base := podBaseName(namespace, pod)
-	if container == "" {
-		return base
-	}
-	return fmt.Sprintf("%s-%s", base, container)
+	return names.Host(names.KindPodContainer, namespace, pod, container)
 }
 
 // EnvFileName is the EnvironmentFile name q8s writes for the workload whose
 // generated pod name is base. The file lives in a per-namespace directory, so
 // its identity in GeneratedNames carries the namespace separately.
 func EnvFileName(base string) string {
-	return base + ".env"
+	return names.Host(names.KindEnvPod, "", base)
 }
 
 // JobEnvBaseName is the generated pod-name base of a Job's EnvironmentFile.
+// The names package includes the .env extension, which EnvFileName adds here.
 func JobEnvBaseName(job string) string {
-	return job + "-job"
+	return strings.TrimSuffix(names.Host(names.KindEnvJob, "", job), ".env")
 }
 
 // CronJobEnvBaseName is the generated pod-name base of a CronJob's
 // EnvironmentFile.
 func CronJobEnvBaseName(cronJob string) string {
-	return cronJob + "-cron"
+	return strings.TrimSuffix(names.Host(names.KindEnvCronJob, "", cronJob), ".env")
 }
 
 // GeneratedNames returns every name q8s generates for a workload object:
@@ -113,20 +113,19 @@ func GeneratedNames(obj interface{}) []GeneratedName {
 		if spec == nil {
 			return
 		}
-		base := podBaseName(namespace, podName)
 		if len(spec.Containers) > 1 {
 			// PodUnits writes a .pod unit and one .container per member.
-			add(GeneratedKindUnit, base+".pod", "")
-			add(GeneratedKindUnit, base+"-pod.service", "")
+			add(GeneratedKindUnit, names.Host(names.KindPodFile, namespace, podName), "")
+			add(GeneratedKindUnit, names.Host(names.KindPodUnit, namespace, podName), "")
 			for _, c := range spec.Containers {
 				name := podContainerName(namespace, podName, c.Name)
 				add(GeneratedKindContainer, name, "")
-				add(GeneratedKindUnit, name+".service", "")
+				add(GeneratedKindUnit, names.Host(names.KindPodContainerService, namespace, podName, c.Name), "")
 			}
 		} else {
 			// Container writes the historic single-container shape.
-			add(GeneratedKindContainer, base, "")
-			add(GeneratedKindUnit, base+".service", "")
+			add(GeneratedKindContainer, podBaseName(namespace, podName), "")
+			add(GeneratedKindUnit, names.Host(names.KindPodService, namespace, podName), "")
 		}
 		env := EnvFileName(podName)
 		add(GeneratedKindEnvFile, env, namespace+"/"+env)
@@ -155,8 +154,8 @@ func GeneratedNames(obj interface{}) []GeneratedName {
 	case *batchv1.CronJob:
 		name := cronruns.ContainerName(o.Namespace, o.Name)
 		add(GeneratedKindContainer, name, "")
-		add(GeneratedKindUnit, name+".service", "")
-		add(GeneratedKindUnit, name+".timer", "")
+		add(GeneratedKindUnit, names.Host(names.KindCronJobService, o.Namespace, o.Name), "")
+		add(GeneratedKindUnit, names.Host(names.KindCronJobTimer, o.Namespace, o.Name), "")
 		env := EnvFileName(CronJobEnvBaseName(o.Name))
 		add(GeneratedKindEnvFile, env, o.Namespace+"/"+env)
 		for _, volume := range EmptyDirVolumeNamesForSpec(o.Namespace, o.Name, &o.Spec.JobTemplate.Spec.Template.Spec) {

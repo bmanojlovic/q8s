@@ -70,7 +70,7 @@ func TestPodDeleteStopsVolumeUnitOfForceDeletedClaim(t *testing.T) {
 
 	deletePodInNamespaceThroughAPI(t, srv, "demo", "app")
 
-	if want := []string{"demo-data-volume.service"}; !equalStrings(*stops, want) {
+	if want := []string{"demo-data-volume.service", "demo_data-volume.service"}; !equalStrings(*stops, want) {
 		t.Errorf("stopped volume units = %v, want %v", *stops, want)
 	}
 }
@@ -108,7 +108,7 @@ func TestDeploymentDeleteStopsVolumeUnitOfForceDeletedClaim(t *testing.T) {
 		t.Fatalf("deleteDeploymentByName: %v", err)
 	}
 
-	if want := []string{"demo-data-volume.service"}; !equalStrings(*stops, want) {
+	if want := []string{"demo-data-volume.service", "demo_data-volume.service"}; !equalStrings(*stops, want) {
 		t.Errorf("stopped volume units = %v, want %v", *stops, want)
 	}
 }
@@ -144,7 +144,7 @@ func TestDeploymentScaleDownStopsVolumeUnitOfForceDeletedClaim(t *testing.T) {
 
 	srv.scaleDeployment(created, 1, 0)
 
-	if want := []string{"demo-data-volume.service"}; !equalStrings(*stops, want) {
+	if want := []string{"demo-data-volume.service", "demo_data-volume.service"}; !equalStrings(*stops, want) {
 		t.Errorf("stopped volume units = %v, want %v", *stops, want)
 	}
 }
@@ -189,7 +189,7 @@ func TestSecondPodDeleteStopsVolumeUnitOfForceDeletedClaim(t *testing.T) {
 	}
 
 	deletePodInNamespaceThroughAPI(t, srv, "demo", "other")
-	if want := []string{"demo-data-volume.service"}; !equalStrings(*stops, want) {
+	if want := []string{"demo-data-volume.service", "demo_data-volume.service"}; !equalStrings(*stops, want) {
 		t.Errorf("stopped volume units = %v, want %v", *stops, want)
 	}
 }
@@ -213,7 +213,7 @@ func TestNamespaceDeleteStopsVolumeUnitOfForceDeletedClaim(t *testing.T) {
 		t.Fatalf("namespace delete status = %d, body %s", rec.Code, rec.Body.String())
 	}
 
-	idxPod := callIndex(events, "stop demo-app.service")
+	idxPod := callIndex(events, "stop demo_app.service")
 	idxVolume := callIndex(events, "stop demo-data-volume.service")
 	if idxVolume < 0 {
 		t.Fatalf("volume unit of the force-deleted claim was not stopped, events: %v", events)
@@ -240,7 +240,7 @@ func TestJobDeleteStopsVolumeUnitOfForceDeletedClaim(t *testing.T) {
 		t.Fatalf("deleteJobByName: %v", err)
 	}
 
-	if want := []string{"demo-data-volume.service"}; !equalStrings(*stops, want) {
+	if want := []string{"demo-data-volume.service", "demo_data-volume.service"}; !equalStrings(*stops, want) {
 		t.Errorf("stopped volume units = %v, want %v", *stops, want)
 	}
 }

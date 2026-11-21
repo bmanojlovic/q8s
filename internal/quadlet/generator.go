@@ -15,6 +15,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"q8s/internal/cronruns"
+	"q8s/internal/names"
 )
 
 const (
@@ -482,7 +483,7 @@ func JobContainer(name string, job *batchv1.Job, configDir string, pvcMap map[st
 						}
 						b.WriteString(line)
 					} else {
-						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
+						b.WriteString(fmt.Sprintf("Volume=%s.volume:%s%s\n", names.Host(names.KindPVCVolume, ns, vol.PersistentVolumeClaim.ClaimName), vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
 					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
@@ -636,7 +637,7 @@ func CronContainer(name string, cj *batchv1.CronJob, configDir string, pvcMap ma
 						}
 						b.WriteString(line)
 					} else {
-						b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
+						b.WriteString(fmt.Sprintf("Volume=%s.volume:%s%s\n", names.Host(names.KindPVCVolume, ns, vol.PersistentVolumeClaim.ClaimName), vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
 					}
 				case vol.ConfigMap != nil:
 					if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {
@@ -881,24 +882,60 @@ func pvcStorageClass(pvc *corev1.PersistentVolumeClaim) string {
 	return StorageClassStandard
 }
 
-// PVCVolumeName is the Podman named volume backing a PVC. Namespace-scoped
+// PVCVolumeName is the Podman named volume a new PVC gets. Namespace-scoped
 // so two claims with the same name in different namespaces (or from
 // unrelated non-q8s deployments on the same host) can't silently collide on
-// one volume — and so `podman volume ls` self-documents which claim owns
-// what instead of requiring a live cross-reference.
+// one volume, and so `podman volume ls` self-documents which claim owns what.
+// A claim created before the new format keeps spec.volumeName; renderers must
+// use effectivePVCVolumeName for an existing object instead of this helper.
 func PVCVolumeName(ns, name string) string {
-	return fmt.Sprintf("%s-%s", ns, name)
+	return names.Host(names.KindPVCVolume, ns, name)
+}
+
+// LegacyPVCVolumeName is the pre-upgrade Podman volume name of a claim. It is
+// only needed by the delete and migration paths, which must find old volumes
+// and files as well as new ones.
+func LegacyPVCVolumeName(ns, name string) string {
+	return names.LegacyHost(names.KindPVCVolume, ns, name)
+}
+
+// effectivePVCVolumeName returns the Podman volume name a stored claim must
+// keep. spec.volumeName is the authority: a legacy claim keeps <ns>-<claim>
+// forever, and a new claim keeps the name it was created with. An unbound
+// claim without a value is new; startup repair is what adopts an on-disk
+// legacy .volume file for an old claim.
+func effectivePVCVolumeName(pvc *corev1.PersistentVolumeClaim) string {
+	return names.EffectivePVCVolumeName(pvc.Namespace, pvc.Name, pvc.Spec.VolumeName, false)
+}
+
+// effectivePVCFileBase is the basename of the claim's .volume file. It matches
+// the effective Podman volume name, so VolumeName= and the filename cannot
+// disagree.
+func effectivePVCFileBase(pvc *corev1.PersistentVolumeClaim) string {
+	return names.EffectivePVCFileBase(pvc.Namespace, pvc.Name, pvc.Spec.VolumeName, false)
+}
+
+// PVCVolumeFileBase is effectivePVCFileBase for callers outside this package:
+// the delete path, doctor and uninstall all have to name the file a claim
+// actually uses.
+func PVCVolumeFileBase(pvc *corev1.PersistentVolumeClaim) string {
+	return effectivePVCFileBase(pvc)
+}
+
+// LegacyPVCFileBase is the pre-upgrade .volume file basename of a claim.
+func LegacyPVCFileBase(ns, name string) string {
+	return names.LegacyHost(names.KindPVCFile, ns, name)
 }
 
 // EmptyDirVolumeName is the Podman named volume backing an emptyDir (or any
 // other non-PVC volume source q8s cannot render as a bind mount). The
 // underscore separator cannot appear in a Kubernetes namespace, owner or
 // volume name, so this name can never equal another namespace's emptyDir or
-// a PVC volume (PVCVolumeName joins with '-'). owner is the pod name for a
+// a PVC volume (PVCVolumeName joins with '_'). owner is the pod name for a
 // bare pod, the Deployment, Job or CronJob name for a pod template, and
 // DeploymentReplicaVolumeOwner(deployment, index) for one Deployment replica.
 func EmptyDirVolumeName(ns, owner, name string) string {
-	return fmt.Sprintf("q8s_%s_%s_%s", ns, owner, name)
+	return names.Host(names.KindEmptyDirVolume, ns, owner, name)
 }
 
 // DeploymentReplicaVolumeOwner is the owner component of a Deployment
@@ -907,7 +944,7 @@ func EmptyDirVolumeName(ns, owner, name string) string {
 // The underscore cannot appear in a Kubernetes name, so this can never
 // collide with a bare pod or workload owner component.
 func DeploymentReplicaVolumeOwner(deployment string, index int32) string {
-	return fmt.Sprintf("%s_%d", deployment, index)
+	return names.Host(names.KindDeploymentVolumeOwner, "", deployment, strconv.Itoa(int(index)))
 }
 
 // DeploymentReplica returns the Deployment name and replica index of a stored
@@ -1035,7 +1072,7 @@ func Volume(pvc *corev1.PersistentVolumeClaim) ([]byte, error) {
 	var b strings.Builder
 
 	b.WriteString("[Volume]\n")
-	b.WriteString(fmt.Sprintf("VolumeName=%s\n", PVCVolumeName(pvc.Namespace, pvc.Name)))
+	b.WriteString(fmt.Sprintf("VolumeName=%s\n", effectivePVCVolumeName(pvc)))
 	b.WriteString(ManagedByLabel + "\n")
 
 	return []byte(b.String()), nil
@@ -1115,9 +1152,9 @@ func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath 
 	class := pvcStorageClass(pvc)
 	switch class {
 	case StorageClassStandard:
-		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, volumeOptions(readOnly, "Z", userNS)), nil
+		return fmt.Sprintf("Volume=%s.volume:%s%s\n", effectivePVCFileBase(pvc), mountPath, volumeOptions(readOnly, "Z", userNS)), nil
 	case StorageClassShared:
-		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, volumeOptions(readOnly, "z", userNS)), nil
+		return fmt.Sprintf("Volume=%s.volume:%s%s\n", effectivePVCFileBase(pvc), mountPath, volumeOptions(readOnly, "z", userNS)), nil
 	case StorageClassHostPath:
 		hostPath, ok := pvc.Annotations[AnnotationHostPath]
 		if !ok || hostPath == "" {
@@ -1135,7 +1172,7 @@ func pvcVolumeDirective(ns string, pvc *corev1.PersistentVolumeClaim, mountPath 
 	default:
 		// Unknown class — fall back to named volume without SELinux option
 		// for forward compatibility.
-		return fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", ns, pvc.Name, mountPath, volumeOptions(readOnly, "", userNS)), nil
+		return fmt.Sprintf("Volume=%s.volume:%s%s\n", effectivePVCFileBase(pvc), mountPath, volumeOptions(readOnly, "", userNS)), nil
 	}
 }
 
@@ -1145,7 +1182,7 @@ func Network(name string) ([]byte, error) {
 	var b strings.Builder
 
 	b.WriteString("[Network]\n")
-	b.WriteString(fmt.Sprintf("NetworkName=q8s-%s\n", name))
+	b.WriteString(fmt.Sprintf("NetworkName=%s\n", names.Host(names.KindNetwork, name, "")))
 	b.WriteString(ManagedByLabel + "\n")
 
 	return []byte(b.String()), nil

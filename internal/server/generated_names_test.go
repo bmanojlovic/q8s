@@ -6,19 +6,17 @@ import (
 	"testing"
 )
 
-// TestGeneratedNameConflictIs409 covers the HTTP path for the generated-name
-// guard on create: the error reaches the client as 409 with the shared name.
-func TestGeneratedNameConflictIs409(t *testing.T) {
+// TestJobAndPodSuffixNamesCoexist: the new names put the fixed job suffix
+// behind "__", so a Job x and a Pod x-job are distinct objects.
+func TestJobAndPodSuffixNamesCoexist(t *testing.T) {
 	ts, _ := newTestServer(t)
 	resp := post(t, ts.URL+"/apis/batch/v1/namespaces/default/jobs", jobBody("default", "x"))
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
 	resp = post(t, ts.URL+"/api/v1/namespaces/default/pods", podBody("default", "x-job", "busybox"))
-	assertStatus(t, resp, http.StatusConflict)
-	if msg := responseMessage(t, resp); !strings.Contains(msg, `would share the generated name "default-x-job"`) {
-		t.Fatalf("message = %q", msg)
-	}
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
 }
 
 // TestGeneratedNameConflictOnDeploymentScale covers the update path: scaling
@@ -44,7 +42,7 @@ func TestGeneratedNameConflictOnDeploymentScale(t *testing.T) {
 	}
 	resp = do(t, http.MethodPatch, ts.URL+"/apis/apps/v1/namespaces/default/deployments/web/scale", scale)
 	assertStatus(t, resp, http.StatusConflict)
-	if msg := responseMessage(t, resp); !strings.Contains(msg, `would share the generated name "default-web-1"`) {
+	if msg := responseMessage(t, resp); !strings.Contains(msg, `would share the generated name "web-1.env"`) {
 		t.Fatalf("message = %q", msg)
 	}
 }

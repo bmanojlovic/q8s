@@ -119,7 +119,7 @@ func TestDeletePersistFailureAnswersInternalError(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
-	quadlet := filepath.Join(quadletDir, "default-blocked.container")
+	quadlet := filepath.Join(quadletDir, "default_blocked.container")
 	if err := os.WriteFile(quadlet, []byte("[Container]\nImage=nginx\n"), 0644); err != nil {
 		t.Fatalf("write quadlet: %v", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"q8s/internal/names"
 	"strings"
 	"testing"
 	"time"
@@ -276,7 +277,7 @@ func TestConfigMapUpdateRefreshesReferencingCronJobs(t *testing.T) {
 			createEnvTestConfigMap(t, srv.config.Store, "default", "settings", map[string]string{"TOKEN": "old"})
 			createAndRenderCronJob(t, srv, envCronJob("default", "refreshed", tt.env, tt.envFrom, false))
 
-			containerPath := filepath.Join(srv.config.QuadletDir, "default-refreshed-cron.container")
+			containerPath := filepath.Join(srv.config.QuadletDir, names.Host(names.KindCronJobFile, "default", "refreshed"))
 			if got := readEnvTestFile(t, containerPath); !strings.Contains(got, "Environment=TOKEN=old") {
 				t.Fatalf("created container unit missing old ConfigMap value:\n%s", got)
 			}
@@ -352,7 +353,7 @@ func TestSuspendedCronJobRefreshesEnvWithoutEnablingTimer(t *testing.T) {
 	createAndRenderCronJob(t, srv, cj)
 
 	envPath := srv.envFilePath("default", quadlet.CronJobEnvBaseName("susp"))
-	timerPath := filepath.Join(srv.config.QuadletDir, "default-susp-cron.timer")
+	timerPath := filepath.Join(srv.config.QuadletDir, names.Host(names.KindCronJobTimer, "default", "susp"))
 	timerOld := setOldMtime(t, timerPath)
 
 	var starts, stops []string

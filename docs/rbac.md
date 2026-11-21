@@ -118,27 +118,30 @@ refused with 400 before authorization. A write whose object names a different
 namespace or name than the URL is refused with 400, as in Kubernetes, so a
 binding in one namespace never lets a user create objects in another.
 
-Generated Podman and systemd names are built by joining namespace and object
-name, plus any workload suffix. To stop that join from crossing namespaces,
-creating an object whose kind generates such a name is refused with 409
-Conflict when the flattened name already belongs to an object of another
-namespace. The guarded kinds are Pod, Deployment, Job, CronJob,
-PersistentVolumeClaim, Service, Ingress, Middleware and IngressRouteTCP.
+Generated Podman and systemd names join the namespace and object name with
+`_`, which cannot occur in either part, and a fixed workload suffix uses
+`__`: a Job `x` becomes `<namespace>_x__job` and a CronJob `x` becomes
+`<namespace>_x__cron`. A Pod `x-job` is therefore a different host name, and
+`team/prod-db` no longer collides with `team-prod/db`. PVCs created before
+this release keep their legacy `<namespace>-<claim>` volume name from
+`spec.volumeName`.
 
-The same check covers the complete set of names a Pod, Deployment, Job or
-CronJob generates in any namespace, including the same one: container names,
-systemd unit names, EnvironmentFile names and emptyDir volume names. The
-`-job` and `-cron` suffixes, multi-container `<namespace>-<pod>-<container>`
-members and the indexed `<deployment>-<index>` replicas are therefore all
-checked, and a conflict is refused with 409 Conflict. An update checks only
-the names it newly introduces, so an object already in a legacy collision can
-still be edited or scaled down. A replica pod created for its own Deployment
-does not conflict with that Deployment, which already owns the instance
-names. The `pods/log`, `pods/exec` and `pods/attach` subresources address only
+The store still rejects two objects whose complete generated-name sets
+collide, including container names, systemd unit names, EnvironmentFile names
+and emptyDir volume names. An update checks only the names it newly
+introduces, so an object already in a legacy collision can still be edited or
+scaled down. A replica pod created for its own Deployment does not conflict
+with that Deployment, which already owns the instance names. The one flat
+`<namespace>-<name>` name that remains is the Traefik Middleware object key,
+because users write it in Ingress annotations as
+`<namespace>-<name>@kubernetescrd`; that key is still guarded across
+namespaces.
+
+The `pods/log`, `pods/exec` and `pods/attach` subresources address only
 a pod stored in the URL namespace, or a Job/CronJob run resolved there, and
 `?container=` must name one of that pod's containers. A user permitted in one
-namespace therefore cannot reach a pod in another namespace whose flattened
-name happens to match.
+namespace therefore cannot reach a pod in another namespace through a
+flattened name.
 
 A denied request answers 403 with the Kubernetes message, for example:
 

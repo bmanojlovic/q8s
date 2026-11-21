@@ -99,7 +99,7 @@ func TestWorkloadMountMultiContainerPod(t *testing.T) {
 		t.Fatalf("PodUnits: %v", err)
 	}
 	for _, c := range pod.Spec.Containers {
-		filename := "default-multi-" + c.Name + ".container"
+		filename := "default_multi_" + c.Name + ".container"
 		content, ok := files[filename]
 		if !ok {
 			t.Fatalf("missing %s in %v", filename, files)

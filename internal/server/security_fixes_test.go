@@ -140,9 +140,9 @@ func TestPodSubresourcesRequirePodInURLNamespace(t *testing.T) {
 	}
 }
 
-// TestGeneratedNameCollisionAcrossNamespaces: the flattened namespace-name
-// must be unique across every kind that generates Podman and systemd names.
-func TestGeneratedNameCollisionAcrossNamespaces(t *testing.T) {
+// TestGeneratedNameAcrossNamespaceSplitsCoexist: the new "_" separator makes
+// team/prod-db and team-prod/db two distinct host names.
+func TestGeneratedNameAcrossNamespaceSplitsCoexist(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		firstNS    string
@@ -160,19 +160,15 @@ func TestGeneratedNameCollisionAcrossNamespaces(t *testing.T) {
 			resp.Body.Close()
 
 			resp = post(t, ts.URL+"/api/v1/namespaces/"+tc.secondNS+"/pods", podBody(tc.secondNS, tc.secondName, "busybox"))
-			assertStatus(t, resp, http.StatusConflict)
-			msg := responseMessage(t, resp)
-			if !strings.Contains(msg, `would share the generated name "team-prod-db"`) ||
-				!strings.Contains(msg, tc.firstName) || !strings.Contains(msg, tc.firstNS) {
-				t.Fatalf("message = %q", msg)
-			}
+			assertStatus(t, resp, http.StatusCreated)
+			resp.Body.Close()
 		})
 	}
 }
 
-// TestGeneratedNameCollisionAcrossKinds: a Deployment and a Pod cannot own the
-// same flattened name in different namespaces either.
-func TestGeneratedNameCollisionAcrossKinds(t *testing.T) {
+// TestGeneratedNameAcrossKindsCoexist: a Deployment and a Pod in different
+// namespaces no longer share a flat "<ns>-<name>" host name.
+func TestGeneratedNameAcrossKindsCoexist(t *testing.T) {
 	ts, _ := newTestServer(t)
 	resp := post(t, ts.URL+"/api/v1/namespaces/team-prod/pods", podBody("team-prod", "db", "busybox"))
 	assertStatus(t, resp, http.StatusCreated)
@@ -194,8 +190,6 @@ func TestGeneratedNameCollisionAcrossKinds(t *testing.T) {
 		},
 	}
 	resp = post(t, ts.URL+"/apis/apps/v1/namespaces/team/deployments", dep)
-	assertStatus(t, resp, http.StatusConflict)
-	if msg := responseMessage(t, resp); !strings.Contains(msg, `with Pod "db" in namespace "team-prod"`) {
-		t.Fatalf("message = %q", msg)
-	}
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
 }

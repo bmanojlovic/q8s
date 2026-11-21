@@ -34,11 +34,11 @@ func TestPodContainerName(t *testing.T) {
 		requested string
 		want      string
 	}{
-		{"multi default container", "multi", "", "default-multi-web"},
-		{"multi explicit container", "multi", "sidecar", "default-multi-sidecar"},
-		{"single unchanged", "single", "", "default-single"},
-		{"single explicit container unchanged", "single", "app", "default-single"},
-		{"unknown pod falls back", "missing", "", "default-missing"},
+		{"multi default container", "multi", "", "default_multi_web"},
+		{"multi explicit container", "multi", "sidecar", "default_multi_sidecar"},
+		{"single unchanged", "single", "", "default_single"},
+		{"single explicit container unchanged", "single", "app", "default_single"},
+		{"unknown pod falls back", "missing", "", "default_missing"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

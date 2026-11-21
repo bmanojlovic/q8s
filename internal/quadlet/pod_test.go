@@ -71,10 +71,10 @@ func TestPodUnitsTwoContainers(t *testing.T) {
 		t.Fatalf("expected 3 files (.pod plus 2 .container), got %d: %v", len(files), keys(files))
 	}
 
-	podOut := string(files["default-multi.pod"])
+	podOut := string(files["default_multi.pod"])
 	for _, want := range []string{
 		"[Pod]",
-		"PodName=default-multi",
+		"PodName=default_multi",
 		"Network=q8s-default.network",
 		"NetworkAlias=myservice",
 		"PublishPort=8080:80/tcp",
@@ -88,11 +88,11 @@ func TestPodUnitsTwoContainers(t *testing.T) {
 	assertNotContains(t, podOut, "Image=")
 	assertNotContains(t, podOut, "io.kubernetes.container.name")
 
-	webOut := string(files["default-multi-web.container"])
+	webOut := string(files["default_multi_web.container"])
 	for _, want := range []string{
 		"Image=nginx:latest",
-		"ContainerName=default-multi-web",
-		"Pod=default-multi.pod",
+		"ContainerName=default_multi_web",
+		"Pod=default_multi.pod",
 		"Environment=ROLE=web",
 		"Volume=/run/q8s/configmaps/default/app-config:/etc/config:ro,z",
 		"Label=io.kubernetes.container.name=web",
@@ -107,11 +107,11 @@ func TestPodUnitsTwoContainers(t *testing.T) {
 	// The /dev/shm emptyDir is a pod-level ShmSize, never a Volume= line.
 	assertNotContains(t, webOut, "shm")
 
-	sidecarOut := string(files["default-multi-sidecar.container"])
+	sidecarOut := string(files["default_multi_sidecar.container"])
 	for _, want := range []string{
 		"Image=busybox",
-		"ContainerName=default-multi-sidecar",
-		"Pod=default-multi.pod",
+		"ContainerName=default_multi_sidecar",
+		"Pod=default_multi.pod",
 		"Environment=ROLE=sidecar",
 		`HealthCmd=["test","-f","/tmp/ready"]`,
 		"Label=io.kubernetes.container.name=sidecar",
@@ -129,7 +129,7 @@ func TestPodUnitsHostNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PodUnits: %v", err)
 	}
-	podOut := string(files["default-multi.pod"])
+	podOut := string(files["default_multi.pod"])
 	assertContains(t, podOut, "Network=host")
 	assertNotContains(t, podOut, "Network=q8s-default.network")
 	assertNotContains(t, podOut, "NetworkAlias=")
@@ -160,7 +160,7 @@ func TestPodUnitsNetworkAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PodUnits: %v", err)
 	}
-	podOut := string(files["default-multi.pod"])
+	podOut := string(files["default_multi.pod"])
 	want := "Network=q8s-default.network:ip=10.89.3.254\nNetwork=q8s-other.network\n"
 	if !strings.Contains(podOut, want) {
 		t.Errorf("pod networks missing:\nwant:\n%s\ngot:\n%s", want, podOut)
@@ -347,7 +347,7 @@ func TestPodUnitsOwnershipAndHashLabels(t *testing.T) {
 		t.Fatalf("PodUnits: %v", err)
 	}
 
-	podOut := string(files["default-multi.pod"])
+	podOut := string(files["default_multi.pod"])
 	assertContains(t, podOut, quadlet.ManagedByLabel)
 	assertContains(t, podOut, "Label=q8s.io/containers=web,sidecar")
 	hash := labelValue(podOut, quadlet.TemplateHashLabel)
@@ -360,7 +360,7 @@ func TestPodUnitsOwnershipAndHashLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PodUnits second render: %v", err)
 	}
-	assertContains(t, string(again["default-multi.pod"]), "Label="+quadlet.TemplateHashLabel+"="+hash)
+	assertContains(t, string(again["default_multi.pod"]), "Label="+quadlet.TemplateHashLabel+"="+hash)
 
 	for name, content := range files {
 		if !strings.HasSuffix(name, ".container") {

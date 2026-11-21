@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -93,7 +94,7 @@ func (s *Server) jobRuns(ctx context.Context, job *batchv1.Job) []cronruns.Run {
 	if s.config.CronRuns == nil {
 		return nil
 	}
-	runs, err := s.config.CronRuns.RunsForUnit(ctx, cronruns.JobUnitName(job.Namespace, job.Name))
+	runs, err := s.config.CronRuns.RunsForJob(ctx, job.Namespace, job.Name)
 	if err != nil || len(runs) == 0 {
 		return nil
 	}
@@ -155,7 +156,8 @@ func (s *Server) rejectJobPodWrite(w http.ResponseWriter, r *http.Request, ns, n
 }
 
 // handleJobPodLogs serves a Job pod's logs from the job unit. The unit is the
-// same one JobContainer renders, <ns>-<name>-job.service. The run annotation
+// same one JobContainer renders, <ns>_<name>__job.service (or the legacy
+// name for a run recorded before the names migration). The run annotation
 // alone is not trusted: it is checked against the runs the stored Job owns,
 // because the unit name is shared by other namespace/name pairs and an older
 // invocation would stream another tenant's output.
@@ -166,14 +168,18 @@ func (s *Server) handleJobPodLogs(w http.ResponseWriter, r *http.Request, pod *c
 		s.respondStatus(w, http.StatusNotFound, "NotFound", "pod %q not found", pod.Name)
 		return
 	}
-	if !runBelongsTo(s.jobRuns(r.Context(), job), pod.Annotations[cronRunInvocationAnnotation]) {
+	run, ok := ownedRun(s.jobRuns(r.Context(), job), pod.Annotations[cronRunInvocationAnnotation])
+	if !ok {
 		s.respondStatus(w, http.StatusNotFound, "NotFound",
 			"pod %q has no run of Job %s/%s", pod.Name, job.Namespace, job.Name)
 		return
 	}
-	s.handleJournalPodLogs(w, r, pod,
-		cronruns.JobUnitName(pod.Namespace, jobName),
-		cronruns.JobContainerName(pod.Namespace, jobName),
+	unit, container := run.Unit, strings.TrimSuffix(run.Unit, ".service")
+	if unit == "" {
+		unit = cronruns.JobUnitName(pod.Namespace, jobName)
+		container = cronruns.JobContainerName(pod.Namespace, jobName)
+	}
+	s.handleJournalPodLogs(w, r, pod, unit, container,
 		job.CreationTimestamp.Time.Add(-jobRunStartTolerance))
 }
 
@@ -219,6 +225,9 @@ func jobPodObjectFor(job *batchv1.Job, run *cronruns.Run) *corev1.Pod {
 		creation = metav1.NewTime(run.Start)
 		start = &metav1.Time{Time: run.Start}
 		annotations[cronRunInvocationAnnotation] = run.InvocationID
+		if run.Unit != "" {
+			annotations[cronRunUnitAnnotation] = run.Unit
+		}
 	}
 
 	pod := &corev1.Pod{

@@ -155,15 +155,17 @@ the named Podman volume is created right away (the volume unit is started at
 PVC creation); `hostpath` claims bind to the directory named in their
 annotation.
 
-Named volumes are namespace-scoped as `{namespace}-{name}` (also surfaced
+Named volumes are namespace-scoped as `{namespace}_{name}` (also surfaced
 in `spec.volumeName`), so same-named claims in different namespaces — or a
 claim colliding with a volume some unrelated non-q8s deployment created —
 never share one backing volume, and `podman volume ls` shows which
-namespace/claim owns each volume.
+namespace/claim owns each volume. A claim created before this release keeps
+its old `{namespace}-{name}` volume name and `.volume` file forever; every
+renderer takes the name from `spec.volumeName` so its data is not abandoned.
 
 Deleting a PVC that no workload uses stops the generated volume unit and
 removes its `.volume` quadlet file, but keeps the Podman volume
-`{namespace}-{name}` and the data in it: q8s never deletes PVC data
+`<spec.volumeName>` and the data in it: q8s never deletes PVC data
 automatically. A namespace delete stops the namespace's workloads first and
 removes every claim the same way.
 
@@ -177,7 +179,7 @@ created while the claim is Terminating waits with `persistentvolumeclaim
 the finalizer, for example with `kubectl patch pvc <claim> -p
 '{"metadata":{"finalizers":[]}}' --type=merge`, deletes the claim right away,
 as in Kubernetes. Remove the leftover volume manually when its data is no
-longer needed: `podman volume rm {namespace}-{name}`. `q8s doctor` lists such
+longer needed: `podman volume rm <spec.volumeName>`. `q8s doctor` lists such
 a leftover as `data of deleted PVC` and prints that command.
 
 The `hostpath` class requires a `q8s.io/host-path` annotation on the PVC specifying the absolute host directory. It also honours an optional `q8s.io/selinux-label` annotation: `private` (the default, `:Z`) relabels the host directory for one container, while `shared` (`:z`) lets several containers mount it without locking each other out. Any other value is rejected.
@@ -216,7 +218,8 @@ CronJob runs keep the per-workload name
 appear in a Kubernetes name, so a bare-pod name and a replica name can never
 collide (they have four and five underscore-separated parts), and an
 emptyDir can never collide with another namespace's emptyDir or with a PVC
-volume, which is named `{namespace}-{claim}`. An `emptyDir` with
+volume, which is named `{namespace}_{claim}` (or the legacy `{namespace}-{claim}`
+for a claim created before this release). An `emptyDir` with
 `medium: Memory` mounted at `/dev/shm` is rendered as `ShmSize=` instead, as
 described above under Pods.
 

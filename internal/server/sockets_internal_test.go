@@ -29,7 +29,7 @@ func TestPodSocketsAreWrittenToSystemdDirAndRemovedOnDelete(t *testing.T) {
 		quadlet.AnnotationSocketActivation: "web=8080",
 	})
 
-	webSocket := filepath.Join(systemdDir, "default-traefik-web.socket")
+	webSocket := filepath.Join(systemdDir, "default_traefik_web.socket")
 	if _, err := os.Stat(webSocket); err != nil {
 		t.Fatalf("expected %s: %v", webSocket, err)
 	}
@@ -40,8 +40,8 @@ func TestPodSocketsAreWrittenToSystemdDirAndRemovedOnDelete(t *testing.T) {
 	if !netTestContainsLine(content, "ListenStream=8080") {
 		t.Fatalf("unexpected socket content:\n%s", content)
 	}
-	container := netTestReadFile(t, filepath.Join(quadletDir, "default-traefik.container"))
-	if !netTestContainsLine(container, "Requires=default-traefik-web.socket") {
+	container := netTestReadFile(t, filepath.Join(quadletDir, "default_traefik.container"))
+	if !netTestContainsLine(container, "Requires=default_traefik_web.socket") {
 		t.Fatalf("container does not require its socket unit:\n%s", container)
 	}
 
@@ -60,7 +60,7 @@ func TestPodSocketsAreWrittenToSystemdDirAndRemovedOnDelete(t *testing.T) {
 	if _, err := os.Stat(webSocket); !os.IsNotExist(err) {
 		t.Fatalf("old web socket was not removed, err=%v", err)
 	}
-	apiSocket := filepath.Join(systemdDir, "default-traefik-api.socket")
+	apiSocket := filepath.Join(systemdDir, "default_traefik_api.socket")
 	if _, err := os.Stat(apiSocket); err != nil {
 		t.Fatalf("expected %s after patch: %v", apiSocket, err)
 	}
@@ -110,7 +110,7 @@ func TestDeploymentInstanceSocketsUseInstanceName(t *testing.T) {
 		t.Fatalf("create deployment: status %d", resp.StatusCode)
 	}
 
-	socket := filepath.Join(systemdDir, "default-app-0-web.socket")
+	socket := filepath.Join(systemdDir, "default_app-0_web.socket")
 	if _, err := os.Stat(socket); err != nil {
 		t.Fatalf("expected deployment instance socket %s: %v", socket, err)
 	}

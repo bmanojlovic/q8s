@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/names"
 	"q8s/internal/quadlet"
 )
 
@@ -121,17 +122,17 @@ X-Q8s-Pod=traefik
 [Socket]
 ListenStream=80
 FileDescriptorName=web
-Service=ingress-traefik.service
+Service=ingress_traefik.service
 
 [Install]
 WantedBy=sockets.target
 `
-	if got := string(files["ingress-traefik-web.socket"]); got != wantWeb {
+	if got := string(files["ingress_traefik_web.socket"]); got != wantWeb {
 		t.Errorf("web socket unit = %q, want %q", got, wantWeb)
 	}
 	for filename, want := range map[string]string{
-		"ingress-traefik-websecure.socket": "ListenStream=127.0.0.1:443\n",
-		"ingress-traefik-tls.socket":       "ListenStream=[::1]:8443\n",
+		"ingress_traefik_websecure.socket": "ListenStream=127.0.0.1:443\n",
+		"ingress_traefik_tls.socket":       "ListenStream=[::1]:8443\n",
 	} {
 		if got := string(files[filename]); !strings.Contains(got, want) {
 			t.Errorf("%s missing %q:\n%s", filename, want, got)
@@ -182,11 +183,28 @@ func TestContainerSocketActivationUnitDependencies(t *testing.T) {
 		t.Fatalf("Container: %v", err)
 	}
 	want := "After=q8s-api.service\n" +
-		"Requires=ingress-traefik-web.socket\n" +
-		"After=ingress-traefik-web.socket\n" +
-		"Requires=ingress-traefik-websecure.socket\n" +
-		"After=ingress-traefik-websecure.socket\n"
+		"Requires=ingress_traefik_web.socket\n" +
+		"After=ingress_traefik_web.socket\n" +
+		"Requires=ingress_traefik_websecure.socket\n" +
+		"After=ingress_traefik_websecure.socket\n"
 	if !strings.Contains(string(out), want) {
 		t.Fatalf("socket unit dependencies missing:\nwant:\n%s\ngot:\n%s", want, out)
+	}
+}
+
+// TestSocketServiceMatchesContainerUnitForLongNames: the Service= line must
+// name the same unit the container file generates, including when the pod
+// name is long enough to be truncated with a hash.
+func TestSocketServiceMatchesContainerUnitForLongNames(t *testing.T) {
+	ns := strings.Repeat("n", 253)
+	pod := strings.Repeat("p", 253)
+	files, err := quadlet.SocketUnits(ns, pod, []quadlet.SocketEntry{{Name: "web", Port: 80}})
+	if err != nil {
+		t.Fatalf("SocketUnits: %v", err)
+	}
+	content := string(files[names.Host(names.KindSocketFile, ns, pod, "web")])
+	want := "Service=" + names.Host(names.KindPodService, ns, pod) + "\n"
+	if !strings.Contains(content, want) {
+		t.Fatalf("socket Service= does not match the container unit:\n%s\nwant %q", content, want)
 	}
 }

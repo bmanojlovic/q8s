@@ -285,12 +285,12 @@ user's subordinate uid range.
 
 ~/.config/containers/systemd/        # Podman quadlet directory
   q8s-default.network
-  default-nginx.container
+  default_nginx.container
 
 ~/.config/systemd/user/              # systemd user unit directory
   q8s.socket
   q8s-api.service
-  default-my-cron-cron.timer
+  default_my-cron__cron.timer
 
 $XDG_RUNTIME_DIR/q8s/               # runtime (tmpfs)
   api.sock
@@ -300,6 +300,12 @@ $XDG_RUNTIME_DIR/q8s/               # runtime (tmpfs)
   workload/ns/{ns}/kubeconfig
   workload/sa.sock                   # ServiceAccount credential socket
 ```
+
+Generated host names join the namespace and object name with `_`, which
+cannot occur in a Kubernetes name: `default_nginx.container`, a Job
+`my-job` becomes `default_my-job__job.container`, and a CronJob `my-cron`
+becomes `default_my-cron__cron.timer`. PVCs created before this release keep
+their old `<namespace>-<claim>` volume name.
 
 Rootful uses `/etc/q8s` for the data directory and `/run/q8s` for the runtime
 directory. `q8s-api.service` sets `RuntimeDirectoryPreserve=yes`, so a q8s

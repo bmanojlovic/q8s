@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"q8s/internal/names"
 	"q8s/internal/server"
 	"q8s/internal/store"
 )
@@ -81,7 +82,7 @@ func TestMiddlewareCRUD(t *testing.T) {
 	if metadata["uid"] == nil || metadata["resourceVersion"] == nil || metadata["creationTimestamp"] == nil {
 		t.Fatalf("server-owned metadata missing: %v", metadata)
 	}
-	readTraefikFile(t, dir, "middleware-default-allow.yaml")
+	readTraefikFile(t, dir, "middleware_default_allow.yaml")
 
 	resp = get(t, collection)
 	assertStatus(t, resp, http.StatusOK)
@@ -112,7 +113,7 @@ func TestMiddlewareCRUD(t *testing.T) {
 	}))
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
-	if cfg := readTraefikFile(t, dir, "middleware-default-allow.yaml"); !strings.Contains(cfg, "redirectRegex:") {
+	if cfg := readTraefikFile(t, dir, "middleware_default_allow.yaml"); !strings.Contains(cfg, "redirectRegex:") {
 		t.Fatalf("PUT did not rewrite the file:\n%s", cfg)
 	}
 
@@ -149,7 +150,7 @@ func TestMiddlewareCRUD(t *testing.T) {
 	resp = do(t, http.MethodDelete, collection+"/allow", nil)
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
-	if _, err := os.Stat(filepath.Join(dir, "middleware-default-allow.yaml")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, "middleware_default_allow.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("middleware file was not removed: %v", err)
 	}
 	resp = get(t, collection+"/allow")
@@ -162,6 +163,96 @@ func TestMiddlewareCRUD(t *testing.T) {
 	resp.Body.Close()
 }
 
+// TestTraefikLegacyFilesRemovedOnWriteAndDelete: writing an object removes
+// its pre-upgrade file, and deleting it removes both names.
+func TestTraefikLegacyFilesRemovedOnWriteAndDelete(t *testing.T) {
+	ts, dir := ingressTestServer(t)
+
+	writeLegacy := func(filename string) string {
+		t.Helper()
+		path := filepath.Join(dir, filename)
+		if err := os.WriteFile(path, []byte("stale: true\n"), 0644); err != nil {
+			t.Fatalf("write legacy %s: %v", filename, err)
+		}
+		return path
+	}
+	assertGone := func(path string) {
+		t.Helper()
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s was not removed, stat err=%v", path, err)
+		}
+	}
+
+	// Ingress
+	ingress := ingressBody("default", "web", "example.com", "myservice", 80)
+	resp := post(t, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses", ingress)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+	legacyIngress := writeLegacy(names.LegacyHost(names.KindIngressFile, "default", "web"))
+	resp = do(t, http.MethodPut, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses/web", ingress)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	assertGone(legacyIngress)
+	readTraefikFile(t, dir, names.Host(names.KindIngressFile, "default", "web"))
+
+	legacyIngress = writeLegacy(names.LegacyHost(names.KindIngressFile, "default", "web"))
+	resp = do(t, http.MethodDelete, ts.URL+"/apis/networking.k8s.io/v1/namespaces/default/ingresses/web", nil)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	assertGone(legacyIngress)
+	if _, err := os.Stat(filepath.Join(dir, names.Host(names.KindIngressFile, "default", "web"))); !os.IsNotExist(err) {
+		t.Fatalf("new ingress file survived delete, stat err=%v", err)
+	}
+
+	// Middleware, whose object key deliberately stays <ns>-<name>.
+	mw := middlewareObject("default", "allow", map[string]interface{}{
+		"ipAllowList": map[string]interface{}{"sourceRange": []string{"203.0.113.7/32"}},
+	})
+	collection := ts.URL + "/apis/traefik.io/v1alpha1/namespaces/default/middlewares"
+	resp = post(t, collection, mw)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+	legacyMW := writeLegacy(names.LegacyHost(names.KindMiddlewareFile, "default", "allow"))
+	resp = do(t, http.MethodPut, collection+"/allow", mw)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	assertGone(legacyMW)
+	if cfg := readTraefikFile(t, dir, names.Host(names.KindMiddlewareFile, "default", "allow")); !strings.Contains(cfg, "default-allow:") {
+		t.Fatalf("middleware object key changed:\n%s", cfg)
+	}
+
+	legacyMW = writeLegacy(names.LegacyHost(names.KindMiddlewareFile, "default", "allow"))
+	resp = do(t, http.MethodDelete, collection+"/allow", nil)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	assertGone(legacyMW)
+	if _, err := os.Stat(filepath.Join(dir, names.Host(names.KindMiddlewareFile, "default", "allow"))); !os.IsNotExist(err) {
+		t.Fatalf("new middleware file survived delete, stat err=%v", err)
+	}
+
+	// IngressRouteTCP
+	irt := ingressRouteTCPObject("default", "smtp", tcpSpec("smtp", "mail", 25))
+	tcpCollection := ts.URL + "/apis/traefik.io/v1alpha1/namespaces/default/ingressroutetcps"
+	resp = post(t, tcpCollection, irt)
+	assertStatus(t, resp, http.StatusCreated)
+	resp.Body.Close()
+	legacyTCP := writeLegacy(names.LegacyHost(names.KindIngressRouteTCPFile, "default", "smtp"))
+	resp = do(t, http.MethodPut, tcpCollection+"/smtp", irt)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	assertGone(legacyTCP)
+	readTraefikFile(t, dir, names.Host(names.KindIngressRouteTCPFile, "default", "smtp"))
+
+	legacyTCP = writeLegacy(names.LegacyHost(names.KindIngressRouteTCPFile, "default", "smtp"))
+	resp = do(t, http.MethodDelete, tcpCollection+"/smtp", nil)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	assertGone(legacyTCP)
+	if _, err := os.Stat(filepath.Join(dir, names.Host(names.KindIngressRouteTCPFile, "default", "smtp"))); !os.IsNotExist(err) {
+		t.Fatalf("new TCP file survived delete, stat err=%v", err)
+	}
+}
+
 func TestIngressRouteTCPCRUD(t *testing.T) {
 	ts, dir := ingressTestServer(t)
 	collection := ts.URL + "/apis/traefik.io/v1alpha1/namespaces/default/ingressroutetcps"
@@ -170,7 +261,7 @@ func TestIngressRouteTCPCRUD(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	created := decodeBody(t, resp)
 	assertKind(t, created, "IngressRouteTCP")
-	readTraefikFile(t, dir, "tcp-default-smtp.yaml")
+	readTraefikFile(t, dir, "tcp_default_smtp.yaml")
 
 	resp = get(t, collection)
 	assertStatus(t, resp, http.StatusOK)
@@ -225,7 +316,7 @@ func TestIngressRouteTCPCRUD(t *testing.T) {
 	resp = do(t, http.MethodDelete, collection+"/smtp", nil)
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
-	if _, err := os.Stat(filepath.Join(dir, "tcp-default-smtp.yaml")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, "tcp_default_smtp.yaml")); !os.IsNotExist(err) {
 		t.Fatalf("tcp file was not removed: %v", err)
 	}
 	resp = get(t, collection+"/smtp")
@@ -324,7 +415,7 @@ spec:
 	if ranges, _ := allow["sourceRange"].([]interface{}); len(ranges) != 1 || ranges[0] != "192.168.0.0/16" {
 		t.Fatalf("apply update spec = %v", spec)
 	}
-	if cfg := readTraefikFile(t, dir, "middleware-default-applied.yaml"); !strings.Contains(cfg, "192.168.0.0/16") {
+	if cfg := readTraefikFile(t, dir, "middleware_default_applied.yaml"); !strings.Contains(cfg, "192.168.0.0/16") {
 		t.Fatalf("apply update did not rewrite the file:\n%s", cfg)
 	}
 }
@@ -617,7 +708,7 @@ func TestMiddlewareRenderingExact(t *testing.T) {
 				"contentTypeNosniff":      true,
 				"browserXssFilter":        true,
 				"referrerPolicy":          "no-referrer",
-				"contentSecurityPolicy":   "default-src 'self'",
+				"contentSecurityPolicy":   "default_src 'self'",
 				"permissionsPolicy":       "geolocation=()",
 				"customFrameOptionsValue": "SAMEORIGIN",
 			}},
@@ -626,7 +717,7 @@ func TestMiddlewareRenderingExact(t *testing.T) {
     default-headers:
       headers:
         browserXssFilter: true
-        contentSecurityPolicy: default-src 'self'
+        contentSecurityPolicy: default_src 'self'
         contentTypeNosniff: true
         customFrameOptionsValue: SAMEORIGIN
         customRequestHeaders:
@@ -715,7 +806,7 @@ func TestMiddlewareRenderingExact(t *testing.T) {
 				middlewareObject("default", tc.name, tc.spec))
 			assertStatus(t, resp, http.StatusCreated)
 			resp.Body.Close()
-			if got := readTraefikFile(t, dir, "middleware-default-"+tc.name+".yaml"); got != tc.want {
+			if got := readTraefikFile(t, dir, "middleware_default_"+tc.name+".yaml"); got != tc.want {
 				t.Fatalf("rendered file:\n%s\nwant:\n%s", got, tc.want)
 			}
 		})
@@ -764,7 +855,7 @@ spec:
 	if replace["replacement"] != "/latest/${1}" {
 		t.Fatalf("apply update spec = %v", spec)
 	}
-	if cfg := readTraefikFile(t, dir, "middleware-default-applied-replace-path-regex.yaml"); !strings.Contains(cfg, "/latest/${1}") {
+	if cfg := readTraefikFile(t, dir, "middleware_default_applied-replace-path-regex.yaml"); !strings.Contains(cfg, "/latest/${1}") {
 		t.Fatalf("apply update did not rewrite the file:\n%s", cfg)
 	}
 }
@@ -797,38 +888,38 @@ func TestIngressRouteTCPRenderingAndPodChurn(t *testing.T) {
 
 	want := `tcp:
   routers:
-    default-smtp-0:
+    default_smtp_0:
       entryPoints:
       - smtp
       rule: HostSNI(` + "`*`" + `)
-      service: default-smtp-0
+      service: default_smtp_0
       tls:
         passthrough: true
   serversTransports:
-    default-smtp-0:
+    default_smtp_0:
       proxyProtocol:
         version: 2
   services:
-    default-smtp-0:
+    default_smtp_0:
       loadBalancer:
         servers:
         - address: mail-0.default:2525
-        serversTransport: default-smtp-0
+        serversTransport: default_smtp_0
 `
-	if got := readTraefikFile(t, dir, "tcp-default-smtp.yaml"); got != want {
+	if got := readTraefikFile(t, dir, "tcp_default_smtp.yaml"); got != want {
 		t.Fatalf("rendered TCP file:\n%s\nwant:\n%s", got, want)
 	}
 
 	// A new matching pod is added to the servers; deleting it removes it again.
 	postPodWithPort(t, ts.URL, "default", "mail-1", map[string]string{"app": "mail"}, 2525, 0)
-	cfg := readTraefikFile(t, dir, "tcp-default-smtp.yaml")
+	cfg := readTraefikFile(t, dir, "tcp_default_smtp.yaml")
 	if !strings.Contains(cfg, "address: mail-0.default:2525") || !strings.Contains(cfg, "address: mail-1.default:2525") {
 		t.Fatalf("pod create did not regenerate the TCP file:\n%s", cfg)
 	}
 	resp = do(t, http.MethodDelete, ts.URL+"/api/v1/namespaces/default/pods/mail-1", nil)
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
-	cfg = readTraefikFile(t, dir, "tcp-default-smtp.yaml")
+	cfg = readTraefikFile(t, dir, "tcp_default_smtp.yaml")
 	if strings.Contains(cfg, "mail-1.default:2525") {
 		t.Fatalf("pod delete did not regenerate the TCP file:\n%s", cfg)
 	}
@@ -838,7 +929,7 @@ func TestIngressRouteTCPRenderingAndPodChurn(t *testing.T) {
 	resp = do(t, http.MethodDelete, ts.URL+"/api/v1/namespaces/default/services/stalwart", nil)
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
-	cfg = readTraefikFile(t, dir, "tcp-default-smtp.yaml")
+	cfg = readTraefikFile(t, dir, "tcp_default_smtp.yaml")
 	if strings.Contains(cfg, "mail-0.default:2525") {
 		t.Fatalf("Service delete did not regenerate the TCP file:\n%s", cfg)
 	}
@@ -853,7 +944,7 @@ func TestIngressRouteTCPRenderingAndPodChurn(t *testing.T) {
 	})
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
-	cfg = readTraefikFile(t, dir, "tcp-default-smtp.yaml")
+	cfg = readTraefikFile(t, dir, "tcp_default_smtp.yaml")
 	if !strings.Contains(cfg, "address: mail-0.default:2525") {
 		t.Fatalf("Service create did not regenerate the TCP file:\n%s", cfg)
 	}
@@ -905,8 +996,8 @@ func TestReconcileIngressConfigsWritesTraefikSubsetFiles(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	middlewareFile := filepath.Join(traefikDir, "middleware-default-allow.yaml")
-	tcpFile := filepath.Join(traefikDir, "tcp-default-smtp.yaml")
+	middlewareFile := filepath.Join(traefikDir, "middleware_default_allow.yaml")
+	tcpFile := filepath.Join(traefikDir, "tcp_default_smtp.yaml")
 	if err := os.Remove(middlewareFile); err != nil {
 		t.Fatal(err)
 	}

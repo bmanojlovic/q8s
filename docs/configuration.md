@@ -117,14 +117,14 @@ A single-container Pod spec translates to a `.container` file; a multi-container
 ```ini
 [Container]
 Image=nginx:latest
-ContainerName=default-nginx-0
+ContainerName=default_nginx-0
 Network=q8s-default.network
 Label=io.kubernetes.pod.name=nginx-0
 Label=io.kubernetes.pod.namespace=default
 Label=io.kubernetes.pod.deployment=nginx
 Label=app=nginx
 Environment=KEY=value
-Volume=default-my-pvc.volume:/data:Z
+Volume=default_my-pvc.volume:/data:Z
 Volume=/run/q8s/configmaps/default/config:/etc/config:ro,z
 
 [Unit]
@@ -139,6 +139,13 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 ```
+
+Generated host names use `_` between the namespace and the object name and
+before a fixed kind suffix: a Pod `nginx-0` in `default` is
+`default_nginx-0`, a Job `batch` is `default_batch__job`, and a CronJob
+`nightly` is `default_nightly__cron`. The API Pod name of a Deployment replica
+stays `<deployment>-<index>`, and the Traefik Middleware object key stays
+`<namespace>-<name>` for manifest compatibility.
 
 ### command and args
 
@@ -167,13 +174,13 @@ PVCs can specify a `storageClassName` to control how volumes are mounted:
 
 | storageClassName | Quadlet Volume= | SELinux |
 |---|---|---|
-| `standard` (default) | `ns-name.volume:/mount:Z` | Exclusive relabel |
-| `standard-shared` | `ns-name.volume:/mount:z` | Shared relabel |
+| `standard` (default) | `ns_name.volume:/mount:Z` | Exclusive relabel |
+| `standard-shared` | `ns_name.volume:/mount:z` | Shared relabel |
 | `hostpath` | `/host/path:/mount:Z` | Exclusive relabel |
 
 The `hostpath` class reads the host directory from the `q8s.io/host-path` annotation on the PVC. No `.volume` file is generated for hostpath PVCs. An optional `q8s.io/selinux-label` annotation selects the relabel mode for the host directory: `private` (default) emits `:Z`, `shared` emits `:z`, and any other value is rejected.
 
-Deleting a `standard` or `standard-shared` PVC (or its namespace) stops the generated volume unit first and then removes only its `.volume` quadlet file. The Podman volume `{namespace}-{name}` and its data are kept, because q8s never deletes PVC data automatically. A single PVC delete leaves the volume unit running while a stored Pod, Deployment, Job or CronJob still mounts the claim, since the container unit depends on the volume unit. Remove the volume by hand when the data is no longer needed: `podman volume rm {namespace}-{name}`. `q8s doctor` reports such a leftover as `data of deleted PVC` and prints that command. A `hostpath` claim has no Podman volume; deleting it only removes the claim and stops no unit.
+Deleting a `standard` or `standard-shared` PVC (or its namespace) stops the generated volume unit first and then removes only its `.volume` quadlet file. The Podman volume `{namespace}_{name}` and its data are kept, because q8s never deletes PVC data automatically. A claim created before this release keeps its old `{namespace}-{name}` volume name and `.volume` file, which `spec.volumeName` records. A single PVC delete leaves the volume unit running while a stored Pod, Deployment, Job or CronJob still mounts the claim, since the container unit depends on the volume unit. Remove the volume by hand when the data is no longer needed: `podman volume rm <spec.volumeName>`. `q8s doctor` reports such a leftover as `data of deleted PVC` and prints that command. A `hostpath` claim has no Podman volume; deleting it only removes the claim and stops no unit.
 
 Host path storage is available to administrators only: a non-administrator creating or patching a PVC with `storageClassName: hostpath` or the `q8s.io/host-path` annotation gets 403 Forbidden. See [Host access](rbac.md#host-access).
 

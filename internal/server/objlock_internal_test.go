@@ -231,14 +231,14 @@ func assertObjectLockDeploymentConsistent(t *testing.T, st *store.Store, dir, na
 	dep, err := st.GetDeployment("default", name)
 	if err == nil {
 		for i := int32(0); i < deploymentReplicas(dep); i++ {
-			path := filepath.Join(dir, fmt.Sprintf("default-%s-%d.container", name, i))
+			path := filepath.Join(dir, fmt.Sprintf("default_%s-%d.container", name, i))
 			if _, statErr := os.Stat(path); statErr != nil {
 				t.Fatalf("Deployment %s exists but its replica unit %s is missing: %v", name, filepath.Base(path), statErr)
 			}
 		}
 		return
 	}
-	if files := objectLockFilesWithPrefix(t, dir, "default-"+name+"-"); len(files) != 0 {
+	if files := objectLockFilesWithPrefix(t, dir, "default_"+name+"-"); len(files) != 0 {
 		t.Fatalf("Deployment %s is gone but unit files remain: %v", name, files)
 	}
 	for _, pod := range st.Pods("default") {
@@ -251,7 +251,7 @@ func assertObjectLockDeploymentConsistent(t *testing.T, st *store.Store, dir, na
 func assertObjectLockPodConsistent(t *testing.T, st *store.Store, dir, name string) {
 	t.Helper()
 	_, err := st.GetPod("default", name)
-	path := filepath.Join(dir, fmt.Sprintf("default-%s.container", name))
+	path := filepath.Join(dir, fmt.Sprintf("default_%s.container", name))
 	_, statErr := os.Stat(path)
 	if err == nil {
 		if statErr != nil {
@@ -284,7 +284,7 @@ func TestDeleteAndApplySameDeploymentStayConsistent(t *testing.T) {
 		if status != http.StatusOK && status != http.StatusCreated {
 			t.Fatalf("iteration %d: initial apply status = %d", i, status)
 		}
-		if files := objectLockFilesWithPrefix(t, dir, "default-"+name+"-"); len(files) == 0 {
+		if files := objectLockFilesWithPrefix(t, dir, "default_"+name+"-"); len(files) == 0 {
 			t.Fatalf("iteration %d: initial apply created no unit files", i)
 		}
 

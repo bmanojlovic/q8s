@@ -51,7 +51,7 @@ func TestNodeShellPodRendersHostNamespaceUnit(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	content, err := os.ReadFile(filepath.Join(quadletDir, "default-node-shell.container"))
+	content, err := os.ReadFile(filepath.Join(quadletDir, "default_node-shell.container"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,11 +12,18 @@ import (
 // that is removed immediately.
 const pvcProtectionFinalizer = "kubernetes.io/pvc-protection"
 
-// preparePVCUpdate applies the rules for updating deletion state: an update
+// preparePVCUpdate applies the rules for an API update of a claim: the bound
+// volume name is kept, and for deletion state an update
 // can neither clear nor invent deletionTimestamp, and removing the protection
 // finalizer from a Terminating object forces the delete. It returns true when
 // the caller must complete the delete.
 func preparePVCUpdate(existing, updated *corev1.PersistentVolumeClaim) bool {
+	// A bound claim's volume name is immutable, as in Kubernetes. It names
+	// the Podman volume that holds the data and the renderer trusts it, so a
+	// client must not be able to repoint a claim at another volume.
+	if existing.Spec.VolumeName != "" {
+		updated.Spec.VolumeName = existing.Spec.VolumeName
+	}
 	updated.DeletionTimestamp = existing.DeletionTimestamp
 	if existing.DeletionTimestamp == nil {
 		return false

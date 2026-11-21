@@ -298,7 +298,7 @@ func TestOrdinaryPodNeverJoinsOtherNamespaceNetworks(t *testing.T) {
 	netTestCreatePod(t, ts, "a", "web", nil)
 	netTestCreateNamespace(t, ts, "c")
 
-	content := netTestReadFile(t, filepath.Join(quadletDir, "a-web.container"))
+	content := netTestReadFile(t, filepath.Join(quadletDir, "a_web.container"))
 	if !netTestContainsLine(content, "Network=q8s-a.network") {
 		t.Fatalf("ordinary pod missing own Network= line:\n%s", content)
 	}
@@ -325,7 +325,7 @@ func TestNamespaceCreateAttachesOptedInPod(t *testing.T) {
 	netTestCreateNamespace(t, ts, "c")
 
 	calls := fake.connectCalls()
-	want := netTestCall{Network: "q8s-c", Container: "a-traefik", IP: "10.89.3.254"}
+	want := netTestCall{Network: "q8s-c", Container: "a_traefik", IP: "10.89.3.254"}
 	found := false
 	for _, call := range calls {
 		if call == want {
@@ -336,7 +336,7 @@ func TestNamespaceCreateAttachesOptedInPod(t *testing.T) {
 		t.Fatalf("NetworkConnect calls = %v, want %v", calls, want)
 	}
 
-	content := netTestReadFile(t, filepath.Join(quadletDir, "a-traefik.container"))
+	content := netTestReadFile(t, filepath.Join(quadletDir, "a_traefik.container"))
 	if !netTestContainsLine(content, "Network=q8s-c.network:ip=10.89.3.254") {
 		t.Fatalf("quadlet missing new namespace network line:\n%s", content)
 	}
@@ -374,7 +374,7 @@ func TestNamespaceDeleteDisconnectsBeforeRemovingNetwork(t *testing.T) {
 	}
 
 	disconnects := fake.disconnectCalls()
-	want := netTestCall{Network: "q8s-b", Container: "a-traefik"}
+	want := netTestCall{Network: "q8s-b", Container: "a_traefik"}
 	found := false
 	for _, call := range disconnects {
 		if call.Network == want.Network && call.Container == want.Container {
@@ -390,7 +390,7 @@ func TestNamespaceDeleteDisconnectsBeforeRemovingNetwork(t *testing.T) {
 	if _, err := os.Stat(networkFile); !os.IsNotExist(err) {
 		t.Fatalf("network quadlet still exists after delete, err=%v", err)
 	}
-	content := netTestReadFile(t, filepath.Join(quadletDir, "a-traefik.container"))
+	content := netTestReadFile(t, filepath.Join(quadletDir, "a_traefik.container"))
 	if netTestContains(content, "q8s-b.network") {
 		t.Fatalf("pod quadlet still references deleted namespace:\n%s", content)
 	}

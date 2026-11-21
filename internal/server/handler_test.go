@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/names"
 	"q8s/internal/quadlet"
 	"q8s/internal/server"
 	"q8s/internal/store"
@@ -831,15 +832,15 @@ func TestPVCCreateBindsAndWritesQuadlet(t *testing.T) {
 	if spec["storageClassName"] != "standard" {
 		t.Fatalf("expected defaulted storageClassName standard, got %v", spec["storageClassName"])
 	}
-	if spec["volumeName"] != "default-data" {
-		t.Fatalf("expected volumeName default-data, got %v", spec["volumeName"])
+	if spec["volumeName"] != "default_data" {
+		t.Fatalf("expected volumeName default_data, got %v", spec["volumeName"])
 	}
 
-	content, err := os.ReadFile(filepath.Join(quadletDir, "default-data.volume"))
+	content, err := os.ReadFile(filepath.Join(quadletDir, "default_data.volume"))
 	if err != nil {
 		t.Fatalf("expected quadlet volume file: %v", err)
 	}
-	if want := "[Volume]\nVolumeName=default-data\nLabel=app.kubernetes.io/managed-by=q8s\n"; string(content) != want {
+	if want := "[Volume]\nVolumeName=default_data\nLabel=app.kubernetes.io/managed-by=q8s\n"; string(content) != want {
 		t.Fatalf("unexpected volume file content:\n%s", content)
 	}
 
@@ -869,10 +870,11 @@ func TestReconcileQuadletsBindsExistingPVC(t *testing.T) {
 		t.Fatalf("UpdatePVC: %v", err)
 	}
 
-	// Pre-write the pre-scoping volume file shape: same claim, but the
-	// volume name is the bare claim name, not namespace-scoped.
+	// Pre-write the legacy <namespace>-<claim> volume file. An unbound
+	// claim adopts it instead of switching to the new <namespace>_<claim>
+	// volume, which would silently abandon the existing data.
 	volFile := filepath.Join(quadletDir, "default-legacy.volume")
-	if err := os.WriteFile(volFile, []byte("[Volume]\nVolumeName=legacy\n"), 0644); err != nil {
+	if err := os.WriteFile(volFile, []byte("[Volume]\nVolumeName=default-legacy\n"), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -897,7 +899,143 @@ func TestReconcileQuadletsBindsExistingPVC(t *testing.T) {
 		t.Fatalf("expected reconcile to write volume file: %v", err)
 	}
 	if want := "[Volume]\nVolumeName=default-legacy\nLabel=app.kubernetes.io/managed-by=q8s\n"; string(content) != want {
-		t.Fatalf("expected reconcile to rewrite unscoped volume file, got:\n%s", content)
+		t.Fatalf("expected reconcile to adopt the legacy volume file, got:\n%s", content)
+	}
+}
+
+// TestReconcileKeepsStoredLegacyVolumeName: the startup repair must not
+// rewrite a legacy spec.volumeName to the new format, because that would point
+// the claim at a new, empty volume.
+func TestReconcileKeepsStoredLegacyVolumeName(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	created, err := st.CreatePVC(&corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+	})
+	if err != nil {
+		t.Fatalf("CreatePVC: %v", err)
+	}
+	legacy := created.DeepCopy()
+	legacy.Spec.VolumeName = "default-data"
+	if _, err := st.UpdatePVC(legacy); err != nil {
+		t.Fatalf("UpdatePVC: %v", err)
+	}
+
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	srv.ReconcileQuadlets()
+
+	got, err := st.GetPVC("default", "data")
+	if err != nil {
+		t.Fatalf("GetPVC: %v", err)
+	}
+	if got.Spec.VolumeName != "default-data" {
+		t.Fatalf("reconcile rewrote the legacy volumeName to %q", got.Spec.VolumeName)
+	}
+	content, err := os.ReadFile(filepath.Join(quadletDir, "default-data.volume"))
+	if err != nil {
+		t.Fatalf("legacy .volume file missing: %v", err)
+	}
+	if want := "[Volume]\nVolumeName=default-data\nLabel=app.kubernetes.io/managed-by=q8s\n"; string(content) != want {
+		t.Fatalf("legacy volume file = %q, want %q", content, want)
+	}
+	if _, err := os.Stat(filepath.Join(quadletDir, "default_data.volume")); !os.IsNotExist(err) {
+		t.Fatalf("reconcile wrote a new-format file for a legacy claim, stat err=%v", err)
+	}
+}
+
+// TestReconcileRendersIdenticalFilesTwice: startup reconciliation must be
+// byte-identical across restarts, otherwise every restart rewrites and
+// restarts every workload.
+func TestReconcileRendersIdenticalFilesTwice(t *testing.T) {
+	st := store.New()
+	quadletDir := t.TempDir()
+	if _, err := st.CreatePVC(&corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+	}); err != nil {
+		t.Fatalf("CreatePVC: %v", err)
+	}
+	if _, err := st.CreatePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
+				},
+			}},
+		},
+	}); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if _, err := st.CreateJob(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "batch", Namespace: "default"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "batch", Image: "busybox"}}},
+		}},
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := st.CreateCronJob(&batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: "default"},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "0 3 * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "nightly", Image: "busybox"}}},
+				},
+			}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateCronJob: %v", err)
+	}
+	one := int32(1)
+	if _, err := st.CreateDeployment(&appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &one,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	srv := newTestServerWithQuadletDir(t, st, quadletDir)
+	snapshot := func() map[string]string {
+		t.Helper()
+		entries, err := os.ReadDir(quadletDir)
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		files := make(map[string]string, len(entries))
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(quadletDir, entry.Name()))
+			if err != nil {
+				t.Fatalf("ReadFile %s: %v", entry.Name(), err)
+			}
+			files[entry.Name()] = string(data)
+		}
+		return files
+	}
+	srv.ReconcileQuadlets()
+	first := snapshot()
+	if len(first) == 0 {
+		t.Fatal("reconcile wrote no files")
+	}
+	srv.ReconcileQuadlets()
+	second := snapshot()
+	if len(first) != len(second) {
+		t.Fatalf("file set changed between reconciles: %d then %d", len(first), len(second))
+	}
+	for name, content := range first {
+		if second[name] != content {
+			t.Fatalf("%s changed between two reconciles:\nfirst:\n%s\nsecond:\n%s", name, content, second[name])
+		}
 	}
 }
 
@@ -913,7 +1051,7 @@ func TestReconcileSweepsOrphanedSockets(t *testing.T) {
 	if err := os.WriteFile(orphan, []byte("[Socket]\nListenStream=13131\n"), 0644); err != nil {
 		t.Fatalf("WriteFile socket: %v", err)
 	}
-	keep := filepath.Join(quadletDir, "default-web-0.container")
+	keep := filepath.Join(quadletDir, "default_web-0.container")
 	if err := os.WriteFile(keep, []byte("[Container]\n"), 0644); err != nil {
 		t.Fatalf("WriteFile container: %v", err)
 	}
@@ -951,7 +1089,7 @@ func TestReconcileRerendersExistingPodUnits(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
-	unit := filepath.Join(quadletDir, "default-web-0.container")
+	unit := filepath.Join(quadletDir, "default_web-0.container")
 	stale := "[Container]\nImage=nginx:1.0\nHealthCmd=curl -fsS http://127.0.0.1/\n"
 	if err := os.WriteFile(unit, []byte(stale), 0644); err != nil {
 		t.Fatal(err)
@@ -964,7 +1102,7 @@ func TestReconcileRerendersExistingPodUnits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) == stale || !strings.Contains(string(got), "ContainerName=default-web-0") {
+	if string(got) == stale || !strings.Contains(string(got), "ContainerName=default_web-0") {
 		t.Fatalf("stale unit was not re-rendered:\n%s", got)
 	}
 
@@ -1474,7 +1612,7 @@ func TestEnvValueFromResolvedInQuadlet(t *testing.T) {
 	assertStatus(t, resp, 201)
 	resp.Body.Close()
 
-	podOut := readTestFile(t, filepath.Join(quadletDir, "default-envpod.container"))
+	podOut := readTestFile(t, filepath.Join(quadletDir, "default_envpod.container"))
 	if !strings.Contains(podOut, "Environment=FROM_CM=cm-val") {
 		t.Fatalf("expected resolved ConfigMap env value in pod quadlet:\n%s", podOut)
 	}
@@ -1517,7 +1655,7 @@ func TestEnvValueFromResolvedInQuadlet(t *testing.T) {
 	assertStatus(t, resp, 201)
 	resp.Body.Close()
 
-	jobOut := readTestFile(t, filepath.Join(quadletDir, "default-envjob-job.container"))
+	jobOut := readTestFile(t, filepath.Join(quadletDir, "default_envjob__job.container"))
 	if !strings.Contains(jobOut, "Environment=FROM_CM=cm-val") {
 		t.Fatalf("expected resolved ConfigMap env value in job quadlet:\n%s", jobOut)
 	}
@@ -1554,7 +1692,7 @@ func TestEnvValueFromMissingRefNotSilentlyBlank(t *testing.T) {
 	assertStatus(t, resp, 201)
 	resp.Body.Close()
 
-	if _, err := os.Stat(filepath.Join(quadletDir, "default-missingrefpod.container")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(quadletDir, "default_missingrefpod.container")); !os.IsNotExist(err) {
 		t.Fatalf("expected no quadlet file to be written for a pod with an unresolvable required secretKeyRef, err=%v", err)
 	}
 
@@ -1568,7 +1706,7 @@ func TestEnvValueFromMissingRefNotSilentlyBlank(t *testing.T) {
 	assertStatus(t, resp, 201)
 	resp.Body.Close()
 
-	if _, err := os.Stat(filepath.Join(quadletDir, "default-optionalrefpod.container")); err != nil {
+	if _, err := os.Stat(filepath.Join(quadletDir, "default_optionalrefpod.container")); err != nil {
 		t.Fatalf("expected quadlet file for a pod with only an optional unresolvable ref, err=%v", err)
 	}
 }
@@ -1754,8 +1892,8 @@ func TestCronJobUpdatePut(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	containerPath := filepath.Join(quadletDir, "default-upd-cron-cron.container")
-	timerPath := filepath.Join(quadletDir, "default-upd-cron-cron.timer")
+	containerPath := filepath.Join(quadletDir, "default_upd-cron__cron.container")
+	timerPath := filepath.Join(quadletDir, "default_upd-cron__cron.timer")
 	if got := readTestFile(t, containerPath); !strings.Contains(got, "Environment=MODE=old") {
 		t.Fatalf("created container unit missing old env:\n%s", got)
 	}
@@ -1997,7 +2135,7 @@ func TestCronJobTimeZoneRendersTimer(t *testing.T) {
 		t.Fatalf("stored timeZone = %v, want Europe/Belgrade", cj.Spec.TimeZone)
 	}
 
-	timer := readTestFile(t, filepath.Join(quadletDir, "default-zoned-cron.timer"))
+	timer := readTestFile(t, filepath.Join(quadletDir, "default_zoned__cron.timer"))
 	if !strings.Contains(timer, "OnCalendar=*-*-* 0:34:00 Europe/Belgrade\n") {
 		t.Fatalf("timer missing zoned OnCalendar line:\n%s", timer)
 	}
@@ -2536,7 +2674,7 @@ func TestDeploymentTemplateAnnotationRollsQuadlet(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	containerFile := filepath.Join(quadletDir, "default-rollpatch-0.container")
+	containerFile := filepath.Join(quadletDir, "default_rollpatch-0.container")
 	before, err := os.ReadFile(containerFile)
 	if err != nil {
 		t.Fatalf("read generated container unit: %v", err)
@@ -2954,7 +3092,7 @@ func TestIngressNilBackendSkippedInTraefikConfig(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	cfg, err := os.ReadFile(filepath.Join(traefikDir, "default-mixed.yaml"))
+	cfg, err := os.ReadFile(filepath.Join(traefikDir, "default_mixed.yaml"))
 	if err != nil {
 		t.Fatalf("traefik config not written: %v", err)
 	}
@@ -3094,11 +3232,11 @@ func TestIngressWithoutRouterAnnotationsUnchanged(t *testing.T) {
 
 	want := "http:\n" +
 		"  routers:\n" +
-		"    default-plain-0:\n" +
+		"    default_plain_0:\n" +
 		"      rule: \"Host(`example.com`)\"\n" +
-		"      service: default-plain-0\n" +
+		"      service: default_plain_0\n" +
 		"  services:\n" +
-		"    default-plain-0:\n" +
+		"    default_plain_0:\n" +
 		"      loadBalancer:\n" +
 		"        servers:\n" +
 		"          - url: \"http://localhost:80\"\n"
@@ -3353,7 +3491,7 @@ func postPodWithPort(t *testing.T, url, ns, name string, labels map[string]strin
 
 func readTraefikConfig(t *testing.T, dir, ns, name string) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(dir, ns+"-"+name+".yaml"))
+	b, err := os.ReadFile(filepath.Join(dir, names.Host(names.KindIngressFile, ns, name)))
 	if err != nil {
 		t.Fatalf("read traefik config: %v", err)
 	}
@@ -4729,15 +4867,15 @@ func TestPodWithTwoContainersWritesPodFiles(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	podOut := readTestFile(t, filepath.Join(quadletDir, "default-multi.pod"))
-	for _, want := range []string{"[Pod]", "PodName=default-multi", "Network=q8s-default.network", "PublishPort=8080:80/tcp", "Label=io.kubernetes.pod.name=multi", "Label=app=multi"} {
+	podOut := readTestFile(t, filepath.Join(quadletDir, "default_multi.pod"))
+	for _, want := range []string{"[Pod]", "PodName=default_multi", "Network=q8s-default.network", "PublishPort=8080:80/tcp", "Label=io.kubernetes.pod.name=multi", "Label=app=multi"} {
 		if !strings.Contains(podOut, want) {
 			t.Fatalf("pod file missing %q:\n%s", want, podOut)
 		}
 	}
 
-	webOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-web.container"))
-	for _, want := range []string{"Image=nginx", "ContainerName=default-multi-web", "Pod=default-multi.pod", "Environment=ROLE=web", "Label=io.kubernetes.container.name=web"} {
+	webOut := readTestFile(t, filepath.Join(quadletDir, "default_multi_web.container"))
+	for _, want := range []string{"Image=nginx", "ContainerName=default_multi_web", "Pod=default_multi.pod", "Environment=ROLE=web", "Label=io.kubernetes.container.name=web"} {
 		if !strings.Contains(webOut, want) {
 			t.Fatalf("web container missing %q:\n%s", want, webOut)
 		}
@@ -4748,8 +4886,8 @@ func TestPodWithTwoContainersWritesPodFiles(t *testing.T) {
 		}
 	}
 
-	sidecarOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-sidecar.container"))
-	for _, want := range []string{"Image=busybox", "ContainerName=default-multi-sidecar", "Pod=default-multi.pod", "Environment=ROLE=sidecar", "Label=io.kubernetes.container.name=sidecar"} {
+	sidecarOut := readTestFile(t, filepath.Join(quadletDir, "default_multi_sidecar.container"))
+	for _, want := range []string{"Image=busybox", "ContainerName=default_multi_sidecar", "Pod=default_multi.pod", "Environment=ROLE=sidecar", "Label=io.kubernetes.container.name=sidecar"} {
 		if !strings.Contains(sidecarOut, want) {
 			t.Fatalf("sidecar container missing %q:\n%s", want, sidecarOut)
 		}
@@ -4759,7 +4897,7 @@ func TestPodWithTwoContainersWritesPodFiles(t *testing.T) {
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
-	for _, name := range []string{"default-multi.pod", "default-multi-web.container", "default-multi-sidecar.container"} {
+	for _, name := range []string{"default_multi.pod", "default_multi_web.container", "default_multi_sidecar.container"} {
 		if _, err := os.Stat(filepath.Join(quadletDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("expected %s to be removed on delete, stat err=%v", name, err)
 		}
@@ -4786,17 +4924,17 @@ func TestDeploymentWithTwoContainersWritesPodFiles(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	podOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-dep-0.pod"))
-	for _, want := range []string{"PodName=default-multi-dep-0", "Network=q8s-default.network", "Label=io.kubernetes.pod.deployment=multi-dep"} {
+	podOut := readTestFile(t, filepath.Join(quadletDir, "default_multi-dep-0.pod"))
+	for _, want := range []string{"PodName=default_multi-dep-0", "Network=q8s-default.network", "Label=io.kubernetes.pod.deployment=multi-dep"} {
 		if !strings.Contains(podOut, want) {
 			t.Fatalf("deployment pod file missing %q:\n%s", want, podOut)
 		}
 	}
-	webOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-dep-0-web.container"))
-	if !strings.Contains(webOut, "Pod=default-multi-dep-0.pod") {
+	webOut := readTestFile(t, filepath.Join(quadletDir, "default_multi-dep-0_web.container"))
+	if !strings.Contains(webOut, "Pod=default_multi-dep-0.pod") {
 		t.Fatalf("deployment web container missing Pod=:\n%s", webOut)
 	}
-	sidecarOut := readTestFile(t, filepath.Join(quadletDir, "default-multi-dep-0-sidecar.container"))
+	sidecarOut := readTestFile(t, filepath.Join(quadletDir, "default_multi-dep-0_sidecar.container"))
 	if !strings.Contains(sidecarOut, "Image=busybox") {
 		t.Fatalf("deployment sidecar container missing image:\n%s", sidecarOut)
 	}
@@ -4805,7 +4943,7 @@ func TestDeploymentWithTwoContainersWritesPodFiles(t *testing.T) {
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
-	for _, name := range []string{"default-multi-dep-0.pod", "default-multi-dep-0-web.container", "default-multi-dep-0-sidecar.container"} {
+	for _, name := range []string{"default_multi-dep-0.pod", "default_multi-dep-0_web.container", "default_multi-dep-0_sidecar.container"} {
 		if _, err := os.Stat(filepath.Join(quadletDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("expected %s to be removed on delete, stat err=%v", name, err)
 		}
@@ -4842,7 +4980,7 @@ func TestDeploymentPatchAcceptsSecondContainer(t *testing.T) {
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
-	for _, name := range []string{"default-patched-0.pod", "default-patched-0-patched.container", "default-patched-0-sidecar.container"} {
+	for _, name := range []string{"default_patched-0.pod", "default_patched-0_patched.container", "default_patched-0_sidecar.container"} {
 		if _, err := os.Stat(filepath.Join(quadletDir, name)); err != nil {
 			t.Fatalf("expected patched deployment to render %s: %v", name, err)
 		}
@@ -4863,7 +5001,7 @@ func TestDeploymentStrategicPatchRemovesSidecar(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	for _, name := range []string{"default-duo-0.pod", "default-duo-0-web.container", "default-duo-0-sidecar.container"} {
+	for _, name := range []string{"default_duo-0.pod", "default_duo-0_web.container", "default_duo-0_sidecar.container"} {
 		if _, err := os.Stat(filepath.Join(quadletDir, name)); err != nil {
 			t.Fatalf("expected %s after create: %v", name, err)
 		}
@@ -4895,12 +5033,12 @@ func TestDeploymentStrategicPatchRemovesSidecar(t *testing.T) {
 		t.Fatalf("expected remaining container web, got %v", name)
 	}
 
-	for _, name := range []string{"default-duo-0.pod", "default-duo-0-sidecar.container"} {
+	for _, name := range []string{"default_duo-0.pod", "default_duo-0_sidecar.container"} {
 		if _, err := os.Stat(filepath.Join(quadletDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("expected stale %s to be removed, stat err=%v", name, err)
 		}
 	}
-	single := readTestFile(t, filepath.Join(quadletDir, "default-duo-0.container"))
+	single := readTestFile(t, filepath.Join(quadletDir, "default_duo-0.container"))
 	if !strings.Contains(single, "Image=nginx") || strings.Contains(single, "Pod=") {
 		t.Fatalf("expected a standalone single-container unit, got:\n%s", single)
 	}
@@ -4933,7 +5071,7 @@ func TestDeploymentShrinkRemovesStalePodUnits(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	for _, name := range []string{"default-duo-0.pod", "default-duo-0-web.container", "default-duo-0-sidecar.container"} {
+	for _, name := range []string{"default_duo-0.pod", "default_duo-0_web.container", "default_duo-0_sidecar.container"} {
 		if _, err := os.Stat(filepath.Join(quadletDir, name)); err != nil {
 			t.Fatalf("expected %s after create: %v", name, err)
 		}
@@ -4953,12 +5091,12 @@ func TestDeploymentShrinkRemovesStalePodUnits(t *testing.T) {
 	assertStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
-	for _, name := range []string{"default-duo-0.pod", "default-duo-0-web.container", "default-duo-0-sidecar.container"} {
+	for _, name := range []string{"default_duo-0.pod", "default_duo-0_web.container", "default_duo-0_sidecar.container"} {
 		if _, err := os.Stat(filepath.Join(quadletDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("expected stale %s to be removed, stat err=%v", name, err)
 		}
 	}
-	single := readTestFile(t, filepath.Join(quadletDir, "default-duo-0.container"))
+	single := readTestFile(t, filepath.Join(quadletDir, "default_duo-0.container"))
 	if !strings.Contains(single, "Image=nginx") || strings.Contains(single, "Pod=") {
 		t.Fatalf("expected a standalone single-container unit, got:\n%s", single)
 	}
@@ -4980,7 +5118,7 @@ func TestDeploymentGrowRemovesStaleSingleContainer(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	old := filepath.Join(quadletDir, "default-uni-0.container")
+	old := filepath.Join(quadletDir, "default_uni-0.container")
 	if _, err := os.Stat(old); err != nil {
 		t.Fatalf("expected single-container unit after create: %v", err)
 	}
@@ -4992,7 +5130,7 @@ func TestDeploymentGrowRemovesStaleSingleContainer(t *testing.T) {
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Fatalf("expected old single-container unit to be removed, stat err=%v", err)
 	}
-	for _, name := range []string{"default-uni-0.pod", "default-uni-0-web.container", "default-uni-0-sidecar.container"} {
+	for _, name := range []string{"default_uni-0.pod", "default_uni-0_web.container", "default_uni-0_sidecar.container"} {
 		if _, err := os.Stat(filepath.Join(quadletDir, name)); err != nil {
 			t.Fatalf("expected %s after grow: %v", name, err)
 		}
@@ -5014,7 +5152,7 @@ func TestUnchangedDeploymentReapplyDoesNotRewrite(t *testing.T) {
 	assertStatus(t, resp, http.StatusCreated)
 	resp.Body.Close()
 
-	path := filepath.Join(quadletDir, "default-same-0.container")
+	path := filepath.Join(quadletDir, "default_same-0.container")
 	before := readTestFile(t, path)
 	old := time.Unix(1000000, 0)
 	if err := os.Chtimes(path, old, old); err != nil {
@@ -5324,8 +5462,8 @@ func TestReconcileRerendersExistingCronJobAndJobUnits(t *testing.T) {
 	}
 	stale := "[Container]\nImage=alpine:3\n"
 	units := []string{
-		filepath.Join(quadletDir, "default-export-cron.container"),
-		filepath.Join(quadletDir, "default-once-job.container"),
+		filepath.Join(quadletDir, "default_export__cron.container"),
+		filepath.Join(quadletDir, "default_once__job.container"),
 	}
 	for _, u := range units {
 		if err := os.WriteFile(u, []byte(stale), 0644); err != nil {

@@ -28,9 +28,9 @@ configuration in the same directory as Ingress files (`TraefikDir`:
 
 | Object | File | Traefik object name |
 |---|---|---|
-| `Middleware default/allow` | `middleware-default-allow.yaml` | `default-allow` |
-| `IngressRouteTCP default/smtp` | `tcp-default-smtp.yaml` | `default-smtp-0`, `default-smtp-1`, ... |
-| `Ingress default/web` | `default-web.yaml` | `default-web-0`, `default-web-1`, ... |
+| `Middleware default/allow` | `middleware_default_allow.yaml` | `default-allow` |
+| `IngressRouteTCP default/smtp` | `tcp_default_smtp.yaml` | `default_smtp_0`, `default_smtp_1`, ... |
+| `Ingress default/web` | `default_web.yaml` | `default_web_0`, `default_web_1`, ... |
 
 Files are written atomically and are left untouched when their content has
 not changed, because Traefik's file watcher reloads on every write. Deleting
@@ -183,6 +183,8 @@ Path and regex fields may not contain control characters (anything below
 ## Ingress middleware references
 
 Traefik's Kubernetes provider names middlewares `<namespace>-<name>@kubernetescrd`.
+The Middleware object key stays in that form even though q8s writes the file
+as `middleware_<namespace>_<name>.yaml`.
 q8s serves `Middleware` objects through Traefik's file provider, so an
 Ingress annotation reference ending in `@kubernetescrd` is rewritten to
 `@file`:
@@ -249,23 +251,23 @@ The file layout for the example above is:
 ```yaml
 tcp:
   routers:
-    default-smtp-0:
+    default_smtp_0:
       entryPoints:
       - smtp
       rule: HostSNI(`*`)
-      service: default-smtp-0
+      service: default_smtp_0
       tls:
         passthrough: true
   serversTransports:
-    default-smtp-0:
+    default_smtp_0:
       proxyProtocol:
         version: 2
   services:
-    default-smtp-0:
+    default_smtp_0:
       loadBalancer:
         servers:
         - address: mail-0.default:25
-        serversTransport: default-smtp-0
+        serversTransport: default_smtp_0
 ```
 
 `proxyProtocol` on the IngressRouteTCP service is rendered as a TCP

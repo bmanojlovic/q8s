@@ -14,6 +14,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"q8s/internal/names"
 	"q8s/internal/store"
 )
 
@@ -48,7 +49,7 @@ func extNameIngress(ns, name, svcName string, port networkingv1.ServiceBackendPo
 
 func readExtNameTraefikFile(t *testing.T, dir, ns, name string) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(dir, ns+"-"+name+".yaml"))
+	b, err := os.ReadFile(filepath.Join(dir, names.Host(names.KindIngressFile, ns, name)))
 	if err != nil {
 		t.Fatalf("read traefik file: %v", err)
 	}

@@ -13,6 +13,8 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"q8s/internal/quadlet"
 )
 
 func deletePVCObject(t *testing.T, srv *Server, ns, name string) *httptest.ResponseRecorder {
@@ -31,13 +33,14 @@ func runningPodUsingClaim(ns, name, claim string) *corev1.Pod {
 
 func addPVCWithVolumeFile(t *testing.T, srv *Server, ns, name string) string {
 	t.Helper()
-	if _, err := srv.config.Store.CreatePVC(&corev1.PersistentVolumeClaim{
+	created, err := srv.config.Store.CreatePVC(&corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("CreatePVC %s/%s: %v", ns, name, err)
 	}
-	path := filepath.Join(srv.config.QuadletDir, ns+"-"+name+".volume")
-	if err := os.WriteFile(path, []byte("[Volume]\nVolumeName="+ns+"-"+name+"\n"), 0644); err != nil {
+	path := filepath.Join(srv.config.QuadletDir, quadlet.PVCVolumeFileBase(created)+".volume")
+	if err := os.WriteFile(path, []byte("[Volume]\nVolumeName="+created.Spec.VolumeName+"\n"), 0644); err != nil {
 		t.Fatalf("write volume quadlet: %v", err)
 	}
 	return path
@@ -58,7 +61,7 @@ func TestPVCProtectionDeleteOfUnusedClaimIsImmediate(t *testing.T) {
 	if _, err := os.Stat(volumeFile); !os.IsNotExist(err) {
 		t.Errorf("unused PVC left its volume file, stat err=%v", err)
 	}
-	if want := []string{"demo-data-volume.service"}; !equalStrings(stops, want) {
+	if want := []string{"demo_data-volume.service"}; !equalStrings(stops, want) {
 		t.Errorf("stopped units = %v, want %v", stops, want)
 	}
 }
@@ -152,7 +155,7 @@ func TestPVCProtectionFinishAfterLastPodGone(t *testing.T) {
 	if _, err := srv.config.Store.GetPVC("demo", "data"); err == nil {
 		t.Fatal("Terminating PVC was not removed after its last pod was gone")
 	}
-	if want := []string{"demo-data-volume.service"}; !equalStrings(stops, want) {
+	if want := []string{"demo_data-volume.service"}; !equalStrings(stops, want) {
 		t.Errorf("stopped units = %v, want %v", stops, want)
 	}
 	if _, err := os.Stat(volumeFile); !os.IsNotExist(err) {
@@ -160,7 +163,7 @@ func TestPVCProtectionFinishAfterLastPodGone(t *testing.T) {
 	}
 
 	srv.FinishTerminatingPVCs()
-	if want := []string{"demo-data-volume.service"}; !equalStrings(stops, want) {
+	if want := []string{"demo_data-volume.service"}; !equalStrings(stops, want) {
 		t.Errorf("second finish pass did work again, stopped units = %v", stops)
 	}
 }
@@ -457,5 +460,17 @@ func TestPVCProtectionStatusSyncKeepsTerminatingWaitMarker(t *testing.T) {
 	}
 	if !podWaitingForClaim(stored) {
 		t.Fatalf("status sync overwrote the Terminating wait marker: %+v", stored.Status.Conditions)
+	}
+}
+
+// TestPVCUpdateKeepsBoundVolumeName: PATCH or PUT cannot repoint a bound
+// claim at another namespace's volume.
+func TestPVCUpdateKeepsBoundVolumeName(t *testing.T) {
+	existing := &corev1.PersistentVolumeClaim{Spec: corev1.PersistentVolumeClaimSpec{VolumeName: "team_db"}}
+	updated := existing.DeepCopy()
+	updated.Spec.VolumeName = "other_db"
+	preparePVCUpdate(existing, updated)
+	if updated.Spec.VolumeName != "team_db" {
+		t.Fatalf("volumeName = %q, want team_db", updated.Spec.VolumeName)
 	}
 }

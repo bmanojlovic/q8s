@@ -26,6 +26,7 @@ import (
 	"q8s/internal/cronruns"
 	"q8s/internal/fsutil"
 	"q8s/internal/hostcheck"
+	"q8s/internal/names"
 	"q8s/internal/podman"
 	"q8s/internal/quadlet"
 	"q8s/internal/server"
@@ -281,30 +282,8 @@ func cmdUninstall() {
 				removed++
 			}
 		}
-		for _, dep := range st.AllDeployments() {
-			n := int32(1)
-			if dep.Spec.Replicas != nil && *dep.Spec.Replicas > 1 {
-				n = *dep.Spec.Replicas
-			}
-			for i := int32(0); i < n; i++ {
-				rm(fmt.Sprintf("%s/%s-%s-%d.container", d.quadletDir, dep.Namespace, dep.Name, i))
-			}
-		}
-		for _, pod := range st.AllPods() {
-			rm(fmt.Sprintf("%s/%s-%s.container", d.quadletDir, pod.Namespace, pod.Name))
-		}
-		for _, pvc := range st.AllPVCs() {
-			rm(fmt.Sprintf("%s/%s-%s.volume", d.quadletDir, pvc.Namespace, pvc.Name))
-		}
-		for _, job := range st.AllJobs() {
-			rm(fmt.Sprintf("%s/%s-%s-job.container", d.quadletDir, job.Namespace, job.Name))
-		}
-		for _, cj := range st.AllCronJobs() {
-			rm(fmt.Sprintf("%s/%s-%s-cron.container", d.quadletDir, cj.Namespace, cj.Name))
-			rm(fmt.Sprintf("%s/%s-%s-cron.timer", d.systemdDir, cj.Namespace, cj.Name))
-		}
-		for _, ns := range st.Namespaces() {
-			rm(fmt.Sprintf("%s/q8s-%s.network", d.quadletDir, ns.Name))
+		for _, path := range uninstallQuadletFiles(st, d) {
+			rm(path)
 		}
 		// Pod sockets (q8s.io/socket-activation) live in the systemd dir next
 		// to q8s's own q8s.socket; only files carrying the pod owner key are
@@ -378,8 +357,93 @@ func cmdUninstall() {
 	}
 }
 
+// uninstallQuadletFiles returns every quadlet and timer file uninstall removes
+// for the stored objects, in both the current and the pre-upgrade name. PVC
+// volumes themselves are never removed; only their .volume file is listed.
+// Pod socket files are handled separately by the owning-label glob.
+func uninstallQuadletFiles(st *store.Store, d dirs) []string {
+	seen := make(map[string]bool)
+	var paths []string
+	add := func(items ...string) {
+		for _, path := range items {
+			if path == "" || seen[path] {
+				continue
+			}
+			seen[path] = true
+			paths = append(paths, path)
+		}
+	}
+	file := func(dir, name string) string {
+		if name == "" {
+			return ""
+		}
+		return filepath.Join(dir, name)
+	}
+	for _, dep := range st.AllDeployments() {
+		n := int32(1)
+		if dep.Spec.Replicas != nil && *dep.Spec.Replicas > 1 {
+			n = *dep.Spec.Replicas
+		}
+		for i := int32(0); i < n; i++ {
+			instance := quadlet.DeploymentInstanceName(dep.Name, i)
+			add(
+				file(d.quadletDir, names.Host(names.KindPodContainerFile, dep.Namespace, instance, "")),
+				file(d.quadletDir, names.LegacyHost(names.KindPodContainerFile, dep.Namespace, instance, "")),
+				file(d.quadletDir, names.Host(names.KindPodFile, dep.Namespace, instance)),
+				file(d.quadletDir, names.LegacyHost(names.KindPodFile, dep.Namespace, instance)))
+			for _, c := range dep.Spec.Template.Spec.Containers {
+				add(
+					file(d.quadletDir, names.Host(names.KindPodContainerFile, dep.Namespace, instance, c.Name)),
+					file(d.quadletDir, names.LegacyHost(names.KindPodContainerFile, dep.Namespace, instance, c.Name)))
+			}
+		}
+	}
+	for _, pod := range st.AllPods() {
+		if len(pod.Spec.Containers) > 1 {
+			add(
+				file(d.quadletDir, names.Host(names.KindPodFile, pod.Namespace, pod.Name)),
+				file(d.quadletDir, names.LegacyHost(names.KindPodFile, pod.Namespace, pod.Name)))
+			for _, c := range pod.Spec.Containers {
+				add(
+					file(d.quadletDir, names.Host(names.KindPodContainerFile, pod.Namespace, pod.Name, c.Name)),
+					file(d.quadletDir, names.LegacyHost(names.KindPodContainerFile, pod.Namespace, pod.Name, c.Name)))
+			}
+			continue
+		}
+		add(
+			file(d.quadletDir, names.Host(names.KindPodContainerFile, pod.Namespace, pod.Name, "")),
+			file(d.quadletDir, names.LegacyHost(names.KindPodContainerFile, pod.Namespace, pod.Name, "")))
+	}
+	for _, pvc := range st.AllPVCs() {
+		if pvcUsesHostPath(pvc) {
+			continue
+		}
+		add(
+			file(d.quadletDir, quadlet.PVCVolumeFileBase(pvc)+".volume"),
+			file(d.quadletDir, names.Host(names.KindPVCFile, pvc.Namespace, pvc.Name)),
+			file(d.quadletDir, names.LegacyHost(names.KindPVCFile, pvc.Namespace, pvc.Name)))
+	}
+	for _, job := range st.AllJobs() {
+		add(
+			file(d.quadletDir, names.Host(names.KindJobFile, job.Namespace, job.Name)),
+			file(d.quadletDir, names.LegacyHost(names.KindJobFile, job.Namespace, job.Name)))
+	}
+	for _, cj := range st.AllCronJobs() {
+		add(
+			file(d.quadletDir, names.Host(names.KindCronJobFile, cj.Namespace, cj.Name)),
+			file(d.quadletDir, names.LegacyHost(names.KindCronJobFile, cj.Namespace, cj.Name)))
+		add(
+			file(d.systemdDir, names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)),
+			file(d.systemdDir, names.LegacyHost(names.KindCronJobTimer, cj.Namespace, cj.Name)))
+	}
+	for _, ns := range st.Namespaces() {
+		add(file(d.quadletDir, names.Host(names.KindNetwork, ns.Name, "")+".network"))
+	}
+	return paths
+}
+
 // pvcVolumeRemovalHints returns the `podman volume rm` command for every PVC
-// whose Podman volume still exists. A PVC's volume is PVCVolumeName, not the
+// whose Podman volume still exists. A PVC's volume is spec.volumeName, not the
 // claim name; hostpath claims have no Podman volume at all. inspect reports
 // whether a volume exists, so the command is only printed when it would work.
 func pvcVolumeRemovalHints(pvcs []*corev1.PersistentVolumeClaim, inspect func(name string) bool) []string {
@@ -388,7 +452,12 @@ func pvcVolumeRemovalHints(pvcs []*corev1.PersistentVolumeClaim, inspect func(na
 		if pvcUsesHostPath(pvc) {
 			continue
 		}
-		volName := quadlet.PVCVolumeName(pvc.Namespace, pvc.Name)
+		volName := pvc.Spec.VolumeName
+		if volName == "" {
+			// A claim stored without a binding has no volume yet; the hint
+			// names the volume a create would use.
+			volName = quadlet.PVCVolumeName(pvc.Namespace, pvc.Name)
+		}
 		if !inspect(volName) {
 			continue
 		}
@@ -1003,7 +1072,7 @@ func reconcilePodmanPods(st *store.Store, mgr *systemd.Manager) map[string][]pod
 		// have been removed by --rm while crash-looping, but the deployment
 		// still owns it and systemd will keep restarting it.
 		if mgr != nil {
-			unitName := fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name)
+			unitName := names.Host(names.KindPodService, pod.Namespace, pod.Name)
 			if state, err := mgr.UnitState(unitName); err == nil && state != nil {
 				continue
 			}
@@ -1067,7 +1136,7 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 			// when Podman hasn't reported any container yet.
 			phase, states := podmanContainerStates(pod, infos)
 			if len(infos) == 0 {
-				if state, err := mgr.UnitState(fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name)); err == nil && state != nil {
+				if state, err := mgr.UnitState(names.Host(names.KindPodService, pod.Namespace, pod.Name)); err == nil && state != nil {
 					phase = unitPhase(pod, state, infos)
 				}
 			}
@@ -1078,10 +1147,10 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 		if len(infos) > 0 {
 			health = infos[0].Health()
 		}
-		state, err := mgr.UnitState(fmt.Sprintf("%s-%s.service", pod.Namespace, pod.Name))
+		state, err := mgr.UnitState(names.Host(names.KindPodService, pod.Namespace, pod.Name))
 		if err != nil || state == nil {
 			// No systemd unit — fall back to Podman container state directly.
-			containerName := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
+			containerName := names.Host(names.KindPod, pod.Namespace, pod.Name)
 			cs, perr := podman.InspectState(containerName)
 			if perr == nil {
 				phase := podmanStateToPhase(cs.State, cs.ExitCode)
@@ -1131,7 +1200,7 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 		// MODIFIED event when the new pod becomes Ready.
 		ready := int32(0)
 		for i := int32(0); i < n; i++ {
-			pod, err := st.GetPod(dep.Namespace, fmt.Sprintf("%s-%d", dep.Name, i))
+			pod, err := st.GetPod(dep.Namespace, quadlet.DeploymentInstanceName(dep.Name, i))
 			if err == nil && pod.Status.Phase == corev1.PodRunning && store.PodReady(pod) {
 				ready++
 			}
@@ -1139,7 +1208,7 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 		st.UpdateDeploymentStatus(dep.Namespace, dep.Name, ready)
 	}
 	for _, job := range st.AllJobs() {
-		state, err := mgr.UnitState(fmt.Sprintf("%s-%s-job.service", job.Namespace, job.Name))
+		state, err := mgr.UnitState(names.Host(names.KindJobService, job.Namespace, job.Name))
 		if err != nil || state == nil {
 			continue
 		}
@@ -1168,7 +1237,7 @@ func reconcileOnce(st *store.Store, mgr *systemd.Manager) map[string][]podman.Co
 //
 // Quadlet derives the service name from the file name: foo.container becomes
 // foo.service, foo.pod becomes foo-pod.service, and q8s renders a CronJob as
-// <ns>-<name>-cron.container, so its unit is <ns>-<name>-cron.service (already
+// <ns>_<name>__cron.container, so its unit is <ns>_<name>__cron.service (already
 // covered by the .container rule).
 func isQ8sUnit(quadletDir, unit string) bool {
 	base, ok := strings.CutSuffix(unit, ".service")

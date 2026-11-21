@@ -84,10 +84,10 @@ func TestCommandMultiContainerPod(t *testing.T) {
 			if err != nil {
 				t.Fatalf("PodUnits: %v", err)
 			}
-			out := string(files["default-multi-target.container"])
+			out := string(files["default_multi_target.container"])
 			assertCommandLines(t, out, tc.want, tc.notWant)
 			// The other container keeps its own command: keys are per container.
-			assertContains(t, string(files["default-multi-other.container"]), `Entrypoint=["other-command"]`)
+			assertContains(t, string(files["default_multi_other.container"]), `Entrypoint=["other-command"]`)
 		})
 	}
 }

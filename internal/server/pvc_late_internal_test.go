@@ -80,7 +80,7 @@ func TestLateClaimStartsPodOnWaitPass(t *testing.T) {
 
 	postPodDirect(t, srv, pvcPod("default", "app", "data"))
 
-	path := filepath.Join(srv.config.QuadletDir, "default-app.container")
+	path := filepath.Join(srv.config.QuadletDir, "default_app.container")
 	if fileExists(t, path) {
 		t.Fatalf("pod unit was written before the claim existed")
 	}
@@ -103,7 +103,7 @@ func TestLateClaimStartsPodOnWaitPass(t *testing.T) {
 	if !fileExists(t, path) {
 		t.Fatalf("pod unit was not rendered after the claim appeared")
 	}
-	if want := []string{"default-app.service"}; !reflect.DeepEqual(starts, want) {
+	if want := []string{"default_app.service"}; !reflect.DeepEqual(starts, want) {
 		t.Fatalf("starts = %v, want %v", starts, want)
 	}
 	stored, err = st.GetPod("default", "app")
@@ -116,7 +116,7 @@ func TestLateClaimStartsPodOnWaitPass(t *testing.T) {
 
 	// A second pass must not restart a pod whose marker is gone.
 	srv.StartPodsWaitingForClaims()
-	if want := []string{"default-app.service"}; !reflect.DeepEqual(starts, want) {
+	if want := []string{"default_app.service"}; !reflect.DeepEqual(starts, want) {
 		t.Fatalf("second wait pass started units again: %v", starts)
 	}
 }
@@ -144,7 +144,7 @@ func TestLateClaimStartsEveryDeploymentReplica(t *testing.T) {
 	srv.generateDeploymentQuadlets(dep)
 
 	for _, name := range []string{"web-0", "web-1"} {
-		if fileExists(t, filepath.Join(srv.config.QuadletDir, "default-"+name+".container")) {
+		if fileExists(t, filepath.Join(srv.config.QuadletDir, "default_"+name+".container")) {
 			t.Fatalf("replica %s was rendered before its claim existed", name)
 		}
 		pod, err := st.GetPod("default", name)
@@ -163,7 +163,7 @@ func TestLateClaimStartsEveryDeploymentReplica(t *testing.T) {
 	srv.StartPodsWaitingForClaims()
 
 	for _, name := range []string{"web-0", "web-1"} {
-		if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default-"+name+".container")) {
+		if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default_"+name+".container")) {
 			t.Fatalf("replica %s was not rendered after the claim appeared", name)
 		}
 		pod, err := st.GetPod("default", name)
@@ -174,7 +174,7 @@ func TestLateClaimStartsEveryDeploymentReplica(t *testing.T) {
 			t.Fatalf("replica %s kept its waiting marker", name)
 		}
 	}
-	want := []string{"default-web-0.service", "default-web-1.service"}
+	want := []string{"default_web-0.service", "default_web-1.service"}
 	sort.Strings(starts)
 	if !reflect.DeepEqual(starts, want) {
 		t.Fatalf("starts = %v, want %v", starts, want)
@@ -194,14 +194,14 @@ func TestClaimBeforePodKeepsSingleStart(t *testing.T) {
 	createClaimDirect(t, st, "default", "data")
 	postPodDirect(t, srv, pvcPod("default", "app", "data"))
 
-	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default-app.container")) {
+	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default_app.container")) {
 		t.Fatalf("pod was not rendered when its claim already existed")
 	}
-	if want := []string{"default-app.service"}; !reflect.DeepEqual(starts, want) {
+	if want := []string{"default_app.service"}; !reflect.DeepEqual(starts, want) {
 		t.Fatalf("starts = %v, want %v", starts, want)
 	}
 	srv.StartPodsWaitingForClaims()
-	if !reflect.DeepEqual(starts, []string{"default-app.service"}) {
+	if !reflect.DeepEqual(starts, []string{"default_app.service"}) {
 		t.Fatalf("wait pass restarted an already rendered pod: %v", starts)
 	}
 }
@@ -215,16 +215,16 @@ func TestMissingClaimInAnotherNamespaceDoesNotReleasePod(t *testing.T) {
 	postPodDirect(t, srv, pvcPod("default", "app", "data"))
 
 	srv.StartPodsWaitingForClaims()
-	if fileExists(t, filepath.Join(srv.config.QuadletDir, "default-app.container")) || len(starts) != 0 {
+	if fileExists(t, filepath.Join(srv.config.QuadletDir, "default_app.container")) || len(starts) != 0 {
 		t.Fatalf("a claim in another namespace released the pod (starts %v)", starts)
 	}
 
 	createClaimDirect(t, st, "default", "data")
 	srv.StartPodsWaitingForClaims()
-	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default-app.container")) {
+	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default_app.container")) {
 		t.Fatalf("pod did not render after its own claim appeared")
 	}
-	if want := []string{"default-app.service"}; !reflect.DeepEqual(starts, want) {
+	if want := []string{"default_app.service"}; !reflect.DeepEqual(starts, want) {
 		t.Fatalf("starts = %v, want %v", starts, want)
 	}
 }
@@ -240,7 +240,7 @@ func TestPodWithUnitAndClaimIsNotRestarted(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		srv.StartPodsWaitingForClaims()
 	}
-	if want := []string{"default-app.service"}; !reflect.DeepEqual(starts, want) {
+	if want := []string{"default_app.service"}; !reflect.DeepEqual(starts, want) {
 		t.Fatalf("pod with a unit was restarted: starts %v, want %v", starts, want)
 	}
 }
@@ -282,17 +282,17 @@ func TestLateClaimRendersCronJobWithoutStartingTimer(t *testing.T) {
 	srv.startUnitHook = func(name string) { starts = append(starts, name) }
 
 	srv.generateCronJobQuadlets(cj)
-	if fileExists(t, filepath.Join(srv.config.QuadletDir, "default-export-cron.container")) {
+	if fileExists(t, filepath.Join(srv.config.QuadletDir, "default_export__cron.container")) {
 		t.Fatalf("cronjob container was rendered before its claim existed")
 	}
 
 	createClaimDirect(t, st, "default", "data")
 	srv.StartPodsWaitingForClaims()
 
-	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default-export-cron.container")) {
+	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default_export__cron.container")) {
 		t.Fatalf("cronjob container was not rendered after the claim appeared")
 	}
-	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default-export-cron.timer")) {
+	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default_export__cron.timer")) {
 		t.Fatalf("cronjob timer was not rendered after the claim appeared")
 	}
 	if len(starts) != 0 {
@@ -315,17 +315,17 @@ func TestLateClaimStartsJob(t *testing.T) {
 	srv.startUnitHook = func(name string) { starts = append(starts, name) }
 
 	srv.generateJobQuadlet(job)
-	if fileExists(t, filepath.Join(srv.config.QuadletDir, "default-once-job.container")) {
+	if fileExists(t, filepath.Join(srv.config.QuadletDir, "default_once__job.container")) {
 		t.Fatalf("job container was rendered before its claim existed")
 	}
 
 	createClaimDirect(t, st, "default", "data")
 	srv.StartPodsWaitingForClaims()
 
-	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default-once-job.container")) {
+	if !fileExists(t, filepath.Join(srv.config.QuadletDir, "default_once__job.container")) {
 		t.Fatalf("job container was not rendered after the claim appeared")
 	}
-	if want := []string{"default-once-job.service"}; !reflect.DeepEqual(starts, want) {
+	if want := []string{"default_once__job.service"}; !reflect.DeepEqual(starts, want) {
 		t.Fatalf("starts = %v, want %v", starts, want)
 	}
 }

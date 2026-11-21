@@ -89,8 +89,8 @@ func TestUserNSStandaloneContainerAndVolumes(t *testing.T) {
 
 	assertContains(t, out, "UserNS=auto:size=65536\n")
 	for _, want := range []string{
-		"Volume=default-data.volume:/data:Z,idmap",
-		"Volume=default-data-ro.volume:/data-ro:ro,Z,idmap",
+		"Volume=default_data.volume:/data:Z,idmap",
+		"Volume=default_data-ro.volume:/data-ro:ro,Z,idmap",
 		"Volume=/srv/models:/models:ro,Z,idmap",
 		"Volume=/run/q8s/configmaps/default/app-config:/etc/config:ro,z,idmap",
 		"Volume=/run/q8s/secrets/default/creds:/etc/creds:ro,z,idmap",
@@ -111,7 +111,7 @@ func TestUserNSOffByDefault(t *testing.T) {
 	out := string(b)
 	assertNotContains(t, out, "UserNS")
 	assertNotContains(t, out, "idmap")
-	assertContains(t, out, "Volume=default-data.volume:/data:Z")
+	assertContains(t, out, "Volume=default_data.volume:/data:Z")
 	assertContains(t, out, "Volume=q8s_default_app_scratch:/scratch\n")
 	assertContains(t, out, "Volume=q8s_default_app_scratch-ro:/scratch-ro:ro\n")
 
@@ -158,15 +158,15 @@ func TestUserNSMultiContainerPod(t *testing.T) {
 		t.Fatalf("PodUnits: %v", err)
 	}
 
-	podOut := string(files["default-multi.pod"])
+	podOut := string(files["default_multi.pod"])
 	assertContains(t, podOut, "UserNS=auto:size=65536\n")
 
-	webOut := string(files["default-multi-web.container"])
+	webOut := string(files["default_multi_web.container"])
 	assertNotContains(t, webOut, "UserNS")
 	assertContains(t, webOut, "Volume=/run/q8s/configmaps/default/app-config:/etc/config:ro,z,idmap")
-	assertContains(t, webOut, "Volume=default-data.volume:/data:Z,idmap")
+	assertContains(t, webOut, "Volume=default_data.volume:/data:Z,idmap")
 
-	sidecarOut := string(files["default-multi-sidecar.container"])
+	sidecarOut := string(files["default_multi_sidecar.container"])
 	assertNotContains(t, sidecarOut, "UserNS")
 	assertContains(t, sidecarOut, "Volume=q8s_default_multi_scratch:/scratch:idmap")
 
@@ -258,7 +258,7 @@ func TestUserNSJobContainer(t *testing.T) {
 	}
 	out := string(b)
 	assertContains(t, out, "UserNS=auto:size=65536\n")
-	assertContains(t, out, "Volume=ns-data.volume:/data:Z,idmap")
+	assertContains(t, out, "Volume=ns_data.volume:/data:Z,idmap")
 }
 
 func TestUserNSCronContainer(t *testing.T) {
@@ -330,7 +330,7 @@ func TestUserNSSizeAnnotationOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PodUnits: %v", err)
 	}
-	assertContains(t, string(files["default-multi.pod"]), "UserNS=auto:size=200000\n")
+	assertContains(t, string(files["default_multi.pod"]), "UserNS=auto:size=200000\n")
 	for name, content := range files {
 		if strings.Contains(name, ".container") {
 			assertNotContains(t, string(content), "UserNS")

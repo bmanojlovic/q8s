@@ -181,6 +181,13 @@ func TestDeploymentInstanceNames(t *testing.T) {
 	if host == names.Host(names.KindDeploymentHost, "team", "web", "10") {
 		t.Fatalf("Deployment replica 1 collides with replica 10")
 	}
+
+	longDeployment := strings.Repeat("d", 253)
+	longHost := names.Host(names.KindDeploymentHost, "team", longDeployment, "1")
+	longPod := names.Host(names.KindPod, "team", longDeployment+"-1")
+	if longHost != longPod {
+		t.Fatalf("long Deployment instance host %q differs from Pod host %q", longHost, longPod)
+	}
 }
 
 func TestCompactBoundaryAndFallback(t *testing.T) {
@@ -280,6 +287,15 @@ func TestLongNameBasesStayConsistent(t *testing.T) {
 	obj := strings.Repeat("o", 253)
 
 	pod := names.Host(names.KindPod, ns, obj)
+	if got := names.Host(names.KindPodContainer, ns, obj, ""); got != pod {
+		t.Errorf("single-container name = %q, want the Pod base %q", got, pod)
+	}
+	if got, want := names.Host(names.KindPodContainerFile, ns, obj, ""), pod+".container"; got != want {
+		t.Errorf("single-container file = %q, want %q", got, want)
+	}
+	if got, want := names.Host(names.KindPodContainerService, ns, obj, ""), pod+".service"; got != want {
+		t.Errorf("single-container service = %q, want %q", got, want)
+	}
 	if got, want := names.Host(names.KindPodFile, ns, obj), pod+".pod"; got != want {
 		t.Errorf("Pod file = %q, want %q", got, want)
 	}
@@ -408,7 +424,7 @@ func TestEffectivePVCNames(t *testing.T) {
 		{"new claim keeps its volume", current, false, current, current},
 		{"unbound claim adopts a legacy file", "", true, legacy, legacy},
 		{"unbound claim without an old file is new", "", false, current, current},
-		{"another persisted binding is authoritative", "custom-volume", false, "custom-volume", "custom-volume"},
+		{"a foreign persisted binding is ignored", "custom-volume", false, current, current},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -441,5 +457,22 @@ func TestMissingExtraPanics(t *testing.T) {
 			}()
 			tc.call()
 		})
+	}
+}
+
+// TestEffectivePVCNameIgnoresForeignVolumeName: spec.volumeName is client
+// writable, so a value naming another claim's volume must not be used.
+func TestEffectivePVCNameIgnoresForeignVolumeName(t *testing.T) {
+	for _, foreign := range []string{"other-db", "other_db", "team-prod-db", "q8s_team_x_y", "../etc"} {
+		got := names.EffectivePVCVolumeName("team", "db", foreign, false)
+		if got != names.Host(names.KindPVCVolume, "team", "db") {
+			t.Errorf("volumeName %q: got %q, want the claim's own new name", foreign, got)
+		}
+		if got := names.EffectivePVCFileBase("team", "db", foreign, true); got != names.LegacyHost(names.KindPVCVolume, "team", "db") {
+			t.Errorf("volumeName %q with legacy file: got %q, want the legacy name", foreign, got)
+		}
+	}
+	if got := names.EffectivePVCVolumeName("team", "db", "team-db", false); got != "team-db" {
+		t.Errorf("legacy volumeName not kept: %q", got)
 	}
 }

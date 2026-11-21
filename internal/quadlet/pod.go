@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"q8s/internal/names"
 )
 
 // NetworkAttachment is one namespace network a pod joins; IP may be empty.
@@ -71,8 +73,8 @@ type containerRender struct {
 }
 
 // PodUnits renders the quadlet files for a multi-container pod: one
-// <ns>-<pod>.pod holding the pod-level settings and one
-// <ns>-<pod>-<container>.container per spec container. The returned map is
+// <ns>_<pod>.pod holding the pod-level settings and one
+// <ns>_<pod>_<container>.container per spec container. The returned map is
 // keyed by filename (the caller writes each file into the quadlet dir).
 // Single-container pods must keep using Container, whose output is
 // byte-identical to q8s before pods existed.
@@ -97,15 +99,15 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 		return nil, err
 	}
 	workloadMount := workloadMountArg(workload)
-	podName := podBaseName(pod.Namespace, name)
+	podFile := names.Host(names.KindPodFile, pod.Namespace, name)
 	files := map[string][]byte{
-		podName + ".pod": withTemplateHash(podContent),
+		podFile: withTemplateHash(podContent),
 	}
 	for _, c := range pod.Spec.Containers {
 		if err := validateRefName("container name", c.Name); err != nil {
 			return nil, err
 		}
-		filename := podContainerName(pod.Namespace, name, c.Name) + ".container"
+		filename := names.Host(names.KindPodContainerFile, pod.Namespace, name, c.Name)
 		if _, exists := files[filename]; exists {
 			return nil, fmt.Errorf("pod %s/%s has duplicate container name %q", pod.Namespace, name, c.Name)
 		}
@@ -113,7 +115,7 @@ func PodUnits(name string, pod *corev1.Pod, configDir string, serviceAliases []s
 			pod:            pod,
 			container:      c,
 			containerName:  podContainerName(pod.Namespace, name, c.Name),
-			podUnit:        podName + ".pod",
+			podUnit:        podFile,
 			containerLabel: c.Name,
 			podName:        name,
 			configDir:      configDir,
@@ -386,7 +388,7 @@ func renderContainer(r containerRender) ([]byte, error) {
 			return nil, err
 		}
 		for _, s := range sockets {
-			unit := fmt.Sprintf("%s-%s-%s.socket", pod.Namespace, r.podName, s.Name)
+			unit := names.Host(names.KindSocketFile, pod.Namespace, r.podName, s.Name)
 			b.WriteString(fmt.Sprintf("Requires=%s\n", unit))
 			b.WriteString(fmt.Sprintf("After=%s\n", unit))
 		}
@@ -487,7 +489,7 @@ func writeContainerVolumes(b *strings.Builder, r containerRender) error {
 					b.WriteString(line)
 				} else {
 					// PVC not found in map - fall back to named volume with :Z
-					b.WriteString(fmt.Sprintf("Volume=%s-%s.volume:%s%s\n", pod.Namespace, vol.PersistentVolumeClaim.ClaimName, vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
+					b.WriteString(fmt.Sprintf("Volume=%s.volume:%s%s\n", names.Host(names.KindPVCVolume, pod.Namespace, vol.PersistentVolumeClaim.ClaimName), vm.MountPath, volumeOptions(readOnly, "Z", userNS)))
 				}
 			case vol.ConfigMap != nil:
 				if err := validateRefName("configMap.name", vol.ConfigMap.Name); err != nil {

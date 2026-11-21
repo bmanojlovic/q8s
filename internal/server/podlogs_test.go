@@ -91,7 +91,7 @@ func readLogs(t *testing.T, url string) string {
 
 func TestPodLogsFinishedPodReadsJournal(t *testing.T) {
 	fake := newFakeJournal()
-	fake.logs["default-done"] = []byte(`{"MESSAGE":"finished output","__REALTIME_TIMESTAMP":"1700000000000000"}`)
+	fake.logs["default_done"] = []byte(`{"MESSAGE":"finished output","__REALTIME_TIMESTAMP":"1700000000000000"}`)
 	ts, st := newCronRunServer(t, fake)
 	installFakePodman(t, false, "", "", 0)
 	createLogPod(t, ts, st, "done", []interface{}{
@@ -103,10 +103,10 @@ func TestPodLogsFinishedPodReadsJournal(t *testing.T) {
 	}
 
 	args := lastJournalArgs(fake)
-	if !containsArg(args, "default-done.service") {
+	if !containsArg(args, "default_done.service") {
 		t.Fatalf("journal args selected wrong unit: %v", args)
 	}
-	if !containsArg(args, "CONTAINER_NAME=default-done") {
+	if !containsArg(args, "CONTAINER_NAME=default_done") {
 		t.Fatalf("journal args selected wrong container: %v", args)
 	}
 	created, err := time.Parse(time.RFC3339, logPodCreated)
@@ -128,8 +128,8 @@ func TestPodLogsFinishedPodReadsJournal(t *testing.T) {
 
 func TestPodLogsMultiContainerReadsJournal(t *testing.T) {
 	fake := newFakeJournal()
-	fake.logs["default-duo-web"] = []byte(`{"MESSAGE":"web output"}`)
-	fake.logs["default-duo-sidecar"] = []byte(`{"MESSAGE":"sidecar output"}`)
+	fake.logs["default_duo_web"] = []byte(`{"MESSAGE":"web output"}`)
+	fake.logs["default_duo_sidecar"] = []byte(`{"MESSAGE":"sidecar output"}`)
 	ts, st := newCronRunServer(t, fake)
 	installFakePodman(t, false, "", "", 0)
 	createLogPod(t, ts, st, "duo", []interface{}{
@@ -142,10 +142,10 @@ func TestPodLogsMultiContainerReadsJournal(t *testing.T) {
 	}
 
 	args := lastJournalArgs(fake)
-	if !containsArg(args, "default-duo-sidecar.service") {
+	if !containsArg(args, "default_duo_sidecar.service") {
 		t.Fatalf("journal args selected wrong unit: %v", args)
 	}
-	if !containsArg(args, "CONTAINER_NAME=default-duo-sidecar") {
+	if !containsArg(args, "CONTAINER_NAME=default_duo_sidecar") {
 		t.Fatalf("journal args selected wrong container: %v", args)
 	}
 
@@ -153,14 +153,14 @@ func TestPodLogsMultiContainerReadsJournal(t *testing.T) {
 	if got, want := readLogs(t, ts.URL+"/api/v1/namespaces/default/pods/duo/log"), "web output\n"; got != want {
 		t.Fatalf("default container logs = %q, want %q", got, want)
 	}
-	if args := lastJournalArgs(fake); !containsArg(args, "default-duo-web.service") {
+	if args := lastJournalArgs(fake); !containsArg(args, "default_duo_web.service") {
 		t.Fatalf("journal args selected wrong default unit: %v", args)
 	}
 }
 
 func TestPodLogsExistingContainerUsesPodman(t *testing.T) {
 	fake := newFakeJournal()
-	fake.logs["default-live"] = []byte(`{"MESSAGE":"journal output"}`)
+	fake.logs["default_live"] = []byte(`{"MESSAGE":"journal output"}`)
 	ts, st := newCronRunServer(t, fake)
 	installFakePodman(t, true, "podman output\n", "", 0)
 	createLogPod(t, ts, st, "live", []interface{}{
@@ -177,7 +177,7 @@ func TestPodLogsExistingContainerUsesPodman(t *testing.T) {
 
 func TestPodLogsJournalTailAndTimestamps(t *testing.T) {
 	fake := newFakeJournal()
-	fake.logs["default-tail"] = []byte(strings.Join([]string{
+	fake.logs["default_tail"] = []byte(strings.Join([]string{
 		`{"MESSAGE":"first","__REALTIME_TIMESTAMP":"1700000000000000"}`,
 		`{"MESSAGE":"second","__REALTIME_TIMESTAMP":"1700000001000000"}`,
 	}, "\n"))
@@ -215,7 +215,7 @@ func TestPodLogsJournalTailAndTimestamps(t *testing.T) {
 func TestPodLogsPendingPodKeepsPodmanError(t *testing.T) {
 	fake := newFakeJournal()
 	ts, st := newCronRunServer(t, fake)
-	errText := fmt.Sprintf("Error: no container with name or ID %q found: no such container\n", "default-pending")
+	errText := fmt.Sprintf("Error: no container with name or ID %q found: no such container\n", "default_pending")
 	installFakePodman(t, false, "", errText, 125)
 	createLogPod(t, ts, st, "pending", []interface{}{
 		map[string]interface{}{"name": "app", "image": "busybox"},

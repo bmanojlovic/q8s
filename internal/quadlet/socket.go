@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"q8s/internal/names"
+
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -164,7 +166,7 @@ func SocketUnits(ns, podName string, entries []SocketEntry) (map[string][]byte, 
 			}
 			e.Addr = ip.String()
 		}
-		filename := fmt.Sprintf("%s-%s-%s.socket", ns, podName, e.Name)
+		filename := names.Host(names.KindSocketFile, ns, podName, e.Name)
 		if _, exists := files[filename]; exists {
 			return nil, fmt.Errorf("duplicate socket name %q", e.Name)
 		}
@@ -182,7 +184,7 @@ func SocketUnits(ns, podName string, entries []SocketEntry) (map[string][]byte, 
 		b.WriteString("\n[Socket]\n")
 		b.WriteString(fmt.Sprintf("ListenStream=%s\n", listen))
 		b.WriteString(fmt.Sprintf("FileDescriptorName=%s\n", e.Name))
-		b.WriteString(fmt.Sprintf("Service=%s-%s.service\n", ns, podName))
+		b.WriteString(fmt.Sprintf("Service=%s\n", names.Host(names.KindPodService, ns, podName)))
 		b.WriteString("\n[Install]\n")
 		b.WriteString("WantedBy=sockets.target\n")
 		files[filename] = []byte(b.String())

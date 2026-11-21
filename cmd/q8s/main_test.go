@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"q8s/internal/podman"
@@ -475,7 +477,11 @@ func TestPVCVolumeRemovalHintsUseRealVolumeName(t *testing.T) {
 	pvcs := []*corev1.PersistentVolumeClaim{
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
-			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &standard},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				StorageClassName: &standard,
+				// A claim created before the naming upgrade keeps this value.
+				VolumeName: "default-data",
+			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "host", Namespace: "default"},
@@ -501,7 +507,78 @@ func TestPVCVolumeRemovalHintsUseRealVolumeName(t *testing.T) {
 			t.Errorf("inspected a claim name or hostpath volume instead of the Podman volume: %v", inspected)
 		}
 	}
-	if len(inspected) != 2 || inspected[0] != "default-data" || inspected[1] != "team-gone" {
-		t.Errorf("inspected volumes = %v, want [default-data team-gone]", inspected)
+	if len(inspected) != 2 || inspected[0] != "default-data" || inspected[1] != "team_gone" {
+		t.Errorf("inspected volumes = %v, want [default-data team_gone]", inspected)
+	}
+}
+
+func TestUninstallQuadletFilesUseBothNames(t *testing.T) {
+	st := store.New()
+	if _, err := st.CreatePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+	}); err != nil {
+		t.Fatalf("CreatePod: %v", err)
+	}
+	if _, err := st.CreatePVC(&corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "default"},
+	}); err != nil {
+		t.Fatalf("CreatePVC: %v", err)
+	}
+	if _, err := st.CreateJob(&batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "batch", Namespace: "default"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "batch", Image: "busybox"}}},
+		}},
+	}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := st.CreateCronJob(&batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "nightly", Namespace: "default"},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "0 3 * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "nightly", Image: "busybox"}}},
+				},
+			}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateCronJob: %v", err)
+	}
+	one := int32(1)
+	if _, err := st.CreateDeployment(&appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &one,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+
+	d := dirs{quadletDir: "/quadlets", systemdDir: "/units"}
+	paths := uninstallQuadletFiles(st, d)
+	joined := strings.Join(paths, "\n")
+	for _, want := range []string{
+		"/quadlets/default_app.container",           // new Pod file
+		"/quadlets/default-app.container",           // legacy Pod file
+		"/quadlets/default_data.volume",             // new PVC file
+		"/quadlets/default-data.volume",             // legacy PVC file
+		"/quadlets/default_batch__job.container",    // new Job file
+		"/quadlets/default-batch-job.container",     // legacy Job file
+		"/quadlets/default_nightly__cron.container", // new CronJob file
+		"/quadlets/default-nightly-cron.container",  // legacy CronJob file
+		"/units/default_nightly__cron.timer",        // new timer
+		"/units/default-nightly-cron.timer",         // legacy timer
+		"/quadlets/default_web-0.container",         // new Deployment instance
+		"/quadlets/default-web-0.container",         // legacy Deployment instance
+		"/quadlets/q8s-default.network",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("uninstall paths missing %q:\n%s", want, joined)
+		}
 	}
 }

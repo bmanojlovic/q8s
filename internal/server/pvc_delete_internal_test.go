@@ -26,11 +26,12 @@ func pvcDeleteServer(t *testing.T, ns, name string) (*Server, string) {
 		t.Fatalf("CreateNamespace: %v", err)
 	}
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
-	if _, err := st.CreatePVC(pvc); err != nil {
+	created, err := st.CreatePVC(pvc)
+	if err != nil {
 		t.Fatalf("CreatePVC: %v", err)
 	}
-	path := filepath.Join(dir, ns+"-"+name+".volume")
-	if err := os.WriteFile(path, []byte("[Volume]\nVolumeName="+ns+"-"+name+"\n"), 0644); err != nil {
+	path := filepath.Join(dir, quadlet.PVCVolumeFileBase(created)+".volume")
+	if err := os.WriteFile(path, []byte("[Volume]\nVolumeName="+created.Spec.VolumeName+"\n"), 0644); err != nil {
 		t.Fatalf("write volume quadlet: %v", err)
 	}
 	return &Server{config: Config{Store: st, QuadletDir: dir}}, path
@@ -68,7 +69,7 @@ func TestDeleteUnusedPVCStopsVolumeUnitBeforeFileRemoval(t *testing.T) {
 	filePresentAtStop := false
 	srv.stopUnitHook = func(name string) {
 		stops = append(stops, name)
-		if name == "demo-data-volume.service" {
+		if name == "demo_data-volume.service" {
 			if _, err := os.Stat(volumeFile); err == nil {
 				filePresentAtStop = true
 			}
@@ -77,7 +78,7 @@ func TestDeleteUnusedPVCStopsVolumeUnitBeforeFileRemoval(t *testing.T) {
 
 	deletePVCThroughAPI(t, srv, "demo", "data")
 
-	if want := []string{"demo-data-volume.service"}; !equalStrings(stops, want) {
+	if want := []string{"demo_data-volume.service"}; !equalStrings(stops, want) {
 		t.Errorf("stopped units = %v, want %v", stops, want)
 	}
 	if !filePresentAtStop {
@@ -85,6 +86,45 @@ func TestDeleteUnusedPVCStopsVolumeUnitBeforeFileRemoval(t *testing.T) {
 	}
 	if _, err := os.Stat(volumeFile); !os.IsNotExist(err) {
 		t.Errorf("volume quadlet survived delete, stat err=%v", err)
+	}
+}
+
+// TestDeleteLegacyPVCStopsLegacyVolumeUnit: a claim created before the naming
+// upgrade has spec.volumeName <ns>-<claim> and a <ns>-<claim>.volume file, and
+// delete must stop exactly that unit and remove that file.
+func TestDeleteLegacyPVCStopsLegacyVolumeUnit(t *testing.T) {
+	dir := t.TempDir()
+	st := store.New()
+	if _, err := st.CreateNamespace(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "demo"}}); err != nil {
+		t.Fatalf("CreateNamespace: %v", err)
+	}
+	created, err := st.CreatePVC(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "demo"}})
+	if err != nil {
+		t.Fatalf("CreatePVC: %v", err)
+	}
+	legacy := created.DeepCopy()
+	legacy.Spec.VolumeName = "demo-data"
+	if _, err := st.UpdatePVC(legacy); err != nil {
+		t.Fatalf("UpdatePVC: %v", err)
+	}
+	legacyFile := filepath.Join(dir, "demo-data.volume")
+	if err := os.WriteFile(legacyFile, []byte("[Volume]\nVolumeName=demo-data\n"), 0644); err != nil {
+		t.Fatalf("write legacy volume quadlet: %v", err)
+	}
+	srv := &Server{config: Config{Store: st, QuadletDir: dir}}
+	var stops []string
+	srv.stopUnitHook = func(name string) { stops = append(stops, name) }
+
+	deletePVCThroughAPI(t, srv, "demo", "data")
+
+	if want := []string{"demo-data-volume.service"}; !equalStrings(stops, want) {
+		t.Errorf("stopped units = %v, want %v", stops, want)
+	}
+	if _, err := os.Stat(legacyFile); !os.IsNotExist(err) {
+		t.Errorf("legacy volume file survived delete, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "demo_data.volume")); !os.IsNotExist(err) {
+		t.Errorf("delete touched a new-format file, stat err=%v", err)
 	}
 }
 
@@ -144,8 +184,8 @@ func TestNamespaceDeleteStopsWorkloadsBeforeVolumeUnit(t *testing.T) {
 		t.Fatalf("namespace delete status = %d, body %s", rec.Code, rec.Body.String())
 	}
 
-	idxPod := callIndex(events, "stop demo-app.service")
-	idxVolume := callIndex(events, "stop demo-data-volume.service")
+	idxPod := callIndex(events, "stop demo_app.service")
+	idxVolume := callIndex(events, "stop demo_data-volume.service")
 	if idxPod < 0 || idxVolume < 0 || idxPod > idxVolume {
 		t.Errorf("volume unit must stop after the workload units, events: %v", events)
 	}

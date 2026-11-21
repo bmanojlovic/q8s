@@ -84,7 +84,7 @@ func TestAPIDeleteDeploymentReplicaRecreatesItWithFreshEmptyDir(t *testing.T) {
 		t.Fatalf("delete body = kind %q uid %q deletionTimestamp %v, want the deleted Pod with uid %q",
 			body.Kind, body.UID, body.DeletionTimestamp, oldReplica.UID)
 	}
-	if !hasCall(starts, "default-web-0.service") {
+	if !hasCall(starts, "default_web-0.service") {
 		t.Errorf("recreated replica was not started, starts %v", starts)
 	}
 	stillThere, err := st.GetPod("default", "web-1")
@@ -138,7 +138,7 @@ func TestCollectionDeleteRecreatesEveryDeploymentReplica(t *testing.T) {
 		if string(pod.UID) == old[name] {
 			t.Errorf("replica %s kept the old UID %q", name, old[name])
 		}
-		if !hasCall(starts, "default-"+name+".service") {
+		if !hasCall(starts, "default_"+name+".service") {
 			t.Errorf("replica %s was not started, starts %v", name, starts)
 		}
 	}

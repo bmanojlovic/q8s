@@ -291,15 +291,19 @@ func layoutFor(kind Kind, namespace, name string, extra []string) (nameLayout, b
 	case KindPodContainer:
 		parts := []string{namespace, name}
 		// An empty container selects the single-container shape, matching
-		// the historical podContainerName helper.
+		// the historical podContainerName helper. It must share the Pod hash
+		// family so a truncated container name still equals its .container
+		// and .service base.
+		hashFamily := KindPod
 		if container, ok := get(0); ok && container != "" {
 			parts = append(parts, container)
+			hashFamily = KindPodContainer
 		}
 		return nameLayout{
 			separatorNew:    "_",
 			separatorLegacy: "-",
 			parts:           parts,
-			hashFamily:      KindPodContainer,
+			hashFamily:      hashFamily,
 			compact:         true,
 		}, true
 
@@ -338,29 +342,33 @@ func layoutFor(kind Kind, namespace, name string, extra []string) (nameLayout, b
 
 	case KindPodContainerFile:
 		parts := []string{namespace, name}
+		hashFamily := KindPod
 		if container, ok := get(0); ok && container != "" {
 			parts = append(parts, container)
+			hashFamily = KindPodContainer
 		}
 		return nameLayout{
 			separatorNew:    "_",
 			separatorLegacy: "-",
 			parts:           parts,
 			extension:       ".container",
-			hashFamily:      KindPodContainer,
+			hashFamily:      hashFamily,
 			compact:         true,
 		}, true
 
 	case KindPodContainerService:
 		parts := []string{namespace, name}
+		hashFamily := KindPod
 		if container, ok := get(0); ok && container != "" {
 			parts = append(parts, container)
+			hashFamily = KindPodContainer
 		}
 		return nameLayout{
 			separatorNew:    "_",
 			separatorLegacy: "-",
 			parts:           parts,
 			extension:       ".service",
-			hashFamily:      KindPodContainer,
+			hashFamily:      hashFamily,
 			compact:         true,
 		}, true
 
@@ -521,8 +529,12 @@ func layoutFor(kind Kind, namespace, name string, extra []string) (nameLayout, b
 			separatorNew:    "_",
 			separatorLegacy: "-",
 			parts:           []string{namespace, name + "-" + index},
-			hashFamily:      KindDeploymentHost,
-			compact:         true,
+			// The API Pod name is <deployment>-<index>, so the host prefix
+			// is exactly the Pod family for that materialized name. Sharing
+			// the family keeps a truncated instance name identical to the
+			// Pod host name.
+			hashFamily: KindPod,
+			compact:    true,
 		}, true
 
 	case KindDeploymentVolumeOwner:
@@ -657,11 +669,18 @@ func EffectivePVCFileBase(namespace, name, persistedVolumeName string, legacyFil
 }
 
 func effectivePVCName(namespace, name, persistedVolumeName string, legacyFileExists bool) string {
-	if persistedVolumeName != "" {
+	// spec.volumeName is stored with the claim and a client can PATCH or PUT
+	// it. Only the two names this claim can own are honoured; anything else
+	// (for example another namespace's volume) is ignored, so a claim can
+	// never point at, or overwrite the .volume file of, a volume it does not
+	// own.
+	legacy := LegacyHost(KindPVCVolume, namespace, name)
+	current := Host(KindPVCVolume, namespace, name)
+	if persistedVolumeName == legacy || persistedVolumeName == current {
 		return persistedVolumeName
 	}
 	if legacyFileExists {
-		return LegacyHost(KindPVCVolume, namespace, name)
+		return legacy
 	}
-	return Host(KindPVCVolume, namespace, name)
+	return current
 }

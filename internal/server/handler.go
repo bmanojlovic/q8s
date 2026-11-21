@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"q8s/internal/fsutil"
+	"q8s/internal/names"
 	"q8s/internal/quadlet"
 	"q8s/internal/store"
 )
@@ -712,8 +713,8 @@ func filenameSet(files map[string][]byte) map[string]bool {
 // below: the managed-by marker, the namespace and the pod name. Files without
 // the managed-by label (hand-written quadlets, or files written by an older
 // q8s) are never touched. Matching is by exact line, never by filename prefix
-// or substring, because pod "duo" container "web" and pod "duo-web" share the
-// same <ns>-duo-web.container filename shape.
+// or substring, because an old-format file and a current one can be close in
+// name; ownership is the exact label set, never the filename.
 //
 // Returns true when it removed something; in that case it has already run the
 // usual daemon-reload.
@@ -816,7 +817,7 @@ func podQuadletFiles(name string, pod *corev1.Pod, configDir string, serviceAlia
 		return nil, err
 	}
 	return map[string][]byte{
-		fmt.Sprintf("%s-%s.container", pod.Namespace, name): content,
+		names.Host(names.KindPodContainerFile, pod.Namespace, name, ""): content,
 	}, nil
 }
 
@@ -825,25 +826,25 @@ func podQuadletFiles(name string, pod *corev1.Pod, configDir string, serviceAlia
 // the Requires=/After= that pulls the .pod service in.
 func podUnitNames(ns, name string, containers []corev1.Container) []string {
 	if len(containers) > 1 {
-		names := make([]string, 0, len(containers))
+		units := make([]string, 0, len(containers))
 		for _, c := range containers {
-			names = append(names, fmt.Sprintf("%s-%s-%s.service", ns, name, c.Name))
+			units = append(units, names.Host(names.KindPodContainerService, ns, name, c.Name))
 		}
-		return names
+		return units
 	}
-	return []string{fmt.Sprintf("%s-%s.service", ns, name)}
+	return []string{names.Host(names.KindPodService, ns, name)}
 }
 
 // podQuadletPaths returns every quadlet file q8s writes for a pod object.
 func podQuadletPaths(quadletDir, ns, name string, containers []corev1.Container) []string {
 	if len(containers) > 1 {
-		paths := []string{fmt.Sprintf("%s/%s-%s.pod", quadletDir, ns, name)}
+		paths := []string{filepath.Join(quadletDir, names.Host(names.KindPodFile, ns, name))}
 		for _, c := range containers {
-			paths = append(paths, fmt.Sprintf("%s/%s-%s-%s.container", quadletDir, ns, name, c.Name))
+			paths = append(paths, filepath.Join(quadletDir, names.Host(names.KindPodContainerFile, ns, name, c.Name)))
 		}
 		return paths
 	}
-	return []string{fmt.Sprintf("%s/%s-%s.container", quadletDir, ns, name)}
+	return []string{filepath.Join(quadletDir, names.Host(names.KindPodContainerFile, ns, name, ""))}
 }
 
 // reloadAfterRemove deletes paths then triggers a daemon-reload.
@@ -1167,19 +1168,19 @@ func (s *Server) handlePods(w http.ResponseWriter, r *http.Request, ns, name str
 
 // podContainerName resolves the container selector of a logs/exec request
 // to the Podman container name q8s gives that member. A single-container pod
-// keeps its historical <ns>-<pod> name (so -c changes nothing there); a
-// multi-container pod maps -c <container> to <ns>-<pod>-<container>, and
+// uses the same <ns>_<pod> name (so -c changes nothing there); a
+// multi-container pod maps -c <container> to <ns>_<pod>_<container>, and
 // without -c to its first container, like kubectl's default-container
 // behaviour.
 func (s *Server) podContainerName(ns, podName, requested string) string {
 	pod, err := s.config.Store.GetPod(ns, podName)
 	if err != nil || len(pod.Spec.Containers) <= 1 {
-		return fmt.Sprintf("%s-%s", ns, podName)
+		return names.Host(names.KindPodContainer, ns, podName, "")
 	}
 	if requested == "" {
 		requested = pod.Spec.Containers[0].Name
 	}
-	return fmt.Sprintf("%s-%s-%s", ns, podName, requested)
+	return names.Host(names.KindPodContainer, ns, podName, requested)
 }
 
 // validateRequestedContainer answers a logs/exec/attach ?container= query
@@ -1209,16 +1210,16 @@ func validateRequestedContainer(pod *corev1.Pod, requested string) error {
 // podUnitNames and podContainerName: a single-container pod keeps the
 // pod-only names, a multi-container pod names the requested member.
 func podLogUnit(pod *corev1.Pod, requested string) (unit, container string) {
-	container = fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
-	unit = container + ".service"
+	container = names.Host(names.KindPodContainer, pod.Namespace, pod.Name, "")
+	unit = names.Host(names.KindPodService, pod.Namespace, pod.Name)
 	if len(pod.Spec.Containers) <= 1 {
 		return unit, container
 	}
 	if requested == "" {
 		requested = pod.Spec.Containers[0].Name
 	}
-	container = fmt.Sprintf("%s-%s-%s", pod.Namespace, pod.Name, requested)
-	return container + ".service", container
+	container = names.Host(names.KindPodContainer, pod.Namespace, pod.Name, requested)
+	return names.Host(names.KindPodContainerService, pod.Namespace, pod.Name, requested), container
 }
 
 // podmanContainerExists reports whether podman still has the named
@@ -3057,9 +3058,11 @@ func (s *Server) cleanupNamespaceResources(ns string) []corev1.PodSpec {
 	// otherwise keep Traefik config pointing at a deleted namespace.
 	for _, mw := range s.config.Store.Middlewares(ns) {
 		s.removeTraefikConfigFile(middlewareFilename(mw.Namespace, mw.Name))
+		s.removeTraefikConfigFile(legacyMiddlewareFilename(mw.Namespace, mw.Name))
 	}
 	for _, irt := range s.config.Store.IngressRouteTCPs(ns) {
 		s.removeTraefikConfigFile(tcpFilename(irt.Namespace, irt.Name))
+		s.removeTraefikConfigFile(legacyTCPFilename(irt.Namespace, irt.Name))
 	}
 	// Services: drop legacy per-port socket files (see
 	// removeLegacyServiceSockets) along with them.
@@ -3427,7 +3430,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request, ns, name str
 			if resolved, envFile, err := s.resolvedJobEnv(updated); err == nil {
 				if content, err := quadlet.JobContainer(resolved.Name, resolved, s.config.ConfigDir, s.podPVCMap(resolved.Namespace, resolved.Spec.Template.Spec), envFile, s.workloadMount(resolved.Namespace, &resolved.Spec.Template.Spec)); err == nil {
 					writeQuadletFilesTracked(s.config.QuadletDir, map[string][]byte{
-						fmt.Sprintf("%s-%s-job.container", resolved.Namespace, resolved.Name): content,
+						names.Host(names.KindJobFile, resolved.Namespace, resolved.Name): content,
 					})
 				}
 			}
@@ -4096,7 +4099,7 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 				// pre-selector behavior.
 				servers = []string{fmt.Sprintf("http://localhost:%d", svcPort)}
 			}
-			routerName := fmt.Sprintf("%s-%s-%d", ing.Namespace, ing.Name, idx)
+			routerName := names.Host(names.KindIngressRoute, ing.Namespace, ing.Name, strconv.Itoa(idx))
 			idx++
 
 			// Build router rule
@@ -4146,15 +4149,18 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 
 	content := fmt.Sprintf("http:\n  routers:\n%s  services:\n%s", routers.String(), services.String())
 
-	filename := fmt.Sprintf("%s-%s.yaml", ing.Namespace, ing.Name)
+	filename := names.Host(names.KindIngressFile, ing.Namespace, ing.Name)
 	path := filepath.Join(s.config.TraefikDir, filename)
 	if err := os.MkdirAll(s.config.TraefikDir, 0755); err != nil {
 		fmt.Printf("traefik config: mkdir %s: %v\n", s.config.TraefikDir, err)
 		return
 	}
 	// Unchanged content is not rewritten: Traefik's file watcher reloads on
-	// every write, and startup regenerates every Ingress.
+	// every write, and startup regenerates every Ingress. The legacy file is
+	// still removed, because an upgrade leaves one behind even when the new
+	// render already matches.
 	if old, err := os.ReadFile(path); err == nil && string(old) == content {
+		s.removeTraefikConfigFile(names.LegacyHost(names.KindIngressFile, ing.Namespace, ing.Name))
 		return
 	}
 	// Write-then-rename so Traefik never reads a half-written file.
@@ -4162,6 +4168,7 @@ func (s *Server) generateTraefikConfig(ing *networkingv1.Ingress) {
 		fmt.Printf("traefik config: write %s: %v\n", path, err)
 		return
 	}
+	s.removeTraefikConfigFile(names.LegacyHost(names.KindIngressFile, ing.Namespace, ing.Name))
 	fmt.Printf("traefik config: wrote %s\n", filename)
 }
 
@@ -4186,16 +4193,12 @@ func (s *Server) ReconcileIngressConfigs() {
 	}
 }
 
-// removeTraefikConfig removes the Traefik dynamic config file for an Ingress.
+// removeTraefikConfig removes the Traefik dynamic config file for an Ingress,
+// in both the new and the legacy name. Delete has to clear both until no old
+// names remain on the host.
 func (s *Server) removeTraefikConfig(ns, name string) {
-	if s.config.TraefikDir == "" {
-		return
-	}
-	filename := fmt.Sprintf("%s-%s.yaml", ns, name)
-	path := filepath.Join(s.config.TraefikDir, filename)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		fmt.Printf("traefik config: remove %s: %v\n", path, err)
-	}
+	s.removeTraefikConfigFile(names.Host(names.KindIngressFile, ns, name))
+	s.removeTraefikConfigFile(names.LegacyHost(names.KindIngressFile, ns, name))
 }
 
 // --- Startup reconciliation ---
@@ -4239,12 +4242,12 @@ func (s *Server) RestoreEnvFiles() {
 	}
 	for _, job := range s.config.Store.AllJobs() {
 		if _, _, err := s.resolvedJobEnv(job); err != nil {
-			fmt.Printf("restore env-file %s/%s-job: %v\n", job.Namespace, job.Name, err)
+			fmt.Printf("restore env-file %s/%s: %v\n", job.Namespace, quadlet.JobEnvBaseName(job.Name), err)
 		}
 	}
 	for _, cj := range s.config.Store.AllCronJobs() {
 		if _, _, err := s.resolvedCronJobEnv(cj); err != nil {
-			fmt.Printf("restore env-file %s/%s-cron: %v\n", cj.Namespace, cj.Name, err)
+			fmt.Printf("restore env-file %s/%s: %v\n", cj.Namespace, quadlet.CronJobEnvBaseName(cj.Name), err)
 		}
 	}
 }
@@ -4316,9 +4319,9 @@ func (s *Server) ReconcileQuadlets() {
 	for _, dep := range s.config.Store.AllDeployments() {
 		for i := int32(0); i < deploymentReplicas(dep); i++ {
 			instanceName := quadlet.DeploymentInstanceName(dep.Name, i)
-			f := fmt.Sprintf("%s/%s-%s.container", quadletDir, dep.Namespace, instanceName)
+			f := filepath.Join(quadletDir, names.Host(names.KindPodContainerFile, dep.Namespace, instanceName, ""))
 			if len(dep.Spec.Template.Spec.Containers) > 1 {
-				f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, dep.Namespace, instanceName)
+				f = filepath.Join(quadletDir, names.Host(names.KindPodFile, dep.Namespace, instanceName))
 			}
 			pod := s.materializeDeploymentInstance(dep, i)
 			// Heal instances stored by an older q8s with a stale spec
@@ -4361,9 +4364,9 @@ func (s *Server) ReconcileQuadlets() {
 				needReload = true
 			}
 		}
-		f := fmt.Sprintf("%s/%s-%s.container", quadletDir, pod.Namespace, pod.Name)
+		f := filepath.Join(quadletDir, names.Host(names.KindPodContainerFile, pod.Namespace, pod.Name, ""))
 		if len(pod.Spec.Containers) > 1 {
-			f = fmt.Sprintf("%s/%s-%s.pod", quadletDir, pod.Namespace, pod.Name)
+			f = filepath.Join(quadletDir, names.Host(names.KindPodFile, pod.Namespace, pod.Name))
 		}
 		// Deployment instances were rendered by their Deployment above.
 		if isDeploymentOwned(pod) {
@@ -4402,11 +4405,15 @@ func (s *Server) ReconcileQuadlets() {
 			pvc.Spec.StorageClassName = &class
 			dirty = true
 		}
-		if *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath {
-			if want := quadlet.PVCVolumeName(pvc.Namespace, pvc.Name); pvc.Spec.VolumeName != want {
-				pvc.Spec.VolumeName = want
-				dirty = true
-			}
+		if *pvc.Spec.StorageClassName != quadlet.StorageClassHostPath && pvc.Spec.VolumeName == "" {
+			// A claim created before the new naming keeps the volume name in
+			// its spec forever. Only an unbound claim chooses a name here,
+			// and it adopts an existing legacy .volume file so an upgrade
+			// never points an old claim at a new, empty volume.
+			legacyFile := filepath.Join(quadletDir, quadlet.LegacyPVCFileBase(pvc.Namespace, pvc.Name))
+			_, legacyErr := os.Stat(legacyFile)
+			pvc.Spec.VolumeName = names.EffectivePVCVolumeName(pvc.Namespace, pvc.Name, "", legacyErr == nil)
+			dirty = true
 		}
 		if dirty {
 			if _, err := s.config.Store.UpdatePVC(pvc); err != nil {
@@ -4422,29 +4429,28 @@ func (s *Server) ReconcileQuadlets() {
 			// hostpath PVCs don't need a .volume file.
 			continue
 		}
-		// Rewrite only when the file is missing or predates namespace
-		// scoping — an existing file with the old unscoped VolumeName would
-		// otherwise keep pointing at a volume another deployment may own.
-		f := fmt.Sprintf("%s/%s-%s.volume", quadletDir, pvc.Namespace, pvc.Name)
+		// Use the claim's effective file base: a legacy claim keeps its old
+		// <ns>-<claim>.volume file, a new claim uses <ns>_<claim>.volume.
+		base := quadlet.PVCVolumeFileBase(pvc)
+		f := filepath.Join(quadletDir, base+".volume")
 		if existing, _ := os.ReadFile(f); string(existing) == string(content) {
 			continue
 		}
-		write(quadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name), content,
-			fmt.Sprintf("%s-%s-volume.service", pvc.Namespace, pvc.Name))
+		write(quadletDir, base+".volume", content, base+"-volume.service")
 	}
 
 	for _, job := range s.config.Store.AllJobs() {
 		// Existing Job units are re-rendered too, so an upgrade that changes
 		// rendering (e.g. the UserNS size) reaches them; only a missing unit
 		// is started.
-		f := fmt.Sprintf("%s/%s-%s-job.container", quadletDir, job.Namespace, job.Name)
+		f := filepath.Join(quadletDir, names.Host(names.KindJobFile, job.Namespace, job.Name))
 		if claim, message, missingClaim := s.firstMissingClaim(job.Namespace, job.Spec.Template.Spec); missingClaim && missing(f) {
 			s.markJobWaitingForClaim(job.Namespace, job.Name, claim, message)
 			continue
 		}
 		jobUnit := ""
 		if missing(f) {
-			jobUnit = fmt.Sprintf("%s-%s-job.service", job.Namespace, job.Name)
+			jobUnit = names.Host(names.KindJobService, job.Namespace, job.Name)
 		}
 		resolved, envFile, err := s.resolvedJobEnv(job)
 		if err != nil {
@@ -4456,7 +4462,7 @@ func (s *Server) ReconcileQuadlets() {
 			fmt.Printf("reconcile job %s/%s: %v\n", job.Namespace, job.Name, err)
 			continue
 		}
-		write(quadletDir, fmt.Sprintf("%s-%s-job.container", job.Namespace, job.Name), content, jobUnit)
+		write(quadletDir, names.Host(names.KindJobFile, job.Namespace, job.Name), content, jobUnit)
 		s.clearJobWaitingForClaim(job.Namespace, job.Name)
 	}
 
@@ -4465,8 +4471,8 @@ func (s *Server) ReconcileQuadlets() {
 		timerDir = quadletDir
 	}
 	for _, cj := range s.config.Store.AllCronJobs() {
-		cf := fmt.Sprintf("%s/%s-%s-cron.container", quadletDir, cj.Namespace, cj.Name)
-		tf := fmt.Sprintf("%s/%s-%s-cron.timer", timerDir, cj.Namespace, cj.Name)
+		cf := filepath.Join(quadletDir, names.Host(names.KindCronJobFile, cj.Namespace, cj.Name))
+		tf := filepath.Join(timerDir, names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name))
 		if claim, _, missingClaim := s.firstMissingClaim(cj.Namespace, cj.Spec.JobTemplate.Spec.Template.Spec); missingClaim && missing(cf) {
 			s.markCronJobWaitingForClaim(cj.Namespace, cj.Name, claim)
 			continue
@@ -4486,7 +4492,7 @@ func (s *Server) ReconcileQuadlets() {
 				fmt.Printf("reconcile cronjob %s/%s container: %v\n", cj.Namespace, cj.Name, err)
 				continue
 			}
-			write(quadletDir, fmt.Sprintf("%s-%s-cron.container", cj.Namespace, cj.Name), content, "")
+			write(quadletDir, names.Host(names.KindCronJobFile, cj.Namespace, cj.Name), content, "")
 		}
 		{
 			content, err := quadlet.CronTimer(cj.Name, cj)
@@ -4494,10 +4500,10 @@ func (s *Server) ReconcileQuadlets() {
 				fmt.Printf("reconcile cronjob %s/%s timer: %v\n", cj.Namespace, cj.Name, err)
 				continue
 			}
-			write(timerDir, fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name), content, "")
+			write(timerDir, names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name), content, "")
 		}
 		if regen && !cronJobSuspended(cj) {
-			startUnits = append(startUnits, fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name))
+			startUnits = append(startUnits, names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name))
 		}
 		cronJobsToEnsure = append(cronJobsToEnsure, cj)
 		s.clearCronJobWaitingForClaim(cj.Namespace, cj.Name)
@@ -4531,7 +4537,7 @@ func (s *Server) ReconcileQuadlets() {
 		if cronJobSuspended(cj) {
 			continue
 		}
-		timer := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
+		timer := names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)
 		if err := mgr.StartUnit(timer); err != nil {
 			fmt.Printf("reconcile: start %s: %v\n", timer, err)
 		}
@@ -4691,11 +4697,11 @@ func (s *Server) stopPodUnit(pod *corev1.Pod) {
 // a single-container pod keeps the historical rm of its one container.
 func (s *Server) stopPodByName(ns, name string, containers []corev1.Container) {
 	if len(containers) <= 1 {
-		s.stopAndRemoveUnit(fmt.Sprintf("%s-%s.service", ns, name), fmt.Sprintf("%s-%s", ns, name))
+		s.stopAndRemoveUnit(names.Host(names.KindPodService, ns, name), names.Host(names.KindPod, ns, name))
 		return
 	}
 	for _, c := range containers {
-		s.stopUnit(fmt.Sprintf("%s-%s-%s.service", ns, name, c.Name))
+		s.stopUnit(names.Host(names.KindPodContainerService, ns, name, c.Name))
 	}
 	s.stopAndRemovePod(ns, name)
 }
@@ -4724,12 +4730,12 @@ func (s *Server) stopAndRemoveUnit(unit, containerName string) {
 // afterwards, so the pod has to be removed synchronously here. --ignore keeps
 // the call idempotent for paths that stop the same pod twice.
 func (s *Server) stopAndRemovePod(ns, name string) {
-	s.stopUnit(fmt.Sprintf("%s-%s-pod.service", ns, name))
+	s.stopUnit(names.Host(names.KindPodUnit, ns, name))
 	// Same bounded context as stopAndRemoveUnit: this runs in delete and
 	// scale-down handlers and must not hang on a wedged pod.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	podmanCommand(ctx, "pod", "rm", "-f", "--ignore", fmt.Sprintf("%s-%s", ns, name))
+	podmanCommand(ctx, "pod", "rm", "-f", "--ignore", names.Host(names.KindPod, ns, name))
 }
 
 // removeEmptyDirVolumes removes the Podman volumes backing a workload's
@@ -4752,7 +4758,8 @@ func (s *Server) removeEmptyDirVolumes(names []string) {
 
 // removeNamespaceEmptyDirVolumes removes every Podman volume whose name
 // starts with q8s_<ns>_. That is the namespace's emptyDir name space (PVC
-// volumes are <ns>-<claim> and keep their data). The listing is filtered in
+// volumes use <ns>_<claim> or a legacy <ns>-<claim> and keep their data).
+// The listing is filtered in
 // Go rather than with a podman filter so the exact prefix is checked here.
 func (s *Server) removeNamespaceEmptyDirVolumes(ns string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -4837,8 +4844,8 @@ func (s *Server) generatePVCVolume(pvc *corev1.PersistentVolumeClaim) {
 		// hostpath PVCs don't need a .volume file.
 		return
 	}
-	filename := fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name)
-	unitName := fmt.Sprintf("%s-%s-volume.service", pvc.Namespace, pvc.Name)
+	filename := quadlet.PVCVolumeFileBase(pvc) + ".volume"
+	unitName := pvcVolumeUnitName(pvc)
 	if err := writeQuadletFile(s.config.QuadletDir, filename, content); err != nil {
 		fmt.Printf("write pvc volume: %v\n", err)
 		s.recordPVCEvent(pvc, corev1.EventTypeWarning, "ProvisioningFailed", "writing quadlet volume: "+err.Error())
@@ -4881,7 +4888,8 @@ func (s *Server) recordPVCEvent(pvc *corev1.PersistentVolumeClaim, eventType, re
 // volume or its data. `q8s doctor` reports a leftover volume as "data of
 // deleted PVC" with the command to remove it.
 //
-// A container unit using Volume=<ns>-<pvc>.volume gets Requires= and After= on
+// A container unit using Volume=<ns>_<pvc>.volume (or the legacy
+// <ns>-<pvc>.volume) gets Requires= and After= on
 // this volume unit (generated by quadlet), so stopping it would stop every
 // running container that uses the claim. removePVCVolume is the real delete
 // path: the claim is unused, the finish pass found no user, or an update
@@ -4902,7 +4910,7 @@ func (s *Server) removePVCVolume(pvc *corev1.PersistentVolumeClaim) {
 	}
 	if kind, name, used := s.pvcClaimUser(pvc.Namespace, pvc.Name); used {
 		fmt.Printf("leave %s running: %s/%s uses claim %s\n",
-			pvcVolumeUnitName(pvc.Namespace, pvc.Name), kind, name, pvc.Name)
+			pvcVolumeUnitName(pvc), kind, name, pvc.Name)
 	} else {
 		s.stopPVCVolumeUnit(pvc)
 	}
@@ -4951,14 +4959,20 @@ func (s *Server) stopOrphanedPVCVolumeUnits(ns string, specs ...corev1.PodSpec) 
 			if _, _, used := s.pvcClaimUser(ns, claim); used {
 				continue
 			}
-			s.stopUnit(pvcVolumeUnitName(ns, claim))
+			// The claim is gone, so its effective name is unknown: stop
+			// both the legacy and the new unit name; a missing unit is
+			// harmless.
+			s.stopUnit(names.LegacyHost(names.KindPVCVolume, ns, claim) + "-volume.service")
+			s.stopUnit(names.Host(names.KindPVCVolume, ns, claim) + "-volume.service")
 		}
 	}
 }
 
-// pvcVolumeUnitName is the systemd unit quadlet generates from a .volume file.
-func pvcVolumeUnitName(ns, name string) string {
-	return fmt.Sprintf("%s-%s-volume.service", ns, name)
+// pvcVolumeUnitName is the systemd unit quadlet generates from a claim's
+// .volume file. The file base is the claim's effective name, so a legacy
+// claim stops its old <ns>-<claim>-volume.service.
+func pvcVolumeUnitName(pvc *corev1.PersistentVolumeClaim) string {
+	return quadlet.PVCVolumeFileBase(pvc) + "-volume.service"
 }
 
 func (s *Server) stopPVCVolumeUnit(pvc *corev1.PersistentVolumeClaim) {
@@ -4967,11 +4981,11 @@ func (s *Server) stopPVCVolumeUnit(pvc *corev1.PersistentVolumeClaim) {
 	if pvcStorageClass(pvc) == quadlet.StorageClassHostPath {
 		return
 	}
-	s.stopUnit(pvcVolumeUnitName(pvc.Namespace, pvc.Name))
+	s.stopUnit(pvcVolumeUnitName(pvc))
 }
 
 func (s *Server) removePVCVolumeFile(pvc *corev1.PersistentVolumeClaim) {
-	s.reloadAfterRemove(filepath.Join(s.config.QuadletDir, fmt.Sprintf("%s-%s.volume", pvc.Namespace, pvc.Name)))
+	s.reloadAfterRemove(filepath.Join(s.config.QuadletDir, quadlet.PVCVolumeFileBase(pvc)+".volume"))
 }
 
 // pvcClaimUser returns the first stored workload in ns that keeps a claim in
@@ -5052,16 +5066,16 @@ func (s *Server) generateJobQuadlet(job *batchv1.Job) bool {
 		return false
 	}
 	s.deployUnit(s.config.QuadletDir,
-		fmt.Sprintf("%s-%s-job.container", job.Namespace, job.Name),
+		names.Host(names.KindJobFile, job.Namespace, job.Name),
 		content,
-		fmt.Sprintf("%s-%s-job.service", job.Namespace, job.Name))
+		names.Host(names.KindJobService, job.Namespace, job.Name))
 	s.clearJobWaitingForClaim(job.Namespace, job.Name)
 	return true
 }
 
 func (s *Server) stopJobUnit(job *batchv1.Job) {
 	if mgr := s.config.Manager; mgr != nil {
-		mgr.StopUnit(fmt.Sprintf("%s-%s-job.service", job.Namespace, job.Name))
+		mgr.StopUnit(names.Host(names.KindJobService, job.Namespace, job.Name))
 	}
 }
 
@@ -5070,7 +5084,7 @@ func (s *Server) removeJobQuadlet(job *batchv1.Job) {
 	if s.config.QuadletDir == "" {
 		return
 	}
-	s.reloadAfterRemove(fmt.Sprintf("%s/%s-%s-job.container", s.config.QuadletDir, job.Namespace, job.Name))
+	s.reloadAfterRemove(filepath.Join(s.config.QuadletDir, names.Host(names.KindJobFile, job.Namespace, job.Name)))
 }
 
 func (s *Server) generateCronJobQuadlets(cj *batchv1.CronJob) {
@@ -5112,13 +5126,13 @@ func (s *Server) deployCronJobQuadlets(cj *batchv1.CronJob, start bool) bool {
 		fmt.Printf("cronjob timer %s: %v\n", cj.Name, err)
 		return false
 	}
-	containerFile := fmt.Sprintf("%s-%s-cron.container", cj.Namespace, cj.Name)
+	containerFile := names.Host(names.KindCronJobFile, cj.Namespace, cj.Name)
 	containerChanged, err := writeQuadletFilesTracked(quadletDir, map[string][]byte{containerFile: containerContent})
 	if err != nil {
 		fmt.Printf("write %s: %v\n", containerFile, err)
 		return false
 	}
-	timerFile := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
+	timerFile := names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)
 	if !start {
 		// The render-only path (a claim that appeared, or a Secret or
 		// ConfigMap refresh) must not start or enable the timer and must
@@ -5162,7 +5176,7 @@ func (s *Server) setCronTimerEnabled(cj *batchv1.CronJob) {
 	if mgr == nil {
 		return
 	}
-	timer := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
+	timer := names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)
 	if cronJobSuspended(cj) {
 		if err := mgr.StopUnit(timer); err != nil {
 			fmt.Printf("cronjob %s/%s: stop %s: %v\n", cj.Namespace, cj.Name, timer, err)
@@ -5188,14 +5202,14 @@ func (s *Server) removeCronJobQuadlets(cj *batchv1.CronJob) {
 		timerDir = quadletDir
 	}
 	if mgr := s.config.Manager; mgr != nil {
-		timer := fmt.Sprintf("%s-%s-cron.timer", cj.Namespace, cj.Name)
+		timer := names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)
 		mgr.StopUnit(timer)
 		// Remove the timers.target.wants link before the file goes away.
 		mgr.DisableUnit(timer)
 	}
 	s.reloadAfterRemove(
-		fmt.Sprintf("%s/%s-%s-cron.container", quadletDir, cj.Namespace, cj.Name),
-		fmt.Sprintf("%s/%s-%s-cron.timer", timerDir, cj.Namespace, cj.Name),
+		filepath.Join(quadletDir, names.Host(names.KindCronJobFile, cj.Namespace, cj.Name)),
+		filepath.Join(timerDir, names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)),
 	)
 }
 

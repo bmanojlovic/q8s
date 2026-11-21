@@ -77,22 +77,22 @@ func TestPodUnitsHostNamespaceAndPrivilegedFlags(t *testing.T) {
 		t.Fatalf("PodUnits: %v", err)
 	}
 
-	podOut := string(files["default-multi.pod"])
+	podOut := string(files["default_multi.pod"])
 	assertNotContains(t, podOut, "PodmanArgs=")
 
-	for _, name := range []string{"default-multi-web.container", "default-multi-sidecar.container"} {
+	for _, name := range []string{"default_multi_web.container", "default_multi_sidecar.container"} {
 		out := string(files[name])
 		// hostPID and hostIPC are pod-wide, so every member carries them.
 		assertContains(t, out, "PodmanArgs=--pid=host\n")
 		assertContains(t, out, "PodmanArgs=--ipc=host\n")
 	}
 
-	webOut := string(files["default-multi-web.container"])
+	webOut := string(files["default_multi_web.container"])
 	assertNotContains(t, webOut, "PodmanArgs=--privileged")
 	assertNotContains(t, webOut, "PodmanArgs=--interactive")
 	assertNotContains(t, webOut, "PodmanArgs=--tty")
 
-	sidecarOut := string(files["default-multi-sidecar.container"])
+	sidecarOut := string(files["default_multi_sidecar.container"])
 	assertContains(t, sidecarOut, "PodmanArgs=--privileged\n")
 	assertContains(t, sidecarOut, "PodmanArgs=--interactive\n")
 	assertContains(t, sidecarOut, "PodmanArgs=--tty\n")

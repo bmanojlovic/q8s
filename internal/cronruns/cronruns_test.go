@@ -64,11 +64,11 @@ func TestRunsRootless(t *testing.T) {
 
 func TestRunsRootfulUsesInvocationID(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
-	var gotArgs []string
+	var calls [][]string
 	src := &Source{
 		Rootful: true,
 		Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			gotArgs = append([]string{name}, args...)
+			calls = append(calls, append([]string{name}, args...))
 			// USER_INVOCATION_ID is the rootless field and must be ignored.
 			return []byte(strings.Join([]string{
 				journalEntry("USER_INVOCATION_ID", "ignored", MessageIDStarted, base, ""),
@@ -84,18 +84,26 @@ func TestRunsRootfulUsesInvocationID(t *testing.T) {
 	if len(runs) != 1 || runs[0].InvocationID != "rootful" || runs[0].State != StateSucceeded {
 		t.Fatalf("unexpected runs: %+v", runs)
 	}
-	for _, a := range gotArgs {
-		if a == "--user" {
-			t.Fatalf("rootful journalctl must not get --user: %v", gotArgs)
+	if len(calls) != 2 {
+		t.Fatalf("journalctl calls = %d, want one for the new and one for the legacy unit", len(calls))
+	}
+	for _, call := range calls {
+		for _, a := range call {
+			if a == "--user" {
+				t.Fatalf("rootful journalctl must not get --user: %v", call)
+			}
 		}
 	}
-	joined := strings.Join(gotArgs, " ")
-	for _, want := range []string{"-u default-cron-cron.service", "-o json", "-n 400",
+	joined := strings.Join(calls[0], " ")
+	for _, want := range []string{"-u default_cron__cron.service", "-o json", "-n 400",
 		"MESSAGE_ID=" + MessageIDStarted, "MESSAGE_ID=" + MessageIDExited,
 		"MESSAGE_ID=" + MessageIDSucceeded, "MESSAGE_ID=" + MessageIDFailed, "MESSAGE_ID=" + MessageIDResources} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("journalctl args %q missing %q", joined, want)
 		}
+	}
+	if !strings.Contains(strings.Join(calls[1], " "), "-u default-cron-cron.service") {
+		t.Fatalf("legacy journalctl call = %v, want the legacy unit name", calls[1])
 	}
 }
 
@@ -180,8 +188,8 @@ func TestLogArgs(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"--user",
-		"-u default-cron-cron.service",
-		"CONTAINER_NAME=default-cron-cron",
+		"-u default_cron__cron.service",
+		"CONTAINER_NAME=default_cron__cron",
 		"_SYSTEMD_INVOCATION_ID=abc123",
 		"-o json",
 		"-n 25",
@@ -202,10 +210,80 @@ func TestLogArgs(t *testing.T) {
 }
 
 func TestNames(t *testing.T) {
-	if got := UnitName("default", "cron"); got != "default-cron-cron.service" {
+	if got := UnitName("default", "cron"); got != "default_cron__cron.service" {
 		t.Fatalf("UnitName = %q", got)
 	}
-	if got := ContainerName("default", "cron"); got != "default-cron-cron" {
+	if got := ContainerName("default", "cron"); got != "default_cron__cron" {
 		t.Fatalf("ContainerName = %q", got)
+	}
+}
+
+// RunsFallsBackToLegacyUnit: runs recorded before the naming upgrade live
+// under the legacy unit name. A CronJob with no new-format history must still
+// show them.
+func TestRunsFallsBackToLegacyUnit(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	legacyUnit := LegacyUnitName("default", "cron")
+	if legacyUnit == UnitName("default", "cron") {
+		t.Fatal("test needs distinct new and legacy unit names")
+	}
+	var seen []string
+	src := &Source{
+		Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			unit := ""
+			for i, a := range args {
+				if a == "-u" && i+1 < len(args) {
+					unit = args[i+1]
+				}
+			}
+			seen = append(seen, unit)
+			if unit != legacyUnit {
+				return nil, nil
+			}
+			return []byte(strings.Join([]string{
+				journalEntry("USER_INVOCATION_ID", "legacy", MessageIDStarted, base, ""),
+				journalEntry("USER_INVOCATION_ID", "legacy", MessageIDSucceeded, base.Add(time.Second), ""),
+			}, "\n")), nil
+		},
+	}
+	runs, err := src.Runs(context.Background(), "default", "cron")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].InvocationID != "legacy" || runs[0].Unit != legacyUnit {
+		t.Fatalf("legacy runs = %+v, want one run from %s", runs, legacyUnit)
+	}
+	if len(seen) != 2 || seen[0] != UnitName("default", "cron") || seen[1] != legacyUnit {
+		t.Fatalf("journal units queried = %v, want new then legacy", seen)
+	}
+}
+
+// RunsForJobFallsBackToLegacyUnit is the Job half of the same fallback.
+func TestRunsForJobFallsBackToLegacyUnit(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	legacyUnit := LegacyJobUnitName("default", "batch")
+	src := &Source{
+		Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			unit := ""
+			for i, a := range args {
+				if a == "-u" && i+1 < len(args) {
+					unit = args[i+1]
+				}
+			}
+			if unit != legacyUnit {
+				return nil, nil
+			}
+			return []byte(strings.Join([]string{
+				journalEntry("USER_INVOCATION_ID", "legacy", MessageIDStarted, base, ""),
+				journalEntry("USER_INVOCATION_ID", "legacy", MessageIDFailed, base.Add(time.Second), ""),
+			}, "\n")), nil
+		},
+	}
+	runs, err := src.RunsForJob(context.Background(), "default", "batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].InvocationID != "legacy" || runs[0].Unit != legacyUnit {
+		t.Fatalf("legacy Job runs = %+v, want one run from %s", runs, legacyUnit)
 	}
 }

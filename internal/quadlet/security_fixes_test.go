@@ -81,14 +81,14 @@ func TestDeploymentReplicaWithoutEmptyDirRendersUnchanged(t *testing.T) {
 	want := `[Container]
 Image=nginx:1.0
 Pull=missing
-ContainerName=default-web-0
+ContainerName=default_web-0
 Network=q8s-default.network
 NetworkAlias=web-0.default
 Label=io.kubernetes.pod.name=web-0
 Label=io.kubernetes.pod.namespace=default
 Label=io.kubernetes.pod.deployment=web
 Label=app.kubernetes.io/managed-by=q8s
-Label=q8s.io/template-hash=ee46d0e4b71f
+Label=q8s.io/template-hash=57d007f1b222
 
 [Unit]
 Description=Pod web-0

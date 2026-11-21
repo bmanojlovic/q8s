@@ -238,11 +238,24 @@ and has no managed-by label is a legacy emptyDir name from before v0.11.1.
 
 A stored emptyDir or PVC volume is never reported, and neither is a volume
 without the `q8s_` prefix, without the label, and without a stored legacy
-emptyDir name. When the store cannot be read (for example because q8s is not
+emptyDir name. The expected PVC set includes the claim's `spec.volumeName`
+plus both the current `{namespace}_{claim}` and legacy `{namespace}-{claim}`
+names, so a claim created before the naming upgrade is not reported as a
+deleted PVC. When the store cannot be read (for example because q8s is not
 installed or `q8s serve` has not created it yet), the check is informational
 and says `skipped: <reason>`. The podman call goes through the same Env
 command runner as the other checks, so the check is unit-tested without a
 real podman.
+
+### `legacy-names`
+
+Report only: it lists quadlet and systemd files, and q8s-labeled Podman
+containers, that still use a pre-upgrade generated name for a stored object.
+It never removes anything; the `fix:` lines are the exact `systemctl stop` /
+`reset-failed`, `rm -f` and `podman rm -f` commands an administrator can run
+when ready. A legacy PVC's `{namespace}-{claim}.volume` file and
+`{namespace}-{claim}-volume.service` are included, but its Podman volume is
+not. A host with only current-format names reports ok.
 
 ### `networks`
 

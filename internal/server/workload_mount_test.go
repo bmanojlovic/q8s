@@ -63,7 +63,7 @@ func TestWorkloadMountRenderedByServer(t *testing.T) {
 				"metadata":   map[string]interface{}{"name": "sa-pod", "namespace": "default"},
 				"spec":       workloadPodSpec("worker", workloadTestContainer("app")),
 			},
-			files: []string{"default-sa-pod.container"},
+			files: []string{"default_sa-pod.container"},
 		},
 		{
 			name: "multi-container pod",
@@ -74,7 +74,7 @@ func TestWorkloadMountRenderedByServer(t *testing.T) {
 				"metadata":   map[string]interface{}{"name": "sa-multi", "namespace": "default"},
 				"spec":       workloadPodSpec("worker", workloadTestContainer("web"), workloadTestContainer("sidecar")),
 			},
-			files: []string{"default-sa-multi-web.container", "default-sa-multi-sidecar.container"},
+			files: []string{"default_sa-multi_web.container", "default_sa-multi_sidecar.container"},
 		},
 		{
 			name: "deployment replica",
@@ -92,7 +92,7 @@ func TestWorkloadMountRenderedByServer(t *testing.T) {
 					},
 				},
 			},
-			files: []string{"default-sa-dep-0.container"},
+			files: []string{"default_sa-dep-0.container"},
 		},
 		{
 			name: "job",
@@ -107,7 +107,7 @@ func TestWorkloadMountRenderedByServer(t *testing.T) {
 					},
 				},
 			},
-			files: []string{"default-sa-job-job.container"},
+			files: []string{"default_sa-job__job.container"},
 		},
 		{
 			name: "cronjob",
@@ -127,7 +127,7 @@ func TestWorkloadMountRenderedByServer(t *testing.T) {
 					},
 				},
 			},
-			files: []string{"default-sa-cron-cron.container"},
+			files: []string{"default_sa-cron__cron.container"},
 		},
 	}
 
@@ -225,11 +225,11 @@ func TestPodWithoutServiceAccountKeepsRenderedUnit(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	oldContent, err := os.ReadFile(filepath.Join(oldDir, "default-plain.container"))
+	oldContent, err := os.ReadFile(filepath.Join(oldDir, "default_plain.container"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	newContent, err := os.ReadFile(filepath.Join(plainDir, "default-plain.container"))
+	newContent, err := os.ReadFile(filepath.Join(plainDir, "default_plain.container"))
 	if err != nil {
 		t.Fatal(err)
 	}

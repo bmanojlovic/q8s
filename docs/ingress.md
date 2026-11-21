@@ -56,18 +56,18 @@ For `kubectl create ingress myapp --rule="app.example.com/api*=backend:8080,tls"
 ```yaml
 http:
   routers:
-    default-myapp-0:
+    default_myapp_0:
       rule: "Host(`app.example.com`) && PathPrefix(`/api`)"
-      service: default-myapp-0
+      service: default_myapp_0
       tls: {}
   services:
-    default-myapp-0:
+    default_myapp_0:
       loadBalancer:
         servers:
           - url: "http://localhost:8080"
 ```
 
-File location: `~/.local/share/q8s/traefik/{namespace}-{name}.yaml`
+File location: `~/.local/share/q8s/traefik/{namespace}_{name}.yaml`
 
 ## How it works
 
@@ -76,7 +76,7 @@ internet → traefik (in each q8s namespace network, :80/:443) → <pod>.<ns>:<c
 ```
 
 1. q8s renders every pod with DNS aliases on its namespace network: `<svc>`, `<svc>.<ns>`, `<svc>.<ns>.svc.cluster.local` and (always) `<pod>.<ns>`. Deployment replicas are ordinary pods (`web-0`, `web-1`, ...), so each one is individually addressable with no host publish and no port allocation.
-2. `kubectl create ingress` → q8s writes `{dataDir}/traefik/{ns}-{name}.yaml`
+2. `kubectl create ingress` → q8s writes `{dataDir}/traefik/{ns}_{name}.yaml`
 3. Traefik's file provider detects the new file, applies the routing
 4. `kubectl delete ingress` → q8s removes the file, traefik drops the route
 
@@ -157,9 +157,9 @@ q8s renders:
 ```yaml
 http:
   routers:
-    default-myapp-0:
+    default_myapp_0:
       rule: "Host(`app.example.com`)"
-      service: default-myapp-0
+      service: default_myapp_0
       entryPoints: ["websecure"]
       middlewares: ["www-redirect@file", "hsts@file"]
       priority: 10
@@ -173,7 +173,8 @@ configuration directory (the same directory q8s writes its Ingress files into:
 `~/.local/share/q8s/traefik/`, or `/etc/q8s/traefik/` for rootful q8s).
 
 Traefik's Kubernetes provider names a Middleware reference
-`<namespace>-<name>@kubernetescrd`. Because q8s serves `Middleware` objects
+`<namespace>-<name>@kubernetescrd`. This object key is deliberately unchanged
+even though the Middleware file is now `middleware_<namespace>_<name>.yaml`. Because q8s serves `Middleware` objects
 through Traefik's file provider, q8s rewrites that provider suffix to `@file`:
 
 ```yaml
@@ -276,7 +277,7 @@ renders:
 ```yaml
 http:
   services:
-    default-app-0:
+    default_app_0:
       loadBalancer:
         servers:
           - url: "https://backend.example.com:8443"
@@ -328,7 +329,7 @@ dialed at `http://<pod>.<ns>:<containerPort>`. Traefik load-balances
 
 ```yaml
 services:
-  default-web-0:
+  default_web_0:
     loadBalancer:
       servers:
         - url: "http://web-0.default:8080"   # Deployment replica, no hostPort

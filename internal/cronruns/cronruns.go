@@ -1,6 +1,6 @@
 // Package cronruns derives the runs of a q8s CronJob from systemd and the
 // journal. A q8s CronJob is a systemd timer that starts a one-shot
-// <ns>-<cronjob>-cron.service; the container is removed after every run and
+// <ns>_<cronjob>__cron.service; the container is removed after every run and
 // no Job or Pod object is stored. Everything needed to reconstruct the run
 // history is already in systemd's journal, so this package reads it on demand
 // and keeps no state.
@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"q8s/internal/names"
 )
 
 // Journal MESSAGE_IDs of the manager messages that delimit a unit run.
@@ -51,6 +53,10 @@ type Run struct {
 	End          time.Time // zero while running
 	ExitStatus   int       // from EXIT_STATUS, -1 if unknown
 	State        string    // "running" | "succeeded" | "failed"
+	// Unit is the systemd unit the run was read from. It is the new name
+	// for current runs and the legacy name for runs recorded before the
+	// naming upgrade, so a log request can select the right journal unit.
+	Unit string
 }
 
 // LogOptions are the journalctl selections for a logs request.
@@ -76,22 +82,45 @@ type Source struct {
 
 // UnitName is the systemd service unit of a CronJob.
 func UnitName(namespace, cronJob string) string {
-	return fmt.Sprintf("%s-%s-cron.service", namespace, cronJob)
+	return names.Host(names.KindCronJobService, namespace, cronJob)
 }
 
 // ContainerName is the Podman container name of a CronJob run.
 func ContainerName(namespace, cronJob string) string {
-	return fmt.Sprintf("%s-%s-cron", namespace, cronJob)
+	return names.Host(names.KindCronJob, namespace, cronJob)
 }
 
 // JobUnitName is the systemd service unit of a Job.
 func JobUnitName(namespace, job string) string {
-	return fmt.Sprintf("%s-%s-job.service", namespace, job)
+	return names.Host(names.KindJobService, namespace, job)
 }
 
 // JobContainerName is the Podman container name of a Job.
 func JobContainerName(namespace, job string) string {
-	return fmt.Sprintf("%s-%s-job", namespace, job)
+	return names.Host(names.KindJob, namespace, job)
+}
+
+// LegacyUnitName is the pre-upgrade service unit of a CronJob. Journal
+// lookups query it after the new unit so runs recorded before the upgrade
+// still show.
+func LegacyUnitName(namespace, cronJob string) string {
+	return names.LegacyHost(names.KindCronJobService, namespace, cronJob)
+}
+
+// LegacyContainerName is the pre-upgrade Podman container name of a CronJob
+// run.
+func LegacyContainerName(namespace, cronJob string) string {
+	return names.LegacyHost(names.KindCronJob, namespace, cronJob)
+}
+
+// LegacyJobUnitName is the pre-upgrade service unit of a Job.
+func LegacyJobUnitName(namespace, job string) string {
+	return names.LegacyHost(names.KindJobService, namespace, job)
+}
+
+// LegacyJobContainerName is the pre-upgrade Podman container name of a Job.
+func LegacyJobContainerName(namespace, job string) string {
+	return names.LegacyHost(names.KindJob, namespace, job)
 }
 
 func (s *Source) command(ctx context.Context, args ...string) ([]byte, error) {
@@ -155,9 +184,59 @@ func (s *Source) LogArgsForUnit(unit, container, invocationID string, opt LogOpt
 }
 
 // Runs returns the run history of one CronJob, newest first. History limits
-// are a server concern and are not applied here.
+// are a server concern and are not applied here. The current unit is queried
+// first, then the legacy unit name, so a CronJob that existed before the
+// naming upgrade still shows the runs recorded under its old unit.
 func (s *Source) Runs(ctx context.Context, namespace, cronJob string) ([]Run, error) {
-	return s.RunsForUnit(ctx, UnitName(namespace, cronJob))
+	return s.runsForUnits(ctx, UnitName(namespace, cronJob), LegacyUnitName(namespace, cronJob))
+}
+
+// RunsForJob returns the run history of one Job, newest first, including runs
+// recorded under the legacy unit name before the naming upgrade.
+func (s *Source) RunsForJob(ctx context.Context, namespace, job string) ([]Run, error) {
+	return s.runsForUnits(ctx, JobUnitName(namespace, job), LegacyJobUnitName(namespace, job))
+}
+
+// runsForUnits merges the runs of the same workload recorded under its new
+// and legacy unit names. A unit name is a journal selector, so the two
+// histories have to be read separately; invocation ids keep the merge
+// idempotent if both names ever resolve to the same unit.
+func (s *Source) runsForUnits(ctx context.Context, units ...string) ([]Run, error) {
+	seen := make(map[string]Run)
+	var firstErr error
+	for _, unit := range units {
+		runs, err := s.RunsForUnit(ctx, unit)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, run := range runs {
+			if _, ok := seen[run.InvocationID]; !ok {
+				seen[run.InvocationID] = run
+			}
+		}
+	}
+	if len(seen) == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	runs := make([]Run, 0, len(seen))
+	for _, run := range seen {
+		runs = append(runs, run)
+	}
+	sortRuns(runs)
+	return runs, nil
+}
+
+// sortRuns orders runs newest first, matching parseRuns.
+func sortRuns(runs []Run) {
+	sort.SliceStable(runs, func(i, j int) bool {
+		if runs[i].Start.Equal(runs[j].Start) {
+			return runs[i].InvocationID > runs[j].InvocationID
+		}
+		return runs[i].Start.After(runs[j].Start)
+	})
 }
 
 // RunsForUnit returns the run history of one unit, newest first. History
@@ -171,6 +250,9 @@ func (s *Source) RunsForUnit(ctx context.Context, unit string) ([]Run, error) {
 		return nil, nil
 	}
 	runs, _ := parseRuns(out, s.Rootful)
+	for i := range runs {
+		runs[i].Unit = unit
+	}
 	return runs, nil
 }
 

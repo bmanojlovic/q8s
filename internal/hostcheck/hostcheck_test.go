@@ -666,14 +666,14 @@ func TestFirewallReloadCheck(t *testing.T) {
 func TestCheckOrderAndRootfulSkipsLinger(t *testing.T) {
 	rootful := newFake(t, true)
 	got := checkIDs(Run(rootful.env))
-	want := []string{"podman", "kernel", "userns", "idmap", "cgroups", "network", "firewall-reload", "certificates", "traefik-dir", "disk", "volumes", "networks", "env-files"}
+	want := []string{"podman", "kernel", "userns", "idmap", "cgroups", "network", "firewall-reload", "certificates", "traefik-dir", "disk", "volumes", "networks", "env-files", "legacy-names"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rootful check ids = %v, want %v", got, want)
 	}
 
 	rootless := newFake(t, false)
 	got = checkIDs(Run(rootless.env))
-	want = []string{"podman", "kernel", "userns", "idmap", "linger", "cgroups", "network", "certificates", "traefik-dir", "disk", "volumes", "networks", "env-files"}
+	want = []string{"podman", "kernel", "userns", "idmap", "linger", "cgroups", "network", "certificates", "traefik-dir", "disk", "volumes", "networks", "env-files", "legacy-names"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("rootless check ids = %v, want %v", got, want)
 	}

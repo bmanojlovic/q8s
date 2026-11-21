@@ -61,7 +61,7 @@ func TestContainerBasic(t *testing.T) {
 
 	assertContains(t, out, "[Container]")
 	assertContains(t, out, "Image=nginx:latest")
-	assertContains(t, out, "ContainerName=default-nginx")
+	assertContains(t, out, "ContainerName=default_nginx")
 	assertContains(t, out, "Network=q8s-default.network")
 	assertContains(t, out, "Label=io.kubernetes.pod.name=nginx")
 	assertContains(t, out, "Label=io.kubernetes.pod.namespace=default")
@@ -199,7 +199,7 @@ func TestContainerPVCVolume(t *testing.T) {
 	out := mustContainer(t, pod, "")
 
 	// Without a PVC map the fallback adds :Z (SELinux exclusive relabel).
-	assertContains(t, out, "Volume=default-my-pvc.volume:/data:Z")
+	assertContains(t, out, "Volume=default_my-pvc.volume:/data:Z")
 }
 
 func TestContainerConfigMapVolume(t *testing.T) {
@@ -1067,7 +1067,7 @@ func TestJobContainerBasic(t *testing.T) {
 	out := string(b)
 
 	assertContains(t, out, "Image=busybox:latest")
-	assertContains(t, out, "ContainerName=default-myjob-job")
+	assertContains(t, out, "ContainerName=default_myjob__job")
 	assertContains(t, out, "Network=q8s-default.network")
 	assertContains(t, out, "Restart=no")
 	assertContains(t, out, "Description=Job default/myjob")
@@ -1151,7 +1151,7 @@ func TestJobContainerReadOnlyPVC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("JobContainer: %v", err)
 	}
-	assertContains(t, string(b), "Volume=ns-my-pvc.volume:/data:ro,Z")
+	assertContains(t, string(b), "Volume=ns_my-pvc.volume:/data:ro,Z")
 }
 
 func TestJobContainerNoContainersError(t *testing.T) {
@@ -1190,7 +1190,7 @@ func TestCronContainerBasic(t *testing.T) {
 	out := string(b)
 
 	assertContains(t, out, "Image=alpine")
-	assertContains(t, out, "ContainerName=default-mycron-cron")
+	assertContains(t, out, "ContainerName=default_mycron__cron")
 	assertContains(t, out, "Restart=no")
 	assertContains(t, out, "Description=CronJob default/mycron")
 	assertNotContains(t, out, "[Install]")
@@ -1415,7 +1415,7 @@ func TestVolume(t *testing.T) {
 	out := string(b)
 
 	assertContains(t, out, "[Volume]")
-	assertContains(t, out, "VolumeName=default-my-pvc")
+	assertContains(t, out, "VolumeName=default_my-pvc")
 }
 
 func TestVolumeHostpathReturnsNil(t *testing.T) {
@@ -1446,7 +1446,7 @@ func TestVolumeSharedClass(t *testing.T) {
 	}
 	out := string(b)
 	assertContains(t, out, "[Volume]")
-	assertContains(t, out, "VolumeName=default-shared-vol")
+	assertContains(t, out, "VolumeName=default_shared-vol")
 }
 
 // --- StorageClass volume mounts in Container ---
@@ -1469,7 +1469,7 @@ func TestContainerPVCStandardClass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
-	assertContains(t, string(b), "Volume=default-my-pvc.volume:/data:Z")
+	assertContains(t, string(b), "Volume=default_my-pvc.volume:/data:Z")
 }
 
 func TestContainerPVCSharedClass(t *testing.T) {
@@ -1490,7 +1490,7 @@ func TestContainerPVCSharedClass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
-	assertContains(t, string(b), "Volume=default-shared-vol.volume:/data:z")
+	assertContains(t, string(b), "Volume=default_shared-vol.volume:/data:z")
 }
 
 func TestContainerPVCHostpathClass(t *testing.T) {
@@ -1580,8 +1580,8 @@ func TestContainerPVCVolumeSourceReadOnly(t *testing.T) {
 		readOnly bool
 		want     string
 	}{
-		{"read-only", true, "Volume=default-my-pvc.volume:/data:ro,Z"},
-		{"read-write", false, "Volume=default-my-pvc.volume:/data:Z"},
+		{"read-only", true, "Volume=default_my-pvc.volume:/data:ro,Z"},
+		{"read-write", false, "Volume=default_my-pvc.volume:/data:Z"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := simplePod("default", "app", "myimage")
@@ -1613,7 +1613,7 @@ func TestContainerPVCFallbackReadOnly(t *testing.T) {
 	}}
 	pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}
 	out := mustContainer(t, pod, "")
-	assertContains(t, out, "Volume=default-my-pvc.volume:/data:ro,Z")
+	assertContains(t, out, "Volume=default_my-pvc.volume:/data:ro,Z")
 }
 
 func TestContainerPVCUnknownClassReadOnly(t *testing.T) {
@@ -1629,8 +1629,8 @@ func TestContainerPVCUnknownClassReadOnly(t *testing.T) {
 		readOnly bool
 		want     string
 	}{
-		{"read-only", true, "Volume=default-odd-vol.volume:/data:ro"},
-		{"read-write", false, "Volume=default-odd-vol.volume:/data\n"},
+		{"read-only", true, "Volume=default_odd-vol.volume:/data:ro"},
+		{"read-write", false, "Volume=default_odd-vol.volume:/data\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := simplePod("default", "app", "myimage")
@@ -1746,7 +1746,7 @@ func TestContainerPVCDefaultClassWhenNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Container: %v", err)
 	}
-	assertContains(t, string(b), "Volume=default-my-pvc.volume:/data:Z")
+	assertContains(t, string(b), "Volume=default_my-pvc.volume:/data:Z")
 }
 
 // --- Network ---

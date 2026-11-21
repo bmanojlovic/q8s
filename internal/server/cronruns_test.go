@@ -118,7 +118,7 @@ func newCronFixture() *cronFixture {
 }
 
 func (f *cronFixture) install(fake *fakeJournal) {
-	fake.runs["default-cron-cron.service"] = []byte(strings.Join(f.lines, "\n"))
+	fake.runs["default_cron__cron.service"] = []byte(strings.Join(f.lines, "\n"))
 }
 
 func cronJobWithLabels(ns, name string) map[string]interface{} {
@@ -343,7 +343,7 @@ func TestCronRunHistoryLimits(t *testing.T) {
 		add(id, cronruns.MessageIDFailed, base.Add(time.Duration(i)*time.Minute+time.Second), "")
 	}
 	add(fmt.Sprintf("%032d", 6), cronruns.MessageIDStarted, base.Add(5*time.Minute), "")
-	fake.runs["default-limited-cron.service"] = []byte(strings.Join(lines, "\n"))
+	fake.runs["default_limited__cron.service"] = []byte(strings.Join(lines, "\n"))
 	ts, _ := newCronRunServer(t, fake)
 
 	body := cronJobWithLabels("default", "limited")
@@ -440,7 +440,7 @@ func TestCronRunPodLogs(t *testing.T) {
 	fake := newFakeJournal()
 	f := newCronFixture()
 	f.install(fake)
-	fake.logs["default-cron-cron"] = []byte(strings.Join([]string{
+	fake.logs["default_cron__cron"] = []byte(strings.Join([]string{
 		`{"MESSAGE":"hello","__REALTIME_TIMESTAMP":"1700000000000000"}`,
 		`{"MESSAGE":"world","__REALTIME_TIMESTAMP":"1700000001000000"}`,
 		`{"MESSAGE":[104,105],"__REALTIME_TIMESTAMP":"1700000002000000"}`,
@@ -617,7 +617,7 @@ func TestCronRunNamesForSameMinute(t *testing.T) {
 			journalJSON(id, cronruns.MessageIDStarted, base.Add(time.Duration(i)*time.Second), ""),
 			journalJSON(id, cronruns.MessageIDFailed, base.Add(time.Duration(i)*time.Second+time.Millisecond), ""))
 	}
-	fake.runs["default-sameminute-cron.service"] = []byte(strings.Join(lines, "\n"))
+	fake.runs["default_sameminute__cron.service"] = []byte(strings.Join(lines, "\n"))
 	ts, _ := newCronRunServer(t, fake)
 	body := cronJobWithLabels("default", "sameminute")
 	body["spec"].(map[string]interface{})["failedJobsHistoryLimit"] = 2

@@ -92,7 +92,7 @@ func TestGeneratedNamesMatchGenerator(t *testing.T) {
 		for _, name := range containerNames(t, content) {
 			wantGeneratedName(t, set, name)
 		}
-		wantGeneratedName(t, set, "team-web.service")
+		wantGeneratedName(t, set, "team_web.service")
 		for _, name := range emptyDirVolumeNames(t, content) {
 			wantGeneratedName(t, set, name)
 		}
@@ -149,11 +149,11 @@ func TestGeneratedNamesMatchGenerator(t *testing.T) {
 		for _, name := range containerNames(t, content) {
 			wantGeneratedName(t, set, name)
 		}
-		wantGeneratedName(t, set, "team-batch-job.service")
+		wantGeneratedName(t, set, "team_batch__job.service")
 		for _, name := range emptyDirVolumeNames(t, content) {
 			wantGeneratedName(t, set, name)
 		}
-		wantGeneratedName(t, set, "batch-job.env")
+		wantGeneratedName(t, set, "batch__job.env")
 	})
 
 	t.Run("cronjob", func(t *testing.T) {
@@ -174,11 +174,59 @@ func TestGeneratedNamesMatchGenerator(t *testing.T) {
 		for _, name := range containerNames(t, content) {
 			wantGeneratedName(t, set, name)
 		}
-		wantGeneratedName(t, set, "team-nightly-cron.service")
-		wantGeneratedName(t, set, "team-nightly-cron.timer")
+		wantGeneratedName(t, set, "team_nightly__cron.service")
+		wantGeneratedName(t, set, "team_nightly__cron.timer")
 		for _, name := range emptyDirVolumeNames(t, content) {
 			wantGeneratedName(t, set, name)
 		}
-		wantGeneratedName(t, set, "nightly-cron.env")
+		wantGeneratedName(t, set, "nightly__cron.env")
 	})
+}
+
+// TestGeneratedNamesKindSuffixesDiffer: a Job x and a Pod x-job (likewise a
+// CronJob x and a Pod x-cron) must not share a container, unit or env file.
+func TestGeneratedNamesKindSuffixesDiffer(t *testing.T) {
+	simplePod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "team"},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name: "app", Image: "img",
+			}}},
+		}
+	}
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "team"},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "img"}}},
+		}},
+	}
+	cronJob := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "team"},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "* * * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "img"}}},
+				},
+			}},
+		},
+	}
+	for _, tc := range []struct {
+		name string
+		a    interface{}
+		b    interface{}
+	}{
+		{"job and pod x-job", job, simplePod("x-job")},
+		{"cronjob and pod x-cron", cronJob, simplePod("x-cron")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := generatedNameSet(t, tc.a)
+			b := generatedNameSet(t, tc.b)
+			for name := range a {
+				if _, ok := b[name]; ok {
+					t.Errorf("%s and %s both generate %q", tc.name, "the other object", name)
+				}
+			}
+		})
+	}
 }

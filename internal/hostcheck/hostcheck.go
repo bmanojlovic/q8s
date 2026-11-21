@@ -27,6 +27,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"q8s/internal/names"
 	"q8s/internal/quadlet"
 	"q8s/internal/store"
 )
@@ -190,6 +192,7 @@ func Run(env Env) Report {
 	r.Checks = append(r.Checks, checkOrphanedVolumes(env))
 	r.Checks = append(r.Checks, checkNetworks(env))
 	r.Checks = append(r.Checks, checkOrphanedEnvFiles(env))
+	r.Checks = append(r.Checks, checkLegacyNames(env))
 
 	r.Summary = buildSummary(env, r.Checks, certInfo)
 	if r.Summary == nil {
@@ -1206,9 +1209,205 @@ func expectedVolumes(st *store.Store) (emptyDir, legacy, pvc map[string]bool) {
 		if pvcUsesHostPath(claim) {
 			continue
 		}
+		// spec.volumeName is what the claim actually keeps, including a
+		// legacy <ns>-<claim> value from before the naming upgrade. The
+		// computed names keep an in-flight or older claim from being
+		// reported as deleted while its volume is still the only copy.
+		if claim.Spec.VolumeName != "" {
+			pvc[claim.Spec.VolumeName] = true
+		}
 		pvc[quadlet.PVCVolumeName(claim.Namespace, claim.Name)] = true
+		pvc[quadlet.LegacyPVCVolumeName(claim.Namespace, claim.Name)] = true
 	}
 	return emptyDir, legacy, pvc
+}
+
+// legacyArtifacts is the set of pre-upgrade host names still belonging to a
+// stored object. Files maps a path to the unit that has to be stopped before
+// the file can be removed; containers maps a container name to its unit.
+type legacyArtifacts struct {
+	files      map[string]string
+	containers map[string]string
+}
+
+// expectedLegacyArtifacts computes the old-format file and container names of
+// every stored object. Doctor only reports these; it never removes them.
+func expectedLegacyArtifacts(env Env, st *store.Store) legacyArtifacts {
+	out := legacyArtifacts{
+		files:      make(map[string]string),
+		containers: make(map[string]string),
+	}
+	addFile := func(dir, name, unit string) {
+		if dir == "" || name == "" {
+			return
+		}
+		out.files[filepath.Join(dir, name)] = unit
+	}
+	addPod := func(pod *corev1.Pod) {
+		ns, name := pod.Namespace, pod.Name
+		if len(pod.Spec.Containers) > 1 {
+			addFile(env.Dirs.Quadlet,
+				names.LegacyHost(names.KindPodFile, ns, name),
+				names.LegacyHost(names.KindPodUnit, ns, name))
+			for _, c := range pod.Spec.Containers {
+				unit := names.LegacyHost(names.KindPodContainerService, ns, name, c.Name)
+				addFile(env.Dirs.Quadlet,
+					names.LegacyHost(names.KindPodContainerFile, ns, name, c.Name), unit)
+				out.containers[names.LegacyHost(names.KindPodContainer, ns, name, c.Name)] = unit
+			}
+		} else {
+			unit := names.LegacyHost(names.KindPodService, ns, name)
+			addFile(env.Dirs.Quadlet,
+				names.LegacyHost(names.KindPodContainerFile, ns, name, ""), unit)
+			out.containers[names.LegacyHost(names.KindPodContainer, ns, name, "")] = unit
+		}
+		if entries, err := quadlet.ParseSocketActivation(pod.Annotations); err == nil {
+			for _, entry := range entries {
+				addFile(env.Dirs.Systemd,
+					names.LegacyHost(names.KindSocketFile, ns, name, entry.Name), "")
+			}
+		}
+	}
+	for _, pod := range st.AllPods() {
+		addPod(pod)
+	}
+	for _, dep := range st.AllDeployments() {
+		for i := int32(0); i < quadlet.DeploymentReplicaCount(dep); i++ {
+			instance := quadlet.DeploymentInstanceName(dep.Name, i)
+			addPod(&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: instance, Namespace: dep.Namespace},
+				Spec:       dep.Spec.Template.Spec,
+			})
+		}
+	}
+	for _, job := range st.AllJobs() {
+		unit := names.LegacyHost(names.KindJobService, job.Namespace, job.Name)
+		addFile(env.Dirs.Quadlet, names.LegacyHost(names.KindJobFile, job.Namespace, job.Name), unit)
+		out.containers[names.LegacyHost(names.KindJob, job.Namespace, job.Name)] = unit
+	}
+	for _, cj := range st.AllCronJobs() {
+		unit := names.LegacyHost(names.KindCronJobService, cj.Namespace, cj.Name)
+		addFile(env.Dirs.Quadlet, names.LegacyHost(names.KindCronJobFile, cj.Namespace, cj.Name), unit)
+		addFile(env.Dirs.Systemd, names.LegacyHost(names.KindCronJobTimer, cj.Namespace, cj.Name),
+			names.LegacyHost(names.KindCronJobTimer, cj.Namespace, cj.Name))
+		out.containers[names.LegacyHost(names.KindCronJob, cj.Namespace, cj.Name)] = unit
+	}
+	for _, claim := range st.AllPVCs() {
+		if pvcUsesHostPath(claim) {
+			continue
+		}
+		base := names.LegacyHost(names.KindPVCVolume, claim.Namespace, claim.Name)
+		addFile(env.Dirs.Quadlet, base+".volume", base+"-volume.service")
+	}
+	for _, ing := range st.AllIngresses() {
+		addFile(env.Dirs.Traefik, names.LegacyHost(names.KindIngressFile, ing.Namespace, ing.Name), "")
+	}
+	for _, mw := range st.AllMiddlewares() {
+		addFile(env.Dirs.Traefik, names.LegacyHost(names.KindMiddlewareFile, mw.Namespace, mw.Name), "")
+	}
+	for _, irt := range st.AllIngressRouteTCPs() {
+		addFile(env.Dirs.Traefik, names.LegacyHost(names.KindIngressRouteTCPFile, irt.Namespace, irt.Name), "")
+	}
+	return out
+}
+
+// checkLegacyNames reports pre-upgrade quadlet/systemd files and q8s-labeled
+// containers that still belong to a stored object. It is report only: it
+// prints the exact stop and removal commands and never runs them. Step B uses
+// this list to migrate a host.
+func checkLegacyNames(env Env) Check {
+	c := Check{ID: "legacy-names", Title: "legacy generated names"}
+	if env.Dirs.Data == "" {
+		c.Status = StatusInfo
+		c.Detail = "skipped: no data directory"
+		return c
+	}
+	storeFile := filepath.Join(env.Dirs.Data, "store.json")
+	data, err := env.readFile(storeFile)
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + storeFile + ": " + err.Error()
+		return c
+	}
+	st, err := store.LoadReadOnly(data)
+	if err != nil {
+		c.Status = StatusInfo
+		c.Detail = "skipped: cannot read " + storeFile + ": " + err.Error()
+		return c
+	}
+
+	expected := expectedLegacyArtifacts(env, st)
+	containersUnavailable := false
+	containerOut, err := env.command("podman", "ps", "-a",
+		"--filter", managedByNetworkFilter, "--format", "{{.Names}}")
+	if err != nil {
+		containersUnavailable = true
+	}
+	seenContainers := make(map[string]bool)
+	for _, line := range strings.Split(string(containerOut), "\n") {
+		name := strings.TrimSpace(line)
+		if name != "" {
+			seenContainers[name] = true
+		}
+	}
+
+	filePaths := make([]string, 0, len(expected.files))
+	for path := range expected.files {
+		if _, err := env.readFile(path); err == nil {
+			filePaths = append(filePaths, path)
+		}
+	}
+	sort.Strings(filePaths)
+	containerNames := make([]string, 0, len(expected.containers))
+	for name := range expected.containers {
+		if seenContainers[name] {
+			containerNames = append(containerNames, name)
+		}
+	}
+	sort.Strings(containerNames)
+
+	if len(filePaths) == 0 && len(containerNames) == 0 {
+		if containersUnavailable {
+			c.Status = StatusInfo
+			c.Detail = "skipped: podman ps: " + err.Error()
+			return c
+		}
+		c.Status = StatusOK
+		c.Detail = "no legacy-format files or containers of stored objects"
+		c.Gain = "the next upgrade does not have to stop these objects a second time"
+		return c
+	}
+
+	var found, fix []string
+	systemctl := "systemctl --user"
+	if env.Rootful {
+		systemctl = "systemctl"
+	}
+	for _, path := range filePaths {
+		unit := expected.files[path]
+		found = append(found, path+" (legacy file)")
+		if unit != "" {
+			fix = append(fix, systemctl+" stop "+unit+" && "+systemctl+" reset-failed "+unit)
+		}
+		fix = append(fix, "rm -f "+path)
+	}
+	for _, name := range containerNames {
+		unit := expected.containers[name]
+		found = append(found, name+" (legacy container)")
+		if unit != "" {
+			fix = append(fix, systemctl+" stop "+unit+" && "+systemctl+" reset-failed "+unit)
+		}
+		fix = append(fix, "podman rm -f "+name)
+	}
+	c.Status = StatusWarn
+	c.Detail = fmt.Sprintf("%d legacy-format file(s) and %d container(s) of stored objects remain: %s",
+		len(filePaths), len(containerNames), strings.Join(found, ", "))
+	if containersUnavailable {
+		c.Detail += "; container listing skipped: " + err.Error()
+	}
+	c.Loss = "these host names are not used by the current q8s and step B has to stop and remove them during the one-time migration"
+	c.Fix = strings.Join(fix, "\n")
+	return c
 }
 
 // pvcUsesHostPath reports whether a PVC mounts a host directory instead of a

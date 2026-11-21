@@ -232,7 +232,7 @@ func TestNamespaceDeleteRemovesOnlyItsEmptyDirVolumes(t *testing.T) {
 		"q8s_default_web_cache",
 		"q8s_defaultx_solo_data",
 		"q8s_other_solo_data",
-		"default-keep",
+		"default_keep",
 	)
 
 	rec := httptest.NewRecorder()
@@ -253,7 +253,7 @@ func TestNamespaceDeleteRemovesOnlyItsEmptyDirVolumes(t *testing.T) {
 		if strings.Contains(call, "q8s_defaultx_") || strings.Contains(call, "q8s_other_") {
 			t.Errorf("namespace delete touched another namespace's volume: %s", call)
 		}
-		if call == "volume rm --force default-keep" {
+		if call == "volume rm --force default_keep" {
 			t.Errorf("namespace delete removed a PVC volume: %s", call)
 		}
 	}

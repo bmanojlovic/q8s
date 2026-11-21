@@ -28,6 +28,10 @@ const (
 	cronRunJobNameLabel         = "job-name"
 	cronRunCronJobLabel         = "q8s.io/cronjob"
 	cronRunInvocationAnnotation = "q8s.io/invocation-id"
+	// cronRunUnitAnnotation carries the journal unit a run was read from,
+	// so logs of a run recorded before the naming upgrade use the legacy
+	// unit and container name.
+	cronRunUnitAnnotation = "q8s.io/journal-unit"
 
 	defaultSuccessfulJobsHistoryLimit = 3
 	defaultFailedJobsHistoryLimit     = 1
@@ -311,9 +315,7 @@ func (s *Server) cronRunObjectFor(cj *batchv1.CronJob, run cronruns.Run, jobName
 			ResourceVersion:   jobRV,
 			CreationTimestamp: start,
 			Labels:            labels,
-			Annotations: map[string]string{
-				cronRunInvocationAnnotation: run.InvocationID,
-			},
+			Annotations:       cronRunAnnotations(run),
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "batch/v1",
 				Kind:       "CronJob",
@@ -369,9 +371,7 @@ func (s *Server) cronRunObjectFor(cj *batchv1.CronJob, run cronruns.Run, jobName
 				cronRunJobNameLabel: jobName,
 				cronRunCronJobLabel: cj.Name,
 			},
-			Annotations: map[string]string{
-				cronRunInvocationAnnotation: run.InvocationID,
-			},
+			Annotations: cronRunAnnotations(run),
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "batch/v1",
 				Kind:       "Job",
@@ -536,15 +536,20 @@ func (s *Server) handleCronRunPodLogs(w http.ResponseWriter, r *http.Request, po
 		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "journalctl: %v", err)
 		return
 	}
-	if !runBelongsTo(runsSince(runs, cj), pod.Annotations[cronRunInvocationAnnotation]) {
+	run, ok := ownedRun(runsSince(runs, cj), pod.Annotations[cronRunInvocationAnnotation])
+	if !ok {
 		s.respondStatus(w, http.StatusNotFound, "NotFound",
 			"pod %q has no run of CronJob %s/%s", pod.Name, cj.Namespace, cj.Name)
 		return
 	}
-	s.handleJournalPodLogs(w, r, pod,
-		cronruns.UnitName(pod.Namespace, cronJob),
-		cronruns.ContainerName(pod.Namespace, cronJob),
-		cj.CreationTimestamp.Time)
+	// The unit comes from the owned run: runs recorded before the names
+	// migration live under the legacy unit name.
+	unit, container := run.Unit, strings.TrimSuffix(run.Unit, ".service")
+	if unit == "" {
+		unit = cronruns.UnitName(pod.Namespace, cronJob)
+		container = cronruns.ContainerName(pod.Namespace, cronJob)
+	}
+	s.handleJournalPodLogs(w, r, pod, unit, container, cj.CreationTimestamp.Time)
 }
 
 // runBelongsTo reports whether invocationID names one of runs. An empty id
@@ -552,15 +557,32 @@ func (s *Server) handleCronRunPodLogs(w http.ResponseWriter, r *http.Request, po
 // unit, including those of a previous object that happened to share the unit
 // name.
 func runBelongsTo(runs []cronruns.Run, invocationID string) bool {
+	_, ok := ownedRun(runs, invocationID)
+	return ok
+}
+
+// ownedRun returns the run of runs with invocationID; see runBelongsTo.
+func ownedRun(runs []cronruns.Run, invocationID string) (cronruns.Run, bool) {
 	if invocationID == "" {
-		return false
+		return cronruns.Run{}, false
 	}
 	for _, r := range runs {
 		if r.InvocationID == invocationID {
-			return true
+			return r, true
 		}
 	}
-	return false
+	return cronruns.Run{}, false
+}
+
+// cronRunAnnotations returns the derived Job/Pod annotations for one run.
+// The journal unit is carried only when it is known, which keeps the
+// synthetic objects of a fresh store byte-compatible with the old shape.
+func cronRunAnnotations(run cronruns.Run) map[string]string {
+	annotations := map[string]string{cronRunInvocationAnnotation: run.InvocationID}
+	if run.Unit != "" {
+		annotations[cronRunUnitAnnotation] = run.Unit
+	}
+	return annotations
 }
 
 // handleJournalPodLogs serves a synthetic pod's log subresource from one

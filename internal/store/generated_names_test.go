@@ -82,72 +82,48 @@ func wantGeneratedNameConflict(t *testing.T, err error, name string) {
 	}
 }
 
-// Gap 1: a Job's implicit -job suffix and a CronJob's -cron suffix create the
-// same container, unit and EnvironmentFile names as a Pod that carries the
-// suffix in its own name.
-func TestGeneratedNamesJobAndCronJobSuffixes(t *testing.T) {
-	t.Run("job then pod", func(t *testing.T) {
+// The fixed __job and __cron suffixes make a Job x and a Pod x-job (or a
+// CronJob x and a Pod x-cron) distinct, so they can coexist.
+func TestGeneratedNamesJobAndCronJobSuffixesCoexist(t *testing.T) {
+	t.Run("job and pod x-job", func(t *testing.T) {
 		st := newStore(t)
 		if _, err := st.CreateJob(generatedNameJob("default", "x", nil, nil)); err != nil {
 			t.Fatalf("CreateJob: %v", err)
 		}
-		_, err := st.CreatePod(generatedNamePod("default", "x-job", generatedNameContainer("c", "img")))
-		wantGeneratedNameConflict(t, err, "default-x-job")
-	})
-	t.Run("pod then job", func(t *testing.T) {
-		st := newStore(t)
 		if _, err := st.CreatePod(generatedNamePod("default", "x-job", generatedNameContainer("c", "img"))); err != nil {
-			t.Fatalf("CreatePod: %v", err)
+			t.Fatalf("CreatePod x-job next to Job x: %v", err)
 		}
-		_, err := st.CreateJob(generatedNameJob("default", "x", nil, nil))
-		wantGeneratedNameConflict(t, err, "default-x-job")
 	})
-	t.Run("cronjob then pod", func(t *testing.T) {
+	t.Run("cronjob and pod x-cron", func(t *testing.T) {
 		st := newStore(t)
 		if _, err := st.CreateCronJob(generatedNameCronJob("default", "x")); err != nil {
 			t.Fatalf("CreateCronJob: %v", err)
 		}
-		_, err := st.CreatePod(generatedNamePod("default", "x-cron", generatedNameContainer("c", "img")))
-		wantGeneratedNameConflict(t, err, "default-x-cron")
-	})
-	t.Run("pod then cronjob", func(t *testing.T) {
-		st := newStore(t)
 		if _, err := st.CreatePod(generatedNamePod("default", "x-cron", generatedNameContainer("c", "img"))); err != nil {
-			t.Fatalf("CreatePod: %v", err)
+			t.Fatalf("CreatePod x-cron next to CronJob x: %v", err)
 		}
-		_, err := st.CreateCronJob(generatedNameCronJob("default", "x"))
-		wantGeneratedNameConflict(t, err, "default-x-cron")
 	})
 }
 
-// Gap 2: multi-container member names are <namespace>-<pod>-<container>, so
-// hyphens make two different pod/container splits share one container name.
-func TestGeneratedNamesMultiContainerMembers(t *testing.T) {
-	t.Run("pod a container b-c vs pod a-b container c", func(t *testing.T) {
-		st := newStore(t)
-		if _, err := st.CreatePod(generatedNamePod("default", "a",
-			generatedNameContainer("b-c", "img"),
-			generatedNameContainer("side", "img"),
-		)); err != nil {
-			t.Fatalf("CreatePod a: %v", err)
-		}
-		_, err := st.CreatePod(generatedNamePod("default", "a-b",
-			generatedNameContainer("c", "img"),
-			generatedNameContainer("side", "img"),
-		))
-		wantGeneratedNameConflict(t, err, "default-a-b-c")
-	})
-	t.Run("single container pod a-b-c vs multi container pod a", func(t *testing.T) {
-		st := newStore(t)
-		if _, err := st.CreatePod(generatedNamePod("default", "a",
-			generatedNameContainer("b-c", "img"),
-			generatedNameContainer("side", "img"),
-		)); err != nil {
-			t.Fatalf("CreatePod a: %v", err)
-		}
-		_, err := st.CreatePod(generatedNamePod("default", "a-b-c", generatedNameContainer("c", "img")))
-		wantGeneratedNameConflict(t, err, "default-a-b-c")
-	})
+// Multi-container member names use "_" between pod and container, so
+// Pod a/container b-c and Pod a-b/container c no longer collide.
+func TestGeneratedNamesMultiContainerMembersCoexist(t *testing.T) {
+	st := newStore(t)
+	if _, err := st.CreatePod(generatedNamePod("default", "a",
+		generatedNameContainer("b-c", "img"),
+		generatedNameContainer("side", "img"),
+	)); err != nil {
+		t.Fatalf("CreatePod a: %v", err)
+	}
+	if _, err := st.CreatePod(generatedNamePod("default", "a-b",
+		generatedNameContainer("c", "img"),
+		generatedNameContainer("side", "img"),
+	)); err != nil {
+		t.Fatalf("CreatePod a-b next to Pod a: %v", err)
+	}
+	if _, err := st.CreatePod(generatedNamePod("default", "a-b-c", generatedNameContainer("c", "img"))); err != nil {
+		t.Fatalf("CreatePod a-b-c: %v", err)
+	}
 }
 
 // Gap 3: Deployment replicas are stored as Pods named <deployment>-<index>,
@@ -159,7 +135,7 @@ func TestGeneratedNamesDeploymentReplicas(t *testing.T) {
 			t.Fatalf("CreateDeployment: %v", err)
 		}
 		_, err := st.CreatePod(generatedNamePod("default", "web-1", generatedNameContainer("app", "img")))
-		wantGeneratedNameConflict(t, err, "default-web-1")
+		wantGeneratedNameConflict(t, err, "web-1.env")
 	})
 	t.Run("scale up into an existing pod name", func(t *testing.T) {
 		st := newStore(t)
@@ -176,7 +152,7 @@ func TestGeneratedNamesDeploymentReplicas(t *testing.T) {
 		two := int32(2)
 		dep.Spec.Replicas = &two
 		_, err = st.UpdateDeployment(dep)
-		wantGeneratedNameConflict(t, err, "default-web-1")
+		wantGeneratedNameConflict(t, err, "web-1.env")
 	})
 	t.Run("scale down is allowed", func(t *testing.T) {
 		st := newStore(t)
@@ -228,20 +204,27 @@ func TestGeneratedNamesEmptyDirVolume(t *testing.T) {
 	})
 }
 
-// Gap 5: suffixes also collide across namespaces when the hyphen moves from
-// the namespace to the name.
-func TestGeneratedNamesAcrossNamespacesWithSuffix(t *testing.T) {
+// The new separator also removes the cross-namespace ambiguity: a Job a/b
+// and a Pod a-b/job are different objects with different host names.
+func TestGeneratedNamesAcrossNamespacesCoexist(t *testing.T) {
 	st := newStore(t)
 	if _, err := st.CreateJob(generatedNameJob("a", "b", nil, nil)); err != nil {
-		t.Fatalf("CreateJob: %v", err)
+		t.Fatalf("CreateJob a/b: %v", err)
 	}
-	_, err := st.CreatePod(generatedNamePod("a-b", "job", generatedNameContainer("c", "img")))
-	wantGeneratedNameConflict(t, err, "a-b-job")
+	if _, err := st.CreatePod(generatedNamePod("a-b", "job", generatedNameContainer("c", "img"))); err != nil {
+		t.Fatalf("CreatePod a-b/job next to Job a/b: %v", err)
+	}
+	if _, err := st.CreatePod(generatedNamePod("team", "prod-db", generatedNameContainer("c", "img"))); err != nil {
+		t.Fatalf("CreatePod team/prod-db: %v", err)
+	}
+	if _, err := st.CreatePod(generatedNamePod("team-prod", "db", generatedNameContainer("c", "img"))); err != nil {
+		t.Fatalf("CreatePod team-prod/db next to team/prod-db: %v", err)
+	}
 }
 
 // An update is checked for the names it adds, not for every name it keeps.
 func TestGeneratedNamesUpdateAddsNames(t *testing.T) {
-	t.Run("pod gains a colliding member", func(t *testing.T) {
+	t.Run("pod gains a distinct member", func(t *testing.T) {
 		st := newStore(t)
 		if _, err := st.CreatePod(generatedNamePod("default", "a", generatedNameContainer("old", "img"))); err != nil {
 			t.Fatalf("CreatePod a: %v", err)
@@ -257,8 +240,9 @@ func TestGeneratedNamesUpdateAddsNames(t *testing.T) {
 			generatedNameContainer("b-c", "img"),
 			generatedNameContainer("side", "img"),
 		}
-		_, err = st.UpdatePod(pod)
-		wantGeneratedNameConflict(t, err, "default-a-b-c")
+		if _, err := st.UpdatePod(pod); err != nil {
+			t.Fatalf("UpdatePod with member b-c: %v", err)
+		}
 	})
 	t.Run("job gains a colliding volume", func(t *testing.T) {
 		st := newStore(t)

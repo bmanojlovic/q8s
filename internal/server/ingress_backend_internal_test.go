@@ -173,7 +173,7 @@ func TestReconcileIngressConfigsRewritesStaleFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	path := filepath.Join(dir, "default-web.yaml")
+	path := filepath.Join(dir, "default_web.yaml")
 	stale := "http:\n  services:\n    x:\n      loadBalancer:\n        servers:\n        - url: \"http://127.25.0.1:8080\"\n"
 	if err := os.WriteFile(path, []byte(stale), 0o644); err != nil {
 		t.Fatal(err)

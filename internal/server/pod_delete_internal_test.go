@@ -82,13 +82,13 @@ func TestDeleteMultiContainerPodStopsPodBeforeQuadletRemoval(t *testing.T) {
 	if _, err := st.CreatePod(pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
-	podPath := writeOwnedUnit(t, dir, "default-duo.pod", "default", "duo")
+	podPath := writeOwnedUnit(t, dir, "default_duo.pod", "default", "duo")
 
 	var events []string
 	filePresentAtStop := false
 	srv.stopUnitHook = func(name string) {
 		events = append(events, "stop "+name)
-		if name == "default-duo-pod.service" {
+		if name == "default_duo-pod.service" {
 			if _, err := os.Stat(podPath); err == nil {
 				filePresentAtStop = true
 			}
@@ -111,16 +111,16 @@ func TestDeleteMultiContainerPodStopsPodBeforeQuadletRemoval(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"stop default-duo-web.service",
-		"stop default-duo-sidecar.service",
-		"stop default-duo-pod.service",
-		"podman pod rm -f --ignore default-duo",
+		"stop default_duo_web.service",
+		"stop default_duo_sidecar.service",
+		"stop default_duo-pod.service",
+		"podman pod rm -f --ignore default_duo",
 	} {
 		if !hasCall(events, want) {
 			t.Errorf("missing %q in events %v", want, events)
 		}
 	}
-	if idxStop, idxRm := callIndex(events, "stop default-duo-pod.service"), callIndex(events, "podman pod rm -f --ignore default-duo"); idxStop < 0 || idxRm < 0 || idxStop > idxRm {
+	if idxStop, idxRm := callIndex(events, "stop default_duo-pod.service"), callIndex(events, "podman pod rm -f --ignore default_duo"); idxStop < 0 || idxRm < 0 || idxStop > idxRm {
 		t.Errorf("pod service must stop before podman pod rm, events: %v", events)
 	}
 	if !filePresentAtStop {
@@ -146,8 +146,8 @@ func TestDeleteMultiContainerDeploymentRemovesBothPods(t *testing.T) {
 	if _, err := st.CreateDeployment(dep); err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
-	writeOwnedUnit(t, dir, "default-duo-0.pod", "default", "duo-0")
-	writeOwnedUnit(t, dir, "default-duo-1.pod", "default", "duo-1")
+	writeOwnedUnit(t, dir, "default_duo-0.pod", "default", "duo-0")
+	writeOwnedUnit(t, dir, "default_duo-1.pod", "default", "duo-1")
 	calls := recordPodmanCalls(t)
 
 	if err := srv.deleteDeploymentByName("default", "duo"); err != nil {
@@ -155,8 +155,8 @@ func TestDeleteMultiContainerDeploymentRemovesBothPods(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"pod rm -f --ignore default-duo-0",
-		"pod rm -f --ignore default-duo-1",
+		"pod rm -f --ignore default_duo-0",
+		"pod rm -f --ignore default_duo-1",
 	} {
 		if !hasCall(*calls, want) {
 			t.Errorf("missing %q in podman calls %v", want, *calls)
@@ -169,7 +169,7 @@ func TestDeleteMultiContainerDeploymentRemovesBothPods(t *testing.T) {
 		if _, err := st.GetPod("default", name); err == nil {
 			t.Errorf("deleted deployment instance %q is still in the store", name)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "default-"+name+".pod")); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(dir, "default_"+name+".pod")); !os.IsNotExist(err) {
 			t.Errorf("deleted instance %q quadlet survived, stat err=%v", name, err)
 		}
 	}
@@ -190,22 +190,22 @@ func TestScaleDownMultiContainerDeploymentRemovesOnlyDroppedInstance(t *testing.
 	if _, err := st.CreateDeployment(dep); err != nil {
 		t.Fatalf("CreateDeployment: %v", err)
 	}
-	writeOwnedUnit(t, dir, "default-duo-0.pod", "default", "duo-0")
-	dropped := writeOwnedUnit(t, dir, "default-duo-1.pod", "default", "duo-1")
+	writeOwnedUnit(t, dir, "default_duo-0.pod", "default", "duo-0")
+	dropped := writeOwnedUnit(t, dir, "default_duo-1.pod", "default", "duo-1")
 	calls := recordPodmanCalls(t)
 
 	srv.scaleDeployment(dep, 2, 1)
 
-	if !hasCall(*calls, "pod rm -f --ignore default-duo-1") {
+	if !hasCall(*calls, "pod rm -f --ignore default_duo-1") {
 		t.Errorf("missing pod rm for dropped instance in %v", *calls)
 	}
-	if hasCall(*calls, "pod rm -f --ignore default-duo-0") {
+	if hasCall(*calls, "pod rm -f --ignore default_duo-0") {
 		t.Errorf("instance -0 must survive scale-down, calls %v", *calls)
 	}
 	if _, err := os.Stat(dropped); !os.IsNotExist(err) {
 		t.Errorf("dropped instance quadlet survived, stat err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "default-duo-0.pod")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "default_duo-0.pod")); err != nil {
 		t.Errorf("instance -0 quadlet was removed: %v", err)
 	}
 }
@@ -223,14 +223,14 @@ func TestDeleteSingleContainerPodMakesNoPodmanPodCall(t *testing.T) {
 	if _, err := st.CreatePod(pod); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
-	writeOwnedUnit(t, dir, "default-solo.container", "default", "solo")
+	writeOwnedUnit(t, dir, "default_solo.container", "default", "solo")
 	calls := recordPodmanCalls(t)
 
 	if err := srv.deletePodByName("default", "solo"); err != nil {
 		t.Fatalf("deletePodByName: %v", err)
 	}
 
-	if !hasCall(*calls, "rm -f default-solo") {
+	if !hasCall(*calls, "rm -f default_solo") {
 		t.Errorf("missing container removal in %v", *calls)
 	}
 	for _, call := range *calls {
@@ -242,7 +242,7 @@ func TestDeleteSingleContainerPodMakesNoPodmanPodCall(t *testing.T) {
 	if _, err := st.GetPod("default", "solo"); err == nil {
 		t.Fatal("deleted pod is still in the store")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "default-solo.container")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, "default_solo.container")); !os.IsNotExist(err) {
 		t.Fatalf("deleted pod quadlet survived, stat err=%v", err)
 	}
 }
@@ -250,15 +250,15 @@ func TestDeleteSingleContainerPodMakesNoPodmanPodCall(t *testing.T) {
 func TestStalePodUnitRemovesPodmanPod(t *testing.T) {
 	dir := t.TempDir()
 	srv := &Server{config: Config{QuadletDir: dir}}
-	stale := writeOwnedUnit(t, dir, "default-duo.pod", "default", "duo")
-	keep := writeOwnedUnit(t, dir, "default-duo.container", "default", "duo")
+	stale := writeOwnedUnit(t, dir, "default_duo.pod", "default", "duo")
+	keep := writeOwnedUnit(t, dir, "default_duo.container", "default", "duo")
 	calls := recordPodmanCalls(t)
 
-	removed := srv.removeStaleOwnedUnits(dir, "default", "duo", map[string]bool{"default-duo.container": true})
+	removed := srv.removeStaleOwnedUnits(dir, "default", "duo", map[string]bool{"default_duo.container": true})
 	if !removed {
 		t.Fatal("expected stale .pod to be removed")
 	}
-	if !hasCall(*calls, "pod rm -f --ignore default-duo") {
+	if !hasCall(*calls, "pod rm -f --ignore default_duo") {
 		t.Errorf("missing pod rm for stale .pod in %v", *calls)
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
@@ -332,7 +332,7 @@ func TestDeletePodPersistFailureKeepsObjectForRetry(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreatePod: %v", err)
 	}
-	podPath := writeOwnedUnit(t, srv.config.QuadletDir, "default-solo.container", "default", "solo")
+	podPath := writeOwnedUnit(t, srv.config.QuadletDir, "default_solo.container", "default", "solo")
 
 	var stops, starts []string
 	srv.stopUnitHook = func(name string) { stops = append(stops, name) }
@@ -350,10 +350,10 @@ func TestDeletePodPersistFailureKeepsObjectForRetry(t *testing.T) {
 		t.Fatalf("reason = %q, want InternalError", status.Reason)
 	}
 	wantFailedDeleteMessage(t, status, "pod", "solo")
-	if !hasCall(stops, "default-solo.service") {
+	if !hasCall(stops, "default_solo.service") {
 		t.Fatalf("unit was not stopped before the store delete: %v", stops)
 	}
-	if !hasCall(*calls, "rm -f default-solo") {
+	if !hasCall(*calls, "rm -f default_solo") {
 		t.Fatalf("container was not removed before the store delete: %v", *calls)
 	}
 	if len(starts) != 0 {
@@ -411,7 +411,7 @@ func TestDeleteDeploymentPersistFailureKeepsDeploymentAndPods(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CreatePod %s: %v", name, err)
 		}
-		writeOwnedUnit(t, srv.config.QuadletDir, "default-"+name+".container", "default", name)
+		writeOwnedUnit(t, srv.config.QuadletDir, "default_"+name+".container", "default", name)
 	}
 
 	var starts []string

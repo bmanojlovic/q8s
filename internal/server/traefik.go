@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"q8s/internal/fsutil"
+	"q8s/internal/names"
 	"q8s/internal/traefik"
 )
 
@@ -499,11 +500,19 @@ type tcpServer struct {
 }
 
 func middlewareFilename(ns, name string) string {
-	return fmt.Sprintf("middleware-%s-%s.yaml", ns, name)
+	return names.Host(names.KindMiddlewareFile, ns, name)
+}
+
+func legacyMiddlewareFilename(ns, name string) string {
+	return names.LegacyHost(names.KindMiddlewareFile, ns, name)
 }
 
 func tcpFilename(ns, name string) string {
-	return fmt.Sprintf("tcp-%s-%s.yaml", ns, name)
+	return names.Host(names.KindIngressRouteTCPFile, ns, name)
+}
+
+func legacyTCPFilename(ns, name string) string {
+	return names.LegacyHost(names.KindIngressRouteTCPFile, ns, name)
 }
 
 // generateMiddlewareConfig writes the file-provider config for one
@@ -526,7 +535,9 @@ func (s *Server) generateMiddlewareConfig(mw *traefik.Middleware) {
 	}
 	doc := middlewareDocument{HTTP: middlewareHTTP{
 		Middlewares: map[string]middlewareBody{
-			fmt.Sprintf("%s-%s", mw.Namespace, mw.Name): body,
+			// The object key stays <ns>-<name>: users write it in Ingress
+			// annotations as <ns>-<name>@kubernetescrd.
+			names.Host(names.KindMiddlewareKey, mw.Namespace, mw.Name): body,
 		},
 	}}
 	content, err := yaml.Marshal(doc)
@@ -535,10 +546,11 @@ func (s *Server) generateMiddlewareConfig(mw *traefik.Middleware) {
 		return
 	}
 	s.writeTraefikConfigFile(middlewareFilename(mw.Namespace, mw.Name), content)
+	s.removeTraefikConfigFile(legacyMiddlewareFilename(mw.Namespace, mw.Name))
 }
 
 // generateTCPConfig writes the file-provider config for one IngressRouteTCP:
-// one router and one load-balancer service per route, named <ns>-<name>-<i>
+// one router and one load-balancer service per route, named <ns>_<name>_<i>
 // exactly like the Ingress router naming.
 func (s *Server) generateTCPConfig(irt *traefik.IngressRouteTCP) {
 	if s.config.TraefikDir == "" {
@@ -549,7 +561,7 @@ func (s *Server) generateTCPConfig(irt *traefik.IngressRouteTCP) {
 		Services: make(map[string]tcpService),
 	}}
 	for i, route := range irt.Spec.Routes {
-		name := fmt.Sprintf("%s-%s-%d", irt.Namespace, irt.Name, i)
+		name := names.Host(names.KindIngressRouteTCP, irt.Namespace, irt.Name, strconv.Itoa(i))
 		router := tcpRouter{
 			EntryPoints: irt.Spec.EntryPoints,
 			Rule:        route.Match,
@@ -591,6 +603,7 @@ func (s *Server) generateTCPConfig(irt *traefik.IngressRouteTCP) {
 		return
 	}
 	s.writeTraefikConfigFile(tcpFilename(irt.Namespace, irt.Name), content)
+	s.removeTraefikConfigFile(legacyTCPFilename(irt.Namespace, irt.Name))
 }
 
 // tcpBackendAddresses resolves a TCP backend's pods the same way the Ingress
@@ -663,6 +676,7 @@ func (s *Server) deleteMiddlewareByName(ns, name string) error {
 		return err
 	}
 	s.removeTraefikConfigFile(middlewareFilename(ns, name))
+	s.removeTraefikConfigFile(legacyMiddlewareFilename(ns, name))
 	return nil
 }
 
@@ -671,6 +685,7 @@ func (s *Server) deleteIngressRouteTCPByName(ns, name string) error {
 		return err
 	}
 	s.removeTraefikConfigFile(tcpFilename(ns, name))
+	s.removeTraefikConfigFile(legacyTCPFilename(ns, name))
 	return nil
 }
 

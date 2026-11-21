@@ -12,32 +12,32 @@ import (
 )
 
 func TestExecPodmanArgs(t *testing.T) {
-	args := execPodmanArgs("default-pod", []string{"nsenter", "--target", "1"}, true, "Q8S_EXEC_SESSION=abc")
-	want := []string{"exec", "-i", "-e", "Q8S_EXEC_SESSION=abc", "-t", "default-pod", "nsenter", "--target", "1"}
+	args := execPodmanArgs("default_pod", []string{"nsenter", "--target", "1"}, true, "Q8S_EXEC_SESSION=abc")
+	want := []string{"exec", "-i", "-e", "Q8S_EXEC_SESSION=abc", "-t", "default_pod", "nsenter", "--target", "1"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("execPodmanArgs = %v, want %v", args, want)
 	}
 }
 
 func TestExecPodmanArgsWithoutTTY(t *testing.T) {
-	args := execPodmanArgs("default-pod", []string{"true"}, false, "Q8S_EXEC_SESSION=abc")
-	want := []string{"exec", "-i", "-e", "Q8S_EXEC_SESSION=abc", "default-pod", "true"}
+	args := execPodmanArgs("default_pod", []string{"true"}, false, "Q8S_EXEC_SESSION=abc")
+	want := []string{"exec", "-i", "-e", "Q8S_EXEC_SESSION=abc", "default_pod", "true"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("execPodmanArgs = %v, want %v", args, want)
 	}
 }
 
 func TestAttachPodmanArgs(t *testing.T) {
-	args := attachPodmanArgs("default-pod", true)
-	want := []string{"attach", "--sig-proxy=false", "default-pod"}
+	args := attachPodmanArgs("default_pod", true)
+	want := []string{"attach", "--sig-proxy=false", "default_pod"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("attachPodmanArgs = %v, want %v", args, want)
 	}
 }
 
 func TestAttachPodmanArgsWithoutStdin(t *testing.T) {
-	args := attachPodmanArgs("default-pod", false)
-	want := []string{"attach", "--sig-proxy=false", "--no-stdin", "default-pod"}
+	args := attachPodmanArgs("default_pod", false)
+	want := []string{"attach", "--sig-proxy=false", "--no-stdin", "default_pod"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("attachPodmanArgs = %v, want %v", args, want)
 	}
