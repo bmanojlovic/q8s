@@ -516,12 +516,51 @@ func cronRunResourceVersion(kind string, run cronruns.Run) string {
 // handleCronRunPodLogs serves the log subresource of a synthetic pod from the
 // journal. The pod's template container name is only one container; its
 // journald output is selected by CONTAINER_NAME and the run's invocation id.
+// The annotation is checked against the stored CronJob's own runs first: the
+// unit name is shared across namespace/name pairs, so an older invocation
+// would stream a predecessor's output.
 func (s *Server) handleCronRunPodLogs(w http.ResponseWriter, r *http.Request, pod *corev1.Pod) {
+	src := s.config.CronRuns
+	if src == nil {
+		s.respondStatus(w, http.StatusNotFound, "NotFound", "pod %q not found", pod.Name)
+		return
+	}
 	cronJob := pod.Labels[cronRunCronJobLabel]
+	cj, err := s.config.Store.GetCronJob(pod.Namespace, cronJob)
+	if err != nil {
+		s.respondStatus(w, http.StatusNotFound, "NotFound", "pod %q not found", pod.Name)
+		return
+	}
+	runs, err := src.Runs(r.Context(), cj.Namespace, cj.Name)
+	if err != nil {
+		s.respondStatus(w, http.StatusInternalServerError, "InternalError", "journalctl: %v", err)
+		return
+	}
+	if !runBelongsTo(runsSince(runs, cj), pod.Annotations[cronRunInvocationAnnotation]) {
+		s.respondStatus(w, http.StatusNotFound, "NotFound",
+			"pod %q has no run of CronJob %s/%s", pod.Name, cj.Namespace, cj.Name)
+		return
+	}
 	s.handleJournalPodLogs(w, r, pod,
 		cronruns.UnitName(pod.Namespace, cronJob),
 		cronruns.ContainerName(pod.Namespace, cronJob),
-		time.Time{})
+		cj.CreationTimestamp.Time)
+}
+
+// runBelongsTo reports whether invocationID names one of runs. An empty id
+// never belongs: journalctl without an invocation id returns every run of the
+// unit, including those of a previous object that happened to share the unit
+// name.
+func runBelongsTo(runs []cronruns.Run, invocationID string) bool {
+	if invocationID == "" {
+		return false
+	}
+	for _, r := range runs {
+		if r.InvocationID == invocationID {
+			return true
+		}
+	}
+	return false
 }
 
 // handleJournalPodLogs serves a synthetic pod's log subresource from one
@@ -634,9 +673,8 @@ func writeJournalLogLine(w io.Writer, line []byte, timestamps bool) {
 
 // runsSince drops runs that started before the CronJob was created. The
 // journal outlives objects: a CronJob deleted and created again under the
-// same name (or in a namespace with the same name) has the same unit name,
-// and its predecessor's runs must not show up as its own.
-// creationTimestamp has second precision, so compare at that precision.
+// same name (or in a namespace/name pair with the same unit name) has the same
+// unit, and its predecessor's runs must not show up as its own.
 func runsSince(runs []cronruns.Run, cj *batchv1.CronJob) []cronruns.Run {
 	return runsSinceTime(runs, cj.CreationTimestamp.Time)
 }
@@ -644,12 +682,30 @@ func runsSince(runs []cronruns.Run, cj *batchv1.CronJob) []cronruns.Run {
 // runsSinceTime is runsSince for a plain creation timestamp. Job units are
 // named the same way and can be reused after a delete and create too.
 func runsSinceTime(runs []cronruns.Run, created time.Time) []cronruns.Run {
+	return runsStartingAtOrAfter(runs, created)
+}
+
+// runsSinceTimeWithin is runsSinceTime with a backward tolerance, for a run
+// that started just before the API clock stored the object's creation time.
+func runsSinceTimeWithin(runs []cronruns.Run, created time.Time, tolerance time.Duration) []cronruns.Run {
 	if created.IsZero() {
+		return runs
+	}
+	return runsStartingAtOrAfter(runs, created.Add(-tolerance))
+}
+
+// runsStartingAtOrAfter keeps the runs whose start is not before cutoff.
+// The comparison is exact rather than truncated to whole seconds: truncating
+// the creation time would also keep a predecessor run that started earlier in
+// the same second, which is real cross-tenant history after a delete and
+// create.
+func runsStartingAtOrAfter(runs []cronruns.Run, cutoff time.Time) []cronruns.Run {
+	if cutoff.IsZero() {
 		return runs
 	}
 	kept := runs[:0:0]
 	for _, r := range runs {
-		if !r.Start.Truncate(time.Second).Before(created.Truncate(time.Second)) {
+		if !r.Start.Before(cutoff) {
 			kept = append(kept, r)
 		}
 	}

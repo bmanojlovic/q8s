@@ -1420,42 +1420,23 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 			encode(w, &svc, http.StatusCreated)
 			return
 		}
+		if err := s.prepareServiceNodePorts(&svc); err != nil {
+			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+			return
+		}
 		created, err := s.config.Store.CreateService(&svc)
 		if err != nil {
 			s.respondStoreError(w, err, http.StatusConflict, "AlreadyExists")
 			return
 		}
-		// An explicit nodePort is checked before allocation so a collision
-		// is reported as such; the check is repeated after allocation to
-		// cover auto-assigned nodePorts.
-		if port, pod, conflict := s.serviceNodePortConflict(created); conflict {
-			s.config.Store.DeleteService(ns, created.Name)
-			s.respondStatus(w, http.StatusConflict, "Conflict",
-				"nodePort %d collides with hostPort of Pod %s", port, pod)
-			return
-		}
-		if err := s.assignNodePorts(created); err != nil {
-			s.config.Store.DeleteService(ns, created.Name)
-			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
-			return
-		}
-		if port, pod, conflict := s.serviceNodePortConflict(created); conflict {
-			s.config.Store.DeleteService(ns, created.Name)
-			s.respondStatus(w, http.StatusConflict, "Conflict",
-				"nodePort %d collides with hostPort of Pod %s", port, pod)
-			return
-		}
-		if err := s.serviceHostPortConflict(created); err != nil {
-			s.config.Store.DeleteService(ns, created.Name)
-			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
-			return
-		}
+		// The nodePorts were already assigned and validated on the object
+		// that was stored; reconciling now only publishes them to the backing
+		// pod's quadlet, where the stored Service is visible to the renderer.
 		if err := s.reconcileNodePort(created); err != nil {
 			s.config.Store.DeleteService(ns, created.Name)
 			s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
 			return
 		}
-		s.config.Store.UpdateService(created)
 		s.regenerateIngressConfigs(ns)
 		encode(w, created, http.StatusCreated)
 	case http.MethodPut:
@@ -1594,50 +1575,56 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request, ns, name
 	}
 }
 
-// updateService stores a validated Service update and runs the same nodePort,
-// hostPort and socket bookkeeping for PUT and PATCH. previous is restored when
-// a host-port conflict is found after the new object was stored.
+// prepareServiceNodePorts runs every nodePort and host-port validation and
+// assigns missing nodePorts on the copy that will be stored. A refused write
+// therefore never reaches the store; the old order stored first and left a
+// rejected nodePort behind on the 409 path.
+func (s *Server) prepareServiceNodePorts(svc *corev1.Service) error {
+	// An explicit nodePort is checked before allocation so a collision
+	// is reported as such; the check is repeated after allocation to
+	// cover auto-assigned nodePorts.
+	if port, pod, conflict := s.serviceNodePortConflict(svc); conflict {
+		return fmt.Errorf("nodePort %d collides with hostPort of Pod %s", port, pod)
+	}
+	if err := s.assignNodePorts(svc); err != nil {
+		return err
+	}
+	if port, pod, conflict := s.serviceNodePortConflict(svc); conflict {
+		return fmt.Errorf("nodePort %d collides with hostPort of Pod %s", port, pod)
+	}
+	if err := s.serviceHostPortConflict(svc); err != nil {
+		return err
+	}
+	return s.nodePortBackingConflict(svc)
+}
+
+// updateService validates a Service update on a copy and stores it only when
+// every nodePort and host-port check passed. previous is restored only for a
+// race between validation and publishing an already stored Service.
 func (s *Server) updateService(w http.ResponseWriter, ns, name string, previous, patched *corev1.Service) {
-	updated, err := s.config.Store.UpdateService(patched)
+	updated := patched.DeepCopy()
+	if err := s.prepareServiceNodePorts(updated); err != nil {
+		s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
+		return
+	}
+	stored, err := s.config.Store.UpdateService(updated)
 	if err != nil {
 		s.respondStoreError(w, err, http.StatusInternalServerError, "InternalError")
 		return
 	}
-	// An explicit nodePort is checked before allocation so a collision
-	// is reported as such; the check is repeated after allocation to
-	// cover auto-assigned nodePorts.
-	if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
-		s.respondStatus(w, http.StatusConflict, "Conflict",
-			"nodePort %d collides with hostPort of Pod %s", port, pod)
-		return
-	}
-	if err := s.assignNodePorts(updated); err != nil {
-		s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
-		return
-	}
-	if port, pod, conflict := s.serviceNodePortConflict(updated); conflict {
-		s.respondStatus(w, http.StatusConflict, "Conflict",
-			"nodePort %d collides with hostPort of Pod %s", port, pod)
-		return
-	}
-	if err := s.serviceHostPortConflict(updated); err != nil {
-		// The updated object was stored above, before allocation. Put the
-		// previous Service back so a refused conflict does not persist.
+	if err := s.reconcileNodePort(stored); err != nil {
+		// A pod may have appeared between validation and publishing. Restore
+		// the previous Service so the refused nodePort does not persist.
 		if _, restoreErr := s.config.Store.UpdateService(previous); restoreErr != nil {
 			fmt.Printf("restore service %s/%s after conflict: %v\n", ns, name, restoreErr)
 		}
 		s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
 		return
 	}
-	if err := s.reconcileNodePort(updated); err != nil {
-		s.respondStatus(w, http.StatusConflict, "Conflict", "%s", err.Error())
-		return
-	}
-	s.config.Store.UpdateService(updated)
 	// Clean up legacy per-port socket files (see removeLegacyServiceSockets).
 	s.removeLegacyServiceSockets(previous)
 	s.regenerateIngressConfigs(ns)
-	encode(w, updated, http.StatusOK)
+	encode(w, stored, http.StatusOK)
 }
 
 // --- PVCs ---
@@ -5920,15 +5907,26 @@ func (s *Server) reconcileNodePort(svc *corev1.Service) error {
 	if err := s.assignNodePorts(svc); err != nil {
 		return err
 	}
-	pods := s.nodePortBackingPods(svc)
-	if len(pods) > 1 {
-		return fmt.Errorf("NodePort service selector matches %d pods; only one backing pod is supported (use an Ingress for multi-replica exposure)", len(pods))
+	if err := s.nodePortBackingConflict(svc); err != nil {
+		return err
 	}
 	// No backing pod yet is fine — the port is reserved on the Service and
 	// applied when a matching pod appears (see nodePortHostPorts, consulted
 	// during pod quadlet generation).
-	for _, pod := range pods {
+	for _, pod := range s.nodePortBackingPods(svc) {
 		s.redeployPodQuadlet(pod)
+	}
+	return nil
+}
+
+// nodePortBackingConflict rejects a NodePort Service whose selector matches
+// more than one pod: a single host port can only be bound once.
+func (s *Server) nodePortBackingConflict(svc *corev1.Service) error {
+	if svc.Spec.Type != corev1.ServiceTypeNodePort {
+		return nil
+	}
+	if pods := s.nodePortBackingPods(svc); len(pods) > 1 {
+		return fmt.Errorf("NodePort service selector matches %d pods; only one backing pod is supported (use an Ingress for multi-replica exposure)", len(pods))
 	}
 	return nil
 }
@@ -5950,6 +5948,16 @@ func (s *Server) nodePortHostPorts(pod *corev1.Pod) map[int32]int32 {
 			if sp.NodePort == 0 {
 				continue
 			}
+			if sp.NodePort < store.NodePortMin || sp.NodePort > store.NodePortMax {
+				fmt.Printf("service %s/%s: skip nodePort %d for pod %s/%s: out of range %d-%d\n",
+					svc.Namespace, svc.Name, sp.NodePort, pod.Namespace, pod.Name, store.NodePortMin, store.NodePortMax)
+				continue
+			}
+			if other, allocated := s.nodePortAllocatedToOther(svc, sp.NodePort); allocated {
+				fmt.Printf("service %s/%s: skip nodePort %d for pod %s/%s: already allocated to Service %s/%s\n",
+					svc.Namespace, svc.Name, sp.NodePort, pod.Namespace, pod.Name, other.Namespace, other.Name)
+				continue
+			}
 			target := sp.TargetPort.IntVal
 			if target == 0 {
 				target = sp.Port
@@ -5958,6 +5966,23 @@ func (s *Server) nodePortHostPorts(pod *corev1.Pod) map[int32]int32 {
 		}
 	}
 	return out
+}
+
+// nodePortAllocatedToOther reports whether another Service already claims
+// port. The store allocation check is the source of truth; this guards the
+// render path when an invalid update or a restored store left two claims.
+func (s *Server) nodePortAllocatedToOther(svc *corev1.Service, port int32) (*corev1.Service, bool) {
+	for _, other := range s.config.Store.AllServices() {
+		if other.Namespace == svc.Namespace && other.Name == svc.Name {
+			continue
+		}
+		for _, sp := range other.Spec.Ports {
+			if sp.NodePort == port {
+				return other, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (s *Server) writeConfigMapFiles(cm *corev1.ConfigMap) {

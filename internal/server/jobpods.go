@@ -78,10 +78,17 @@ func (s *Server) jobPodObjects(ctx context.Context, ns string) []*corev1.Pod {
 	return pods
 }
 
+// jobRunStartTolerance is how far a unit run may start before the stored
+// creationTimestamp and still count as the new Job's own run. The Job
+// request starts the unit, and the journal timestamp and the API timestamp
+// come from different clocks, so a few seconds of skew are expected. The
+// window is small: a run outside it belongs to a predecessor.
+const jobRunStartTolerance = 2 * time.Second
+
 // jobRuns reads the runs of a Job's unit, newest first. Runs from before the
-// Job object was created belong to a previous Job with the same name. When
-// there is no run since creation, the unit's last known run is still the best
-// available state, so it is returned instead of pretending the Job never ran.
+// Job object was created belong to a previous Job with the same unit name:
+// namespace team-prod Job db and namespace team Job prod-db both map to
+// team-prod-db-job.service. Only runs since creation are returned.
 func (s *Server) jobRuns(ctx context.Context, job *batchv1.Job) []cronruns.Run {
 	if s.config.CronRuns == nil {
 		return nil
@@ -93,7 +100,11 @@ func (s *Server) jobRuns(ctx context.Context, job *batchv1.Job) []cronruns.Run {
 	if kept := runsSinceTime(runs, job.CreationTimestamp.Time); len(kept) > 0 {
 		return kept
 	}
-	return runs
+	// A run normally starts after the Job is stored, but the unit starts in
+	// the same request and the two clocks are not perfectly aligned. Allow a
+	// small backward window instead of the old "return every run" fallback,
+	// which after a delete and create showed a predecessor's whole history.
+	return runsSinceTimeWithin(runs, job.CreationTimestamp.Time, jobRunStartTolerance)
 }
 
 func (s *Server) jobPodFindPod(ctx context.Context, ns, name string) (*corev1.Pod, bool) {
@@ -144,13 +155,26 @@ func (s *Server) rejectJobPodWrite(w http.ResponseWriter, r *http.Request, ns, n
 }
 
 // handleJobPodLogs serves a Job pod's logs from the job unit. The unit is the
-// same one JobContainer renders, <ns>-<name>-job.service.
+// same one JobContainer renders, <ns>-<name>-job.service. The run annotation
+// alone is not trusted: it is checked against the runs the stored Job owns,
+// because the unit name is shared by other namespace/name pairs and an older
+// invocation would stream another tenant's output.
 func (s *Server) handleJobPodLogs(w http.ResponseWriter, r *http.Request, pod *corev1.Pod) {
 	jobName := pod.Labels[jobNameLabel]
+	job, err := s.config.Store.GetJob(pod.Namespace, jobName)
+	if err != nil {
+		s.respondStatus(w, http.StatusNotFound, "NotFound", "pod %q not found", pod.Name)
+		return
+	}
+	if !runBelongsTo(s.jobRuns(r.Context(), job), pod.Annotations[cronRunInvocationAnnotation]) {
+		s.respondStatus(w, http.StatusNotFound, "NotFound",
+			"pod %q has no run of Job %s/%s", pod.Name, job.Namespace, job.Name)
+		return
+	}
 	s.handleJournalPodLogs(w, r, pod,
 		cronruns.JobUnitName(pod.Namespace, jobName),
 		cronruns.JobContainerName(pod.Namespace, jobName),
-		time.Time{})
+		job.CreationTimestamp.Time.Add(-jobRunStartTolerance))
 }
 
 func jobPodObjectFor(job *batchv1.Job, run *cronruns.Run) *corev1.Pod {
