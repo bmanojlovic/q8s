@@ -178,17 +178,14 @@ func (s *Server) reconcilePodSockets(pod *corev1.Pod, podName string) ([]string,
 // startSocketUnits enables and starts socket units. Reconcile calls this
 // before starting any container service so LISTEN_FDS is available.
 func (s *Server) startSocketUnits(units []string) {
-	mgr := s.config.Manager
-	if mgr == nil {
+	if !s.hasSystemd() {
 		return
 	}
 	for _, unit := range units {
-		if err := mgr.EnableUnit(unit); err != nil {
+		if err := s.enableUnit(unit); err != nil {
 			fmt.Printf("enable socket %s: %v\n", unit, err)
 		}
-		if err := mgr.StartUnit(unit); err != nil {
-			fmt.Printf("start socket %s: %v\n", unit, err)
-		}
+		s.startUnit(unit)
 	}
 }
 

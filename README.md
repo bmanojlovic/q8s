@@ -77,6 +77,8 @@ kubectl --context q8s get pods
 
 Run `q8s doctor` for a read-only report of what this host gives your workloads; see [docs/doctor.md](docs/doctor.md).
 
+Upgrading from a release that used the old generated names? See [docs/upgrade.md](docs/upgrade.md) for the one-time restart, the dry-run preview and the rollback steps.
+
 ## Build from source
 
 ```sh

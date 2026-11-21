@@ -54,6 +54,8 @@ func main() {
 		cmdStatus()
 	case "doctor":
 		cmdDoctor()
+	case "migrate-names":
+		cmdMigrateNames()
 	case "start":
 		cmdStart()
 	case "stop":
@@ -86,6 +88,7 @@ func printUsage() {
 	fmt.Println("  uninstall  Remove q8s installation")
 	fmt.Println("  status     Show q8s server status and connectivity")
 	fmt.Println("  doctor     Report host capabilities and limits for workloads (read-only)")
+	fmt.Println("  migrate-names  Migrate host artifacts to the new generated names, or roll back")
 	fmt.Println("  start      Start the q8s socket (begin accepting connections)")
 	fmt.Println("  stop       Stop the q8s socket and API server")
 	fmt.Println("  enable     Enable and start q8s socket on boot")
@@ -835,6 +838,17 @@ func cmdServe() {
 	for _, l := range listeners {
 		fmt.Printf("Listening on: %s\n", l.Addr())
 	}
+
+	// The eager name migration runs before any request can be served: the
+	// listeners exist but StartTLS has not hooked them up yet, and socket
+	// activation keeps clients waiting. The marker is written only after the
+	// whole startup sequence below finished, so a crash at any point makes
+	// the next start migrate and start again.
+	namesMigrationPending := srv.NamesMigrationPending()
+	if namesMigrationPending {
+		srv.MigrateLegacyNames()
+	}
+
 	if err := srv.StartTLS(listeners); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start server: %v\n", err)
 		os.Exit(1)
@@ -853,6 +867,16 @@ func cmdServe() {
 	srv.ReconcileNetworkAttachments()
 	srv.ReconcileIngressConfigs()
 	reconcilePodmanPods(st, mgr)
+	if namesMigrationPending {
+		// ReconcileQuadlets starts only units whose file was missing. A
+		// crash after writing the new files but before starting their units
+		// would otherwise leave those workloads down; this pass starts every
+		// workload that should run and is a no-op for an active unit.
+		srv.EnsureWorkloadsStarted()
+		if err := srv.WriteNamesMigrationMarker(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: names migration marker not written: %v\n", err)
+		}
+	}
 
 	if mgr != nil {
 		syncCtx, stopSync := context.WithCancel(context.Background())

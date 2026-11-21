@@ -83,6 +83,12 @@ type Server struct {
 	// systemd call, so tests can check whether a start was requested without
 	// changing which call production makes.
 	startUnitHook func(name string)
+	// daemonReloadHook, enableUnitHook and disableUnitHook let tests fake the
+	// remaining systemd calls the name migration and startup reconciliation
+	// make. They are nil in production, where config.Manager is used.
+	daemonReloadHook func() error
+	enableUnitHook   func(name string) error
+	disableUnitHook  func(name string) error
 	// disk caches the short-lived disk pressure check for write requests.
 	disk diskPressureCache
 	// objLocks serializes writes to the same object; see objlock.go for the

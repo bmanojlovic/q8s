@@ -4449,7 +4449,11 @@ func (s *Server) ReconcileQuadlets() {
 			continue
 		}
 		jobUnit := ""
-		if missing(f) {
+		// A completed Job gets the regenerated file for the record, but must
+		// never run a second time. jobFinished covers both the counts the
+		// sync loop stores and the Complete/Failed conditions CronJob runs
+		// carry.
+		if missing(f) && !jobFinished(job) {
 			jobUnit = names.Host(names.KindJobService, job.Namespace, job.Name)
 		}
 		resolved, envFile, err := s.resolvedJobEnv(job)
@@ -4509,12 +4513,11 @@ func (s *Server) ReconcileQuadlets() {
 		s.clearCronJobWaitingForClaim(cj.Namespace, cj.Name)
 	}
 
-	mgr := s.config.Manager
-	if mgr == nil {
+	if !s.hasSystemd() {
 		return
 	}
 	if needReload {
-		if err := mgr.DaemonReload(); err != nil {
+		if err := s.daemonReload(); err != nil {
 			fmt.Printf("reconcile: daemon-reload failed: %v\n", err)
 			return
 		}
@@ -4523,9 +4526,7 @@ func (s *Server) ReconcileQuadlets() {
 	// when the .socket unit is already active at start time.
 	s.startSocketUnits(socketUnitsToStart)
 	for _, unit := range startUnits {
-		if err := mgr.StartUnit(unit); err != nil {
-			fmt.Printf("reconcile: start %s: %v\n", unit, err)
-		}
+		s.startUnit(unit)
 	}
 	// Timers written by older q8s versions were started but never enabled,
 	// so they did not come back after a reboot. Enable every non-suspended
@@ -4537,19 +4538,20 @@ func (s *Server) ReconcileQuadlets() {
 		if cronJobSuspended(cj) {
 			continue
 		}
-		timer := names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)
-		if err := mgr.StartUnit(timer); err != nil {
-			fmt.Printf("reconcile: start %s: %v\n", timer, err)
-		}
+		s.startUnit(names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name))
 	}
-	for _, unit := range restartIfActive {
-		state, err := mgr.UnitState(unit)
-		if err != nil || state == nil || state.Active != "active" {
-			continue
-		}
-		fmt.Printf("reconcile: restarting %s (unit re-rendered)\n", unit)
-		if err := mgr.RestartUnit(unit); err != nil {
-			fmt.Printf("reconcile: restart %s: %v\n", unit, err)
+	// A fake manager in a test has no loaded units, so the restart-if-active
+	// pass has nothing to observe. Only a real Manager can report unit state.
+	if mgr := s.config.Manager; mgr != nil {
+		for _, unit := range restartIfActive {
+			state, err := mgr.UnitState(unit)
+			if err != nil || state == nil || state.Active != "active" {
+				continue
+			}
+			fmt.Printf("reconcile: restarting %s (unit re-rendered)\n", unit)
+			if err := mgr.RestartUnit(unit); err != nil {
+				fmt.Printf("reconcile: restart %s: %v\n", unit, err)
+			}
 		}
 	}
 
@@ -4820,6 +4822,48 @@ func (s *Server) startUnit(name string) {
 	if err := mgr.StartUnit(name); err != nil {
 		fmt.Printf("start %s: %v\n", name, err)
 	}
+}
+
+// hasSystemd reports whether any systemd side effect is available. Tests
+// replace the manager with hooks, so a nil Manager alone does not mean the
+// reconcile pass has nothing to do.
+func (s *Server) hasSystemd() bool {
+	return s.config.Manager != nil || s.startUnitHook != nil || s.stopUnitHook != nil ||
+		s.daemonReloadHook != nil || s.enableUnitHook != nil || s.disableUnitHook != nil
+}
+
+func (s *Server) daemonReload() error {
+	if s.daemonReloadHook != nil {
+		return s.daemonReloadHook()
+	}
+	if mgr := s.config.Manager; mgr != nil {
+		return mgr.DaemonReload()
+	}
+	return nil
+}
+
+func (s *Server) enableUnit(name string) error {
+	if s.enableUnitHook != nil {
+		if err := s.enableUnitHook(name); err != nil {
+			return err
+		}
+	}
+	if mgr := s.config.Manager; mgr != nil {
+		return mgr.EnableUnit(name)
+	}
+	return nil
+}
+
+func (s *Server) disableUnit(name string) error {
+	if s.disableUnitHook != nil {
+		if err := s.disableUnitHook(name); err != nil {
+			return err
+		}
+	}
+	if mgr := s.config.Manager; mgr != nil {
+		return mgr.DisableUnit(name)
+	}
+	return nil
 }
 
 func (s *Server) removePodQuadlet(pod *corev1.Pod) {
@@ -5172,21 +5216,18 @@ func cronJobSuspended(cj *batchv1.CronJob) bool {
 // CronJob's timer is enabled (timers.target wants it), and a suspended one
 // is stopped and disabled. Both calls are idempotent.
 func (s *Server) setCronTimerEnabled(cj *batchv1.CronJob) {
-	mgr := s.config.Manager
-	if mgr == nil {
+	if !s.hasSystemd() {
 		return
 	}
 	timer := names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)
 	if cronJobSuspended(cj) {
-		if err := mgr.StopUnit(timer); err != nil {
-			fmt.Printf("cronjob %s/%s: stop %s: %v\n", cj.Namespace, cj.Name, timer, err)
-		}
-		if err := mgr.DisableUnit(timer); err != nil {
+		s.stopUnit(timer)
+		if err := s.disableUnit(timer); err != nil {
 			fmt.Printf("cronjob %s/%s: disable %s: %v\n", cj.Namespace, cj.Name, timer, err)
 		}
 		return
 	}
-	if err := mgr.EnableUnit(timer); err != nil {
+	if err := s.enableUnit(timer); err != nil {
 		fmt.Printf("cronjob %s/%s: enable %s: %v\n", cj.Namespace, cj.Name, timer, err)
 	}
 }
