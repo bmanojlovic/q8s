@@ -43,58 +43,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
-	case "serve":
-		cmdServe()
-	case "install":
-		cmdInstall()
-	case "uninstall":
-		cmdUninstall()
-	case "status":
-		cmdStatus()
-	case "doctor":
-		cmdDoctor()
-	case "migrate-names":
-		cmdMigrateNames()
-	case "start":
-		cmdStart()
-	case "stop":
-		cmdStop()
-	case "enable":
-		cmdEnable()
-	case "disable":
-		cmdDisable()
-	case "kubeconfig":
-		cmdKubeconfig()
-	case "credential":
-		cmdCredential()
+	name := os.Args[1]
+	switch name {
 	case "-h", "--help", "help":
 		printUsage()
+		return
 	case "-v", "--version", "version":
 		fmt.Println(version)
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
+		return
+	}
+
+	cmd, ok := commandFor(name)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", name)
 		printUsage()
 		os.Exit(1)
 	}
-}
-
-func printUsage() {
-	fmt.Println("Usage: q8s <command>")
-	fmt.Println()
-	fmt.Println("Commands:")
-	fmt.Println("  serve      Run the q8s API server (used by systemd)")
-	fmt.Println("  install    Generate certs, create dirs, install systemd units")
-	fmt.Println("  uninstall  Remove q8s installation")
-	fmt.Println("  status     Show q8s server status and connectivity")
-	fmt.Println("  doctor     Report host capabilities and limits for workloads (read-only)")
-	fmt.Println("  migrate-names  Migrate host artifacts to the new generated names, or roll back")
-	fmt.Println("  start      Start the q8s socket (begin accepting connections)")
-	fmt.Println("  stop       Stop the q8s socket and API server")
-	fmt.Println("  enable     Enable and start q8s socket on boot")
-	fmt.Println("  disable    Disable q8s socket (stop and remove from boot)")
-	fmt.Println("  kubeconfig Print a kubeconfig file for this q8s instance")
-	fmt.Println("  credential Print the service account ExecCredential for this pod")
+	if helpRequested(os.Args[2:]) {
+		fmt.Print(cmd.usage)
+		return
+	}
+	cmd.run()
 }
 
 // --- Path resolution ---
@@ -190,14 +159,7 @@ func cmdInstall() {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-h", "--help":
-			fmt.Println("Usage: q8s install [flags]")
-			fmt.Println()
-			fmt.Println("Flags:")
-			fmt.Println("  --name <name>        Cluster/context name for kubeconfig (default: hostname)")
-			fmt.Println("  --san-ip <ip>        Add extra IP to server certificate SAN")
-			fmt.Println("  --san-dns <name>     Add extra DNS name to server certificate SAN")
-			fmt.Println("  --server <url>       Server URL for kubeconfig (default: https://localhost:{port})")
-			fmt.Println("  --regenerate-certs   Force certificate regeneration")
+			fmt.Print(installUsage)
 			return
 		case "--name":
 			i++
@@ -260,226 +222,8 @@ func cmdInstall() {
 	}
 }
 
-func cmdUninstall() {
-	rootful := os.Getuid() == 0
-	d := resolveDirs(rootful)
-	flags := systemctlFlags(rootful)
-
-	for _, unit := range []string{"q8s.socket", "q8s-api.service"} {
-		exec.Command("systemctl", append(flags, "stop", unit)...).Run()
-		exec.Command("systemctl", append(flags, "disable", unit)...).Run()
-	}
-
-	storeFile := d.dataDir + "/store.json"
-	st, storeErr := store.Load(storeFile)
-	if storeErr != nil {
-		// Don't silently skip quadlet cleanup and still claim success: the
-		// user must know container/volume/network files remain.
-		fmt.Fprintf(os.Stderr, "warning: could not read %s (%v) — resource quadlet files were NOT cleaned up\n", storeFile, storeErr)
-	}
-	if storeErr == nil {
-		removed := 0
-		rm := func(path string) {
-			if os.Remove(path) == nil {
-				fmt.Printf("  removed %s\n", path)
-				removed++
-			}
-		}
-		for _, path := range uninstallQuadletFiles(st, d) {
-			rm(path)
-		}
-		// Pod sockets (q8s.io/socket-activation) live in the systemd dir next
-		// to q8s's own q8s.socket; only files carrying the pod owner key are
-		// q8s-generated pod sockets.
-		if socks, err := filepath.Glob(filepath.Join(d.systemdDir, "*.socket")); err == nil {
-			for _, path := range socks {
-				content, err := os.ReadFile(path)
-				if err != nil || !strings.Contains(string(content), "\nX-Q8s-Namespace=") {
-					continue
-				}
-				unit := filepath.Base(path)
-				exec.Command("systemctl", append(flags, "stop", unit)...).Run()
-				exec.Command("systemctl", append(flags, "disable", unit)...).Run()
-				rm(path)
-			}
-		}
-		if removed > 0 {
-			fmt.Printf("Removed %d quadlet/timer file(s).\n", removed)
-		}
-		bakFile := storeFile + ".bak"
-		if data, err := os.ReadFile(storeFile); err == nil {
-			if err := os.WriteFile(bakFile, data, 0600); err == nil {
-				fmt.Printf("Store backed up to %s\n", bakFile)
-			}
-		}
-	}
-
-	for _, f := range []string{"q8s.socket", "q8s-api.service"} {
-		os.Remove(d.systemdDir + "/" + f)
-	}
-	exec.Command("systemctl", append(flags, "daemon-reload")...).Run()
-
-	// Remove the rest of the installation. store.json.bak is kept: it is
-	// the restore path for `q8s install && q8s serve` after uninstall.
-	// The certs directory includes the CA private key — an "uninstall" that
-	// leaves a CA key on disk is not an uninstall.
-	for _, p := range []string{
-		d.dataDir + "/certs",     // ca.key, server/client keys
-		d.dataDir + "/traefik",   // generated ingress dynamic configs
-		d.dataDir + "/quadlets",  // legacy empty dir from old installs
-		d.dataDir + "/snapshots", // gzip store snapshots, derived from store.json
-		d.dataDir + "/config.json",
-	} {
-		if err := os.RemoveAll(p); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not remove %s: %v\n", p, err)
-		} else {
-			fmt.Printf("  removed %s\n", p)
-		}
-	}
-
-	fmt.Println("q8s uninstalled.")
-	if storeErr == nil {
-		fmt.Println("Run 'q8s install && q8s serve' to reinstall — existing resources will be restored from backup.")
-	}
-
-	// List any Podman volumes that belonged to q8s PVCs: data is never deleted automatically.
-	if storeErr == nil {
-		hints := pvcVolumeRemovalHints(st.AllPVCs(), func(name string) bool {
-			out, err := exec.Command("podman", "volume", "inspect", "--format", "{{.Name}}", name).Output()
-			return err == nil && len(out) > 0
-		})
-		if len(hints) > 0 {
-			fmt.Println()
-			fmt.Println("The following Podman volumes still contain your data and were NOT deleted:")
-			for _, hint := range hints {
-				fmt.Printf("  %s\n", hint)
-			}
-			fmt.Println()
-			fmt.Println("Delete them manually with the commands above if you no longer need the data.")
-		}
-	}
-}
-
-// uninstallQuadletFiles returns every quadlet and timer file uninstall removes
-// for the stored objects, in both the current and the pre-upgrade name. PVC
-// volumes themselves are never removed; only their .volume file is listed.
-// Pod socket files are handled separately by the owning-label glob.
-func uninstallQuadletFiles(st *store.Store, d dirs) []string {
-	seen := make(map[string]bool)
-	var paths []string
-	add := func(items ...string) {
-		for _, path := range items {
-			if path == "" || seen[path] {
-				continue
-			}
-			seen[path] = true
-			paths = append(paths, path)
-		}
-	}
-	file := func(dir, name string) string {
-		if name == "" {
-			return ""
-		}
-		return filepath.Join(dir, name)
-	}
-	for _, dep := range st.AllDeployments() {
-		n := int32(1)
-		if dep.Spec.Replicas != nil && *dep.Spec.Replicas > 1 {
-			n = *dep.Spec.Replicas
-		}
-		for i := int32(0); i < n; i++ {
-			instance := quadlet.DeploymentInstanceName(dep.Name, i)
-			add(
-				file(d.quadletDir, names.Host(names.KindPodContainerFile, dep.Namespace, instance, "")),
-				file(d.quadletDir, names.LegacyHost(names.KindPodContainerFile, dep.Namespace, instance, "")),
-				file(d.quadletDir, names.Host(names.KindPodFile, dep.Namespace, instance)),
-				file(d.quadletDir, names.LegacyHost(names.KindPodFile, dep.Namespace, instance)))
-			for _, c := range dep.Spec.Template.Spec.Containers {
-				add(
-					file(d.quadletDir, names.Host(names.KindPodContainerFile, dep.Namespace, instance, c.Name)),
-					file(d.quadletDir, names.LegacyHost(names.KindPodContainerFile, dep.Namespace, instance, c.Name)))
-			}
-		}
-	}
-	for _, pod := range st.AllPods() {
-		if len(pod.Spec.Containers) > 1 {
-			add(
-				file(d.quadletDir, names.Host(names.KindPodFile, pod.Namespace, pod.Name)),
-				file(d.quadletDir, names.LegacyHost(names.KindPodFile, pod.Namespace, pod.Name)))
-			for _, c := range pod.Spec.Containers {
-				add(
-					file(d.quadletDir, names.Host(names.KindPodContainerFile, pod.Namespace, pod.Name, c.Name)),
-					file(d.quadletDir, names.LegacyHost(names.KindPodContainerFile, pod.Namespace, pod.Name, c.Name)))
-			}
-			continue
-		}
-		add(
-			file(d.quadletDir, names.Host(names.KindPodContainerFile, pod.Namespace, pod.Name, "")),
-			file(d.quadletDir, names.LegacyHost(names.KindPodContainerFile, pod.Namespace, pod.Name, "")))
-	}
-	for _, pvc := range st.AllPVCs() {
-		if pvcUsesHostPath(pvc) {
-			continue
-		}
-		add(
-			file(d.quadletDir, quadlet.PVCVolumeFileBase(pvc)+".volume"),
-			file(d.quadletDir, names.Host(names.KindPVCFile, pvc.Namespace, pvc.Name)),
-			file(d.quadletDir, names.LegacyHost(names.KindPVCFile, pvc.Namespace, pvc.Name)))
-	}
-	for _, job := range st.AllJobs() {
-		add(
-			file(d.quadletDir, names.Host(names.KindJobFile, job.Namespace, job.Name)),
-			file(d.quadletDir, names.LegacyHost(names.KindJobFile, job.Namespace, job.Name)))
-	}
-	for _, cj := range st.AllCronJobs() {
-		add(
-			file(d.quadletDir, names.Host(names.KindCronJobFile, cj.Namespace, cj.Name)),
-			file(d.quadletDir, names.LegacyHost(names.KindCronJobFile, cj.Namespace, cj.Name)))
-		add(
-			file(d.systemdDir, names.Host(names.KindCronJobTimer, cj.Namespace, cj.Name)),
-			file(d.systemdDir, names.LegacyHost(names.KindCronJobTimer, cj.Namespace, cj.Name)))
-	}
-	for _, ns := range st.Namespaces() {
-		add(file(d.quadletDir, names.Host(names.KindNetwork, ns.Name, "")+".network"))
-	}
-	return paths
-}
-
-// pvcVolumeRemovalHints returns the `podman volume rm` command for every PVC
-// whose Podman volume still exists. A PVC's volume is spec.volumeName, not the
-// claim name; hostpath claims have no Podman volume at all. inspect reports
-// whether a volume exists, so the command is only printed when it would work.
-func pvcVolumeRemovalHints(pvcs []*corev1.PersistentVolumeClaim, inspect func(name string) bool) []string {
-	var hints []string
-	for _, pvc := range pvcs {
-		if pvcUsesHostPath(pvc) {
-			continue
-		}
-		volName := pvc.Spec.VolumeName
-		if volName == "" {
-			// A claim stored without a binding has no volume yet; the hint
-			// names the volume a create would use.
-			volName = quadlet.PVCVolumeName(pvc.Namespace, pvc.Name)
-		}
-		if !inspect(volName) {
-			continue
-		}
-		hints = append(hints, fmt.Sprintf("podman volume rm %s   # PVC %s/%s", volName, pvc.Namespace, pvc.Name))
-	}
-	return hints
-}
-
-// pvcUsesHostPath reports whether a PVC binds a host directory instead of a
-// Podman named volume.
-func pvcUsesHostPath(pvc *corev1.PersistentVolumeClaim) bool {
-	if pvc.Spec.StorageClassName != nil && *pvc.Spec.StorageClassName == quadlet.StorageClassHostPath {
-		return true
-	}
-	_, ok := pvc.Annotations[quadlet.AnnotationHostPath]
-	return ok
-}
-
 func cmdStatus() {
+	requireNoArguments(statusUsage, os.Args[2:])
 	rootful := os.Getuid() == 0
 	d := resolveDirs(rootful)
 	flags := systemctlFlags(rootful)
@@ -592,14 +336,7 @@ func cmdDoctor() {
 }
 
 func printDoctorUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: q8s doctor [--json]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Reports what this host gives q8s workloads and what it does not.")
-	fmt.Fprintln(w, "Read-only: it never writes files or starts containers.")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Flags:")
-	fmt.Fprintln(w, "  --json   Print the report as JSON")
-	fmt.Fprintln(w, "  -h, --help")
+	fmt.Fprint(w, doctorUsage)
 }
 
 // realFSType maps the Statfs magic to a filesystem name. Names, not magic
@@ -631,6 +368,7 @@ func realFSType(path string) (string, error) {
 }
 
 func cmdStart() {
+	requireNoArguments(startUsage, os.Args[2:])
 	rootful := os.Getuid() == 0
 	args := append(systemctlFlags(rootful), "start", "q8s.socket")
 	if out, err := exec.Command("systemctl", args...).CombinedOutput(); err != nil {
@@ -641,6 +379,7 @@ func cmdStart() {
 }
 
 func cmdStop() {
+	requireNoArguments(stopUsage, os.Args[2:])
 	rootful := os.Getuid() == 0
 	flags := systemctlFlags(rootful)
 	for _, unit := range []string{"q8s-api.service", "q8s.socket"} {
@@ -653,6 +392,7 @@ func cmdStop() {
 }
 
 func cmdEnable() {
+	requireNoArguments(enableUsage, os.Args[2:])
 	rootful := os.Getuid() == 0
 	args := append(systemctlFlags(rootful), "enable", "--now", "q8s.socket")
 	if out, err := exec.Command("systemctl", args...).CombinedOutput(); err != nil {
@@ -663,6 +403,7 @@ func cmdEnable() {
 }
 
 func cmdDisable() {
+	requireNoArguments(disableUsage, os.Args[2:])
 	rootful := os.Getuid() == 0
 	flags := systemctlFlags(rootful)
 	for _, unit := range []string{"q8s-api.service", "q8s.socket"} {

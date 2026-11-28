@@ -781,6 +781,12 @@ func timerStampDir() string {
 	return filepath.Join(home, ".local", "share", "systemd", "timers")
 }
 
+// TimerStampDir is timerStampDir for callers outside this package, such as
+// q8s uninstall removing the stamps of the timers it just removed.
+func TimerStampDir() string {
+	return timerStampDir()
+}
+
 // MoveCronTimerStamps carries each CronJob timer's last-trigger stamp over to
 // its renamed timer (toNew) or back (rollback). CronJob timers use
 // Persistent=true, and a timer without a stamp fires at once when it starts:

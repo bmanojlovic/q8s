@@ -94,8 +94,25 @@ The OpenAPI schema and embedded CRD list are generated and committed; see
 ## Uninstall
 
 ```sh
-q8s uninstall
+q8s uninstall            # ask for confirmation on a terminal
+q8s uninstall --yes      # no question (required when stdin is not a terminal)
+q8s uninstall --purge    # also remove the data directory
 ```
+
+Uninstall stops and disables the q8s units, then stops the generated workload
+units (timers first), removes the quadlet and timer files, removes the q8s
+Podman containers, pods and networks, and clears dangling systemd links.
+CronJob timer stamps are kept for the restore (a restored timer without its
+stamp would fire at once) and removed only with `--purge`.
+
+Without `--purge`, `store.json` and `store.json.bak` are kept, so
+`q8s install && q8s serve` restores the resources. Certificates, the CA key,
+Traefik configs, snapshots and `config.json` are removed. Podman volumes that
+hold PVC data are never removed, with or without `--purge`; uninstall prints the
+`podman volume rm` command for each one it finds.
+
+Without `--yes` and with a non-terminal stdin, uninstall refuses with exit 2
+and changes nothing.
 
 ## System impact
 

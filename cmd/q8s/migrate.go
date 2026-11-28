@@ -33,14 +33,7 @@ type migrateNamesOptions struct {
 }
 
 func printMigrateNamesUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: q8s migrate-names [--dry-run] [--to-legacy]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Migrates the host artifacts of stored objects to the new generated names.")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Flags:")
-	fmt.Fprintln(w, "  --dry-run    Print what the startup migration would stop, remove and start")
-	fmt.Fprintln(w, "  --to-legacy  Remove the new-format artifacts so the previous release can run")
-	fmt.Fprintln(w, "  -h, --help")
+	fmt.Fprint(w, migrateNamesUsage)
 }
 
 func cmdMigrateNames() {

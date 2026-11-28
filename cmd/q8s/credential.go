@@ -46,12 +46,3 @@ func runCredential(args []string, stdout, stderr io.Writer) error {
 	_, err = stdout.Write(data)
 	return err
 }
-
-const credentialUsage = `Usage: q8s credential
-
-Prints the ExecCredential for the service account of the pod this command
-runs in. q8s serve writes a kubeconfig that invokes it; running it outside a
-q8s pod fails.
-
-The socket is $Q8S_WORKLOAD_SOCKET, or /var/run/q8s/workload/sa.sock.
-`

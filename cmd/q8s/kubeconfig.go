@@ -315,21 +315,6 @@ users:
 	return err
 }
 
-const kubeconfigUsage = `Usage: q8s kubeconfig [flags]
-
-Without --user, prints the administrator kubeconfig created by q8s install.
-
-Flags:
-  --name NAME            Cluster and context name (default: the name from q8s install)
-  --server URL           Server URL (default: the URL from q8s install)
-  --user NAME            Issue a client certificate and kubeconfig for NAME
-  --group GROUP          Add GROUP to the certificate; repeat for several groups
-  --days N               Certificate lifetime in days (default 365, max 3650)
-  --revoke NAME          Refuse future requests from certificate user NAME
-  --revoke-serial HEX    Refuse future requests from certificate serial HEX
-  --revoked              List revoked users and serials
-`
-
 // kubeconfig is the subset of the client configuration file q8s emits.
 type kubeconfig struct {
 	APIVersion     string                 `json:"apiVersion"`

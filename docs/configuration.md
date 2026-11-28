@@ -69,7 +69,9 @@ q8s install    # generate certs, create dirs, install systemd units
 q8s install --server https://myhost:6443  # set server URL for kubeconfig
 q8s install --san-ip 10.0.0.5 --san-dns myhost  # add cert SANs (persisted)
 q8s install --regenerate-certs  # regen certs keeping persisted SANs
-q8s uninstall  # remove systemd units
+q8s uninstall  # stop units and remove generated files, keeping store.json
+q8s uninstall --yes    # no confirmation prompt
+q8s uninstall --purge  # also remove the q8s data directory
 q8s serve      # run API server directly (no systemd)
 q8s start      # start q8s.socket (begin accepting connections)
 q8s stop       # stop socket and service
