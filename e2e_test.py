@@ -120,7 +120,7 @@ def start_server():
     if os.path.isdir(our_cache):
         shutil.rmtree(our_cache)
     # kill any lingering containers from a previous aborted run
-    out, _ = run(f"podman ps -a --format '{{{{.Names}}}}' --filter 'name=^{NS}-'")
+    out, _ = run(f"podman ps -a --format '{{{{.Names}}}}' --filter 'name=^{NS}_'")
     for name in out.splitlines():
         name = name.strip()
         if name:
@@ -164,12 +164,12 @@ def test_pod():
     check("create pod", f"kubectl -n {NS} run testpod --image=docker.io/library/busybox:latest -- sleep 3600")
     check("pod in API",            f"kubectl -n {NS} get pods", expect="testpod")
 
-    q = f"{QUADLETS}/{NS}-testpod.container"
+    q = f"{QUADLETS}/{NS}_testpod.container"
     file_exists("quadlet created", q)
     file_contains("quadlet has image",   q, "busybox")
     file_contains("quadlet has network", q, f"q8s-{NS}.network")
 
-    if wait_container(f"{NS}-testpod", "running", 30):
+    if wait_container(f"{NS}_testpod", "running", 30):
         ok("container running in podman")
     else:
         fail("container running in podman", "timed out after 30s")
@@ -181,7 +181,7 @@ def test_pod():
           expect="value")
 
     check("delete pod", f"kubectl -n {NS} delete pod testpod")
-    if wait_container(f"{NS}-testpod", "removed", 20):
+    if wait_container(f"{NS}_testpod", "removed", 20):
         ok("container removed from podman")
     else:
         fail("container removed from podman", "timed out")
@@ -220,11 +220,11 @@ def test_deployment():
           f"kubectl -n {NS} create deployment myapp --image=docker.io/library/busybox:latest --replicas=2 -- sleep 3600")
     check("deployment in API", f"kubectl -n {NS} get deployments", expect="myapp")
 
-    file_exists("instance-0 quadlet", f"{QUADLETS}/{NS}-myapp-0.container")
-    file_exists("instance-1 quadlet", f"{QUADLETS}/{NS}-myapp-1.container")
+    file_exists("instance-0 quadlet", f"{QUADLETS}/{NS}_myapp-0.container")
+    file_exists("instance-1 quadlet", f"{QUADLETS}/{NS}_myapp-1.container")
 
-    started = (wait_container(f"{NS}-myapp-0", "running", 30) and
-               wait_container(f"{NS}-myapp-1", "running", 30))
+    started = (wait_container(f"{NS}_myapp-0", "running", 30) and
+               wait_container(f"{NS}_myapp-1", "running", 30))
     if started:
         ok("both containers running")
     else:
@@ -232,7 +232,7 @@ def test_deployment():
 
     check("set env FOO=bar", f"kubectl -n {NS} set env deployment/myapp FOO=bar")
     file_contains("env in quadlet after set env",
-                  f"{QUADLETS}/{NS}-myapp-0.container", "FOO=bar")
+                  f"{QUADLETS}/{NS}_myapp-0.container", "FOO=bar")
     check("env in API",
           f"kubectl -n {NS} get deployment myapp -o jsonpath='{{.spec.template.spec.containers[0].env[0].value}}'",
           expect="bar")
@@ -240,7 +240,7 @@ def test_deployment():
     propagated = False
     for _ in range(30):
         time.sleep(1)
-        out, _ = run(f"podman inspect --format '{{{{range .Config.Env}}}}{{{{.}}}} {{{{end}}}}' {NS}-myapp-0")
+        out, _ = run(f"podman inspect --format '{{{{range .Config.Env}}}}{{{{.}}}} {{{{end}}}}' {NS}_myapp-0")
         if "FOO=bar" in out:
             propagated = True
             break
@@ -250,8 +250,8 @@ def test_deployment():
         fail("env var propagated to running container in podman", f"podman env: {out.strip()}")
 
     check("scale up to 3", f"kubectl -n {NS} scale deployment myapp --replicas=3")
-    file_exists("instance-2 quadlet created", f"{QUADLETS}/{NS}-myapp-2.container")
-    if wait_container(f"{NS}-myapp-2", "running", 20):
+    file_exists("instance-2 quadlet created", f"{QUADLETS}/{NS}_myapp-2.container")
+    if wait_container(f"{NS}_myapp-2", "running", 20):
         ok("scaled-up container running")
     else:
         fail("scaled-up container running", "timed out")
@@ -261,8 +261,8 @@ def test_deployment():
     # kubectl call can exceed the default 15s, so allow generous headroom.
     check("scale down to 1", f"kubectl -n {NS} scale deployment myapp --replicas=1", timeout=60)
     time.sleep(2)
-    file_absent("instance-1 quadlet removed", f"{QUADLETS}/{NS}-myapp-1.container")
-    file_absent("instance-2 quadlet removed", f"{QUADLETS}/{NS}-myapp-2.container")
+    file_absent("instance-1 quadlet removed", f"{QUADLETS}/{NS}_myapp-1.container")
+    file_absent("instance-2 quadlet removed", f"{QUADLETS}/{NS}_myapp-2.container")
 
     check("rollout restart", f"kubectl -n {NS} rollout restart deployment myapp")
     time.sleep(3)
@@ -279,7 +279,7 @@ def test_deployment():
 
     check("delete deployment", f"kubectl -n {NS} delete deployment myapp", timeout=60)
     time.sleep(2)
-    file_absent("all quadlets removed", f"{QUADLETS}/{NS}-myapp-0.container")
+    file_absent("all quadlets removed", f"{QUADLETS}/{NS}_myapp-0.container")
 
 def test_patch_and_edit():
     section("kubectl patch / apply / edit workflows")
@@ -292,8 +292,8 @@ def test_patch_and_edit():
     check("env visible in API after patch",
           f"kubectl -n {NS} get pod patchpod -o jsonpath='{{.spec.containers[0].env[0].value}}'",
           expect="hello")
-    wait_container(f"{NS}-patchpod", "running", 30)
-    out, _ = run(f"podman inspect --format '{{{{range .Config.Env}}}}{{{{.}}}} {{{{end}}}}' {NS}-patchpod")
+    wait_container(f"{NS}_patchpod", "running", 30)
+    out, _ = run(f"podman inspect --format '{{{{range .Config.Env}}}}{{{{.}}}} {{{{end}}}}' {NS}_patchpod")
     if "MY_VAR=hello" in out:
         ok("env var propagated to pod container in podman")
     else:
@@ -334,7 +334,7 @@ def test_patch_and_edit():
     check("replicas updated via kubectl edit",
           f"kubectl -n {NS} get deployment editapp -o jsonpath='{{.spec.replicas}}'",
           expect="2")
-    if wait_container(f"{NS}-editapp-1", "running", 30):
+    if wait_container(f"{NS}_editapp-1", "running", 30):
         ok("second replica container running in podman after edit")
     else:
         fail("second replica container running in podman after edit", "timed out")
@@ -389,8 +389,8 @@ def test_job():
     section("Job")
     check("create job",
           f"kubectl -n {NS} create job testjob --image=docker.io/library/busybox:latest -- echo done")
-    file_exists("job quadlet created",  f"{QUADLETS}/{NS}-testjob-job.container")
-    file_contains("job has Restart=no", f"{QUADLETS}/{NS}-testjob-job.container", "Restart=no")
+    file_exists("job quadlet created",  f"{QUADLETS}/{NS}_testjob__job.container")
+    file_contains("job has Restart=no", f"{QUADLETS}/{NS}_testjob__job.container", "Restart=no")
     check("delete job", f"kubectl -n {NS} delete job testjob")
 
 def test_cronjob():
@@ -399,9 +399,9 @@ def test_cronjob():
           f"kubectl -n {NS} create cronjob testcron --image=docker.io/library/busybox:latest "
           f"--schedule='*/5 * * * *' -- echo tick")
     TIMER_DIR = f"{XDG_CFG}/systemd/user"
-    file_exists("cronjob container quadlet", f"{QUADLETS}/{NS}-testcron-cron.container")
-    file_exists("cronjob timer file",        f"{TIMER_DIR}/{NS}-testcron-cron.timer")
-    file_contains("timer has OnCalendar",    f"{TIMER_DIR}/{NS}-testcron-cron.timer", "OnCalendar")
+    file_exists("cronjob container quadlet", f"{QUADLETS}/{NS}_testcron__cron.container")
+    file_exists("cronjob timer file",        f"{TIMER_DIR}/{NS}_testcron__cron.timer")
+    file_contains("timer has OnCalendar",    f"{TIMER_DIR}/{NS}_testcron__cron.timer", "OnCalendar")
     check("delete cronjob", f"kubectl -n {NS} delete cronjob testcron")
 
 def port_open(host="localhost", port=6443, timeout=2):
